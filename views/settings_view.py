@@ -3,12 +3,13 @@ Settings view for TKinter-based PTracker application.
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import threading
+import csv
 
 from views.base_view import BaseView
 from ui_theme import ModernStyle
-from ui_widgets import ModernButton
+from ui_widgets import ModernButton, ModernCard, ModernEntry
 from ui_utils import center_window
 
 class SettingsView(BaseView):
@@ -24,36 +25,35 @@ class SettingsView(BaseView):
         tk.Label(header_frame, text="⚙️ Settings", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_TITLE).pack(anchor="w")
         tk.Label(header_frame, text="Configuration and broker management", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
 
-        # Scrollable container
-        canvas = tk.Canvas(self, bg=ModernStyle.BG_PRIMARY, highlightthickness=0)
-        vscroll = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        content = tk.Frame(canvas, bg=ModernStyle.BG_PRIMARY)
-        cid = canvas.create_window((0, 0), window=content, anchor="nw")
+        # Accent divider
+        tk.Frame(self, bg="#D4AF37", height=1).pack(fill="x", padx=15, pady=(10, 10))
 
-        def _on_cfg(_e=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfigure(cid, width=canvas.winfo_width())
+        # Main content area using a 2-column layout to avoid vertical scroll
+        content = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        content.pack(fill="both", expand=True, padx=15, pady=(0, 15))
 
-        content.bind("<Configure>", _on_cfg)
-        canvas.bind("<Configure>", _on_cfg)
+        left_col = tk.Frame(content, bg=ModernStyle.BG_PRIMARY)
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 7))
+
+        right_col = tk.Frame(content, bg=ModernStyle.BG_PRIMARY)
+        right_col.pack(side="right", fill="both", expand=True, padx=(7, 0))
 
         def _card(parent, title: str):
-            frame = tk.Frame(parent, bg=ModernStyle.BG_SECONDARY, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1)
-            frame.pack(fill="x", padx=15, pady=10)
-            tk.Label(frame, text=title, fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SUBHEADING).pack(anchor="w", padx=12, pady=(10, 6))
-            inner = tk.Frame(frame, bg=ModernStyle.BG_SECONDARY)
-            inner.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+            frame = ModernCard(parent, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1, radius=10, canvas_bg=ModernStyle.BG_PRIMARY)
+            frame.pack(fill="x", pady=6)
+            tk.Label(frame.content, text=title, fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SUBHEADING).pack(anchor="w", padx=12, pady=(8, 4))
+            inner = tk.Frame(frame.content, bg=ModernStyle.BG_SECONDARY)
+            inner.pack(fill="both", expand=True, padx=12, pady=(0, 10))
             return inner
 
-        # Broker Management (Flet card - simplified with modal button)
-        broker = _card(content, "🏦 Broker Management")
+        # -------------- LEFT COLUMN --------------
+
+        # Broker Management
+        broker = _card(left_col, "🏦 Broker Management")
         button_row = tk.Frame(broker, bg=ModernStyle.BG_SECONDARY)
         button_row.pack(fill="x", pady=(0, 6))
         
-        self.broker_count_label = tk.Label(broker, text="Loading brokers…", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=(ModernStyle.FONT_FAMILY, 10))
+        self.broker_count_label = tk.Label(broker, text="Loading brokers…", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL)
         self.broker_count_label.pack(anchor="w", pady=(0, 8))
         
         ModernButton(button_row, text="Open Broker Manager", command=self._open_broker_manager, bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.BG_SECONDARY, width=140, height=36).pack(side="left", padx=(0, 6))
@@ -62,22 +62,46 @@ class SettingsView(BaseView):
         self.broker_status = tk.Label(broker, text="", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL)
         self.broker_status.pack(anchor="w", pady=(6, 0))
 
-        # Danger Zone (Flet card)
-        danger = _card(content, "Danger Zone")
+        # Backup & Export
+        backup = _card(left_col, "💾 Data Backup & Export")
+        tk.Label(backup, text="Export trades data to a CSV file.", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_BODY).pack(anchor="w", pady=(0, 8))
+        ModernButton(backup, text="Export Trades (CSV)", command=self._export_trades_csv, bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.BG_SECONDARY, width=150, height=36).pack(anchor="w")
+        
+        self.backup_status = tk.Label(backup, text="", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL)
+        self.backup_status.pack(anchor="w", pady=(6, 0))
+
+        # Danger Zone
+        danger = _card(left_col, "⚠️ Danger Zone")
         tk.Label(danger, text="Wipe Portfolio Data", fg=ModernStyle.ERROR, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SUBHEADING).pack(anchor="w")
         tk.Label(
             danger,
-            text="Permanently deletes all trades, market data, and holdings. Brokers are kept.",
+            text="Permanently deletes all trades, market data, and holdings.\nBrokers are kept.",
             fg=ModernStyle.TEXT_SECONDARY,
             bg=ModernStyle.BG_SECONDARY,
             font=ModernStyle.FONT_BODY,
-            wraplength=780,
+            wraplength=350,
             justify="left",
         ).pack(anchor="w", pady=(4, 10))
         ModernButton(danger, text="Delete All Data", command=self._wipe_all_data, bg=ModernStyle.ERROR, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.BG_SECONDARY, width=150, height=38).pack(anchor="w")
 
-        # Keep existing theme/cache/about sections
-        theme = _card(content, "Theme")
+        # About
+        about = _card(left_col, "ℹ️ About")
+        tk.Label(about, text="PTracker (Tkinter Edition)\nLight theme for readability", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
+
+        # -------------- RIGHT COLUMN --------------
+        
+        # Database Statistics
+        stats = _card(right_col, "📊 Database Statistics")
+        self.stats_frame = tk.Frame(stats, bg=ModernStyle.BG_SECONDARY)
+        self.stats_frame.pack(fill="x", pady=(0, 8))
+        
+        self.stats_loading_label = tk.Label(self.stats_frame, text="Loading statistics...", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_BODY)
+        self.stats_loading_label.pack(anchor="w")
+
+        ModernButton(stats, text="Refresh Stats", command=self._refresh_database_stats, bg=ModernStyle.ACCENT_SECONDARY, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.BG_SECONDARY, width=110, height=32).pack(anchor="w")
+
+        # Theme
+        theme = _card(right_col, "🎨 Theme")
         try:
             current_theme = ttk.Style().theme_use()
         except Exception:
@@ -87,25 +111,24 @@ class SettingsView(BaseView):
             names = ", ".join(ttk.Style().theme_names())
         except Exception:
             names = "(unavailable)"
-        tk.Label(theme, text=f"Available ttk themes: {names}", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL, wraplength=780, justify="left").pack(anchor="w", pady=(4, 0))
+        tk.Label(theme, text=f"Available ttk themes: {names}", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL, wraplength=350, justify="left").pack(anchor="w", pady=(4, 0))
 
-        cache = _card(content, "Data Cache")
+        # Data Cache
+        cache = _card(right_col, "⚡ Data Cache")
         tk.Label(cache, text="Cache is enabled for fast filtering", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
         ModernButton(cache, text="Clear Cache", command=self._clear_cache, bg=ModernStyle.ACCENT_TERTIARY, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.BG_SECONDARY, width=130, height=36).pack(anchor="w", pady=(8, 0))
-
-        about = _card(content, "About")
-        tk.Label(about, text="PTracker (Tkinter Edition)\nLight theme for readability", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
 
     def load_data(self):
         if getattr(self, "_data_loaded", False):
             return
         self._data_loaded = True
         self._reload_brokers()
+        self._refresh_database_stats()
 
     def _get_broker_trade_counts(self) -> dict:
         """Get count of trades for each broker."""
         try:
-            from common.database import db_session
+            from model.database import db_session
             with db_session() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT broker, COUNT(*) as count FROM trades GROUP BY broker")
@@ -116,7 +139,7 @@ class SettingsView(BaseView):
     def _reload_brokers(self) -> None:
         """Reload broker list and update count label."""
         try:
-            import common.models.crud as crud
+            import model.crud as crud
             brokers = crud.get_all_brokers()
             self._broker_trade_counts = self._get_broker_trade_counts()
         except Exception:
@@ -133,6 +156,7 @@ class SettingsView(BaseView):
         """Open broker management modal window."""
         modal = tk.Toplevel(self)
         modal.title("Broker Manager")
+        ModernStyle.style_modal(modal)
         modal.configure(bg=ModernStyle.BG_PRIMARY)
         modal.geometry("600x500")
         modal.resizable(True, True)
@@ -151,15 +175,15 @@ class SettingsView(BaseView):
         # Header
         header = tk.Frame(modal, bg=ModernStyle.BG_PRIMARY)
         header.pack(fill="x", padx=15, pady=(15, 10))
-        tk.Label(header, text="🏦 Broker Management", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=(ModernStyle.FONT_FAMILY, 16, "bold")).pack(anchor="w")
+        tk.Label(header, text="🏦 Broker Management", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_MODAL_TITLE).pack(anchor="w")
         tk.Label(header, text="Add, view, and manage brokers", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
         
         # Add broker section
-        add_card = tk.Frame(modal, bg=ModernStyle.BG_SECONDARY, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1)
+        add_card = ModernCard(modal, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1, radius=10, canvas_bg=ModernStyle.BG_PRIMARY)
         add_card.pack(fill="x", padx=15, pady=10)
-        tk.Label(add_card, text="Add New Broker", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=(ModernStyle.FONT_FAMILY, 12, "bold")).pack(anchor="w", padx=12, pady=(10, 6))
+        tk.Label(add_card.content, text="Add New Broker", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SUBHEADING).pack(anchor="w", padx=12, pady=(10, 6))
         
-        inner = tk.Frame(add_card, bg=ModernStyle.BG_SECONDARY)
+        inner = tk.Frame(add_card.content, bg=ModernStyle.BG_SECONDARY)
         inner.pack(fill="x", padx=12, pady=(0, 12))
         inner.grid_columnconfigure(0, weight=1)
         
@@ -167,7 +191,7 @@ class SettingsView(BaseView):
         entry = tk.Entry(inner, textvariable=new_broker_var, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_BODY, relief=tk.FLAT)
         entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         
-        status_label = tk.Label(inner, text="", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=(ModernStyle.FONT_FAMILY, 9))
+        status_label = tk.Label(inner, text="", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_TINY)
         status_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
         
         def _add():
@@ -176,7 +200,7 @@ class SettingsView(BaseView):
                 status_label.config(text="Enter a broker name", fg=ModernStyle.ERROR)
                 return
             try:
-                import common.models.crud as crud
+                import model.crud as crud
                 existing = [b.upper() for b in crud.get_all_brokers()]
                 if name in existing:
                     status_label.config(text=f"Broker '{name}' already exists", fg=ModernStyle.ERROR)
@@ -199,7 +223,7 @@ class SettingsView(BaseView):
         ModernButton(inner, text="Add", command=_add, bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.BG_SECONDARY, width=60, height=32).grid(row=0, column=1, sticky="e")
         
         # Broker list section
-        list_label = tk.Label(modal, text="Active Brokers", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=(ModernStyle.FONT_FAMILY, 12, "bold"))
+        list_label = tk.Label(modal, text="Active Brokers", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_SUBHEADING)
         list_label.pack(anchor="w", padx=15, pady=(10, 6))
         
         # Scrollable broker list
@@ -234,7 +258,7 @@ class SettingsView(BaseView):
             return
         
         try:
-            import common.models.crud as crud
+            import model.crud as crud
             brokers = crud.get_all_brokers()
         except Exception:
             brokers = []
@@ -253,7 +277,7 @@ class SettingsView(BaseView):
             
             trade_count = self._broker_trade_counts.get(name, 0)
             info_text = f"📊 {name}  •  {trade_count} trade{'s' if trade_count != 1 else ''}"
-            tk.Label(row, text=info_text, fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=(ModernStyle.FONT_FAMILY, 11)).pack(side="left", padx=12, pady=8, expand=True, fill="x")
+            tk.Label(row, text=info_text, fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_BODY).pack(side="left", padx=12, pady=8, expand=True, fill="x")
             
             ModernButton(row, text="Delete", command=lambda n=name: self._delete_broker_from_modal(n, modal), bg=ModernStyle.ERROR, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.BG_SECONDARY, width=70, height=28).pack(side="right", padx=4, pady=4)
     
@@ -264,10 +288,10 @@ class SettingsView(BaseView):
         
         def _bg():
             try:
-                import common.models.crud as crud
+                import model.crud as crud
                 crud.delete_broker(name)
                 try:
-                    from common.engine import rebuild_holdings
+                    from model.engine import rebuild_holdings
                     rebuild_holdings()
                 except Exception:
                     pass
@@ -287,6 +311,7 @@ class SettingsView(BaseView):
         """Quick add broker with suggested names."""
         dlg = tk.Toplevel(self)
         dlg.title("Quick Add Broker")
+        ModernStyle.style_modal(dlg)
         dlg.configure(bg=ModernStyle.BG_PRIMARY)
         dlg.geometry("400x200")
         dlg.resizable(False, False)
@@ -305,7 +330,7 @@ class SettingsView(BaseView):
         card = tk.Frame(dlg, bg=ModernStyle.BG_SECONDARY)
         card.pack(fill="both", expand=True, padx=12, pady=12)
         
-        tk.Label(card, text="Broker Name", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=(ModernStyle.FONT_FAMILY, 10)).pack(anchor="w", padx=12, pady=(10, 4))
+        tk.Label(card, text="Broker Name", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL).pack(anchor="w", padx=12, pady=(10, 4))
         
         broker_var = tk.StringVar(value="")
         entry = tk.Entry(card, textvariable=broker_var, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_BODY, relief=tk.FLAT)
@@ -315,16 +340,16 @@ class SettingsView(BaseView):
         # Suggested brokers
         suggested_frame = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
         suggested_frame.pack(fill="x", padx=12, pady=(0, 8))
-        tk.Label(suggested_frame, text="Suggested:", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=(ModernStyle.FONT_FAMILY, 9)).pack(anchor="w")
+        tk.Label(suggested_frame, text="Suggested:", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_TINY).pack(anchor="w")
         
         suggested = ["Kite", "Upstox", "ICICI Direct", "Angel", "Broker"]
         suggested_row = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
         suggested_row.pack(fill="x", padx=12, pady=(0, 12))
         
         for sug in suggested[:3]:
-            tk.Button(suggested_row, text=sug, command=lambda s=sug: broker_var.set(s), bg=ModernStyle.ACCENT_TERTIARY, fg=ModernStyle.TEXT_ON_ACCENT, relief=tk.FLAT, pady=2, padx=6, font=(ModernStyle.FONT_FAMILY, 9)).pack(side="left", padx=2)
+            tk.Button(suggested_row, text=sug, command=lambda s=sug: broker_var.set(s), bg=ModernStyle.ACCENT_TERTIARY, fg=ModernStyle.TEXT_ON_ACCENT, relief=tk.FLAT, pady=2, padx=6, font=ModernStyle.FONT_TINY).pack(side="left", padx=2)
         
-        status = tk.Label(card, text="", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=(ModernStyle.FONT_FAMILY, 9))
+        status = tk.Label(card, text="", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_TINY)
         status.pack(anchor="w", padx=12, pady=(0, 8))
         
         def _add():
@@ -333,7 +358,7 @@ class SettingsView(BaseView):
                 status.config(text="Enter a broker name", fg=ModernStyle.ERROR)
                 return
             try:
-                import common.models.crud as crud
+                import model.crud as crud
                 existing = [b.upper() for b in crud.get_all_brokers()]
                 if name in existing:
                     status.config(text=f"'{name}' already exists", fg=ModernStyle.ERROR)
@@ -372,10 +397,10 @@ class SettingsView(BaseView):
 
         def _bg():
             try:
-                import common.models.crud as crud
+                import model.crud as crud
                 crud.wipe_all_data()
                 try:
-                    from common.engine import rebuild_holdings
+                    from model.engine import rebuild_holdings
                     rebuild_holdings()
                 except Exception:
                     pass
@@ -392,3 +417,67 @@ class SettingsView(BaseView):
         threading.Thread(target=_bg, daemon=True).start()
 
 
+
+    def _export_trades_csv(self):
+        """Export trades data to a CSV file."""
+        try:
+            filename = filedialog.asksaveasfilename(
+                title="Export Trades",
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                initialfile="trades_backup.csv"
+            )
+            if not filename:
+                return
+
+            import model.crud as crud
+            trades = crud.get_all_trades_for_export()
+            
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(["broker", "trade_id", "date", "symbol", "type", "qty", "price", "fee"])
+                writer.writerows(trades)
+            
+            self.backup_status.config(text=f"Exported {len(trades)} trades ✓", fg=ModernStyle.SUCCESS)
+        except Exception as e:
+            self.backup_status.config(text=f"Export failed: {str(e)[:40]}", fg=ModernStyle.ERROR)
+
+    def _refresh_database_stats(self):
+        """Refresh the database statistics UI."""
+        def _bg():
+            try:
+                import model.crud as crud
+                stats = crud.get_all_table_stats()
+                self.after(0, lambda: self._render_stats(stats))
+            except Exception as e:
+                self.after(0, lambda: self.stats_loading_label.config(text=f"Error: {str(e)[:40]}", fg=ModernStyle.ERROR))
+        
+        if hasattr(self, 'stats_loading_label'):
+             self.stats_loading_label.config(text="Refreshing...", fg=ModernStyle.TEXT_SECONDARY)
+             
+        for child in self.stats_frame.winfo_children():
+            if child != self.stats_loading_label:
+                child.destroy()
+        self.stats_loading_label.pack(anchor="w")
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _render_stats(self, stats: dict):
+        """Render the stats dict into the statistics frame."""
+        self.stats_loading_label.pack_forget()
+        for child in self.stats_frame.winfo_children():
+            if child != self.stats_loading_label:
+                child.destroy()
+        
+        if not stats:
+            tk.Label(self.stats_frame, text="No data found.", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY).pack(anchor="w")
+            return
+            
+        row = 0
+        for table, count in sorted(stats.items()):
+            table_row = tk.Frame(self.stats_frame, bg=ModernStyle.BG_SECONDARY)
+            table_row.pack(fill="x", pady=2)
+            
+            tk.Label(table_row, text=f"• {table}", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_BODY).pack(side="left")
+            tk.Label(table_row, text=f"{count} rows", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_TINY_BOLD).pack(side="right")
+            row += 1

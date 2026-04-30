@@ -1,8 +1,3 @@
-"""
-Base view class for Tkinter-based PTracker application.
-All views inherit from this to ensure consistent behavior.
-"""
-
 import tkinter as tk
 from tkinter import ttk
 from abc import ABC, abstractmethod

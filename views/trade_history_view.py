@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 
 from views.base_view import BaseView, _create_date_input
 from ui_theme import ModernStyle
-from ui_widgets import ModernButton
-from ui_utils import center_window
+from ui_widgets import ModernButton, ModernEntry, ModernCard, ModernDropdown, ClearableEntry
+from ui_utils import center_window, add_treeview_copy_menu, treeview_sort_column, fade_color_transition
 
 class TradeHistoryView(BaseView):
     """View all trades in history."""
@@ -19,15 +19,18 @@ class TradeHistoryView(BaseView):
         self._th_edit_popup = None
         header_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY, height=60)
         header_frame.pack(fill="x", padx=15, pady=(10, 5))
-        tk.Label(header_frame, text="🔷 Trade History", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_TITLE).pack(anchor="w")
+        tk.Label(header_frame, text="🔷 Trade History", fg=ModernStyle.ACCENT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_PAGE_TITLE).pack(anchor="w")
         tk.Label(header_frame, text="All trades with running stats", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
 
+        # Accent divider
+        tk.Frame(self, bg="#D4AF37", height=1).pack(fill="x", padx=15, pady=(10, 10))
+
         # Filters card (enhanced with quick date filters and better styling)
-        filters = tk.Frame(self, bg=ModernStyle.BG_SECONDARY, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1)
+        filters = ModernCard(self, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1, radius=10)
         filters.pack(fill="x", padx=15, pady=(0, 5))
         
         # Header with title and info
-        header_row = tk.Frame(filters, bg=ModernStyle.BG_SECONDARY)
+        header_row = tk.Frame(filters.content, bg=ModernStyle.BG_SECONDARY)
         header_row.pack(fill="x", padx=12, pady=(5, 0))
         tk.Label(header_row, text="🔍 Filters", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SUBHEADING).pack(side="left")
         info_lbl = tk.Label(header_row, text="", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL)
@@ -49,29 +52,42 @@ class TradeHistoryView(BaseView):
         self._th_search_timer = None
 
         # Filter row with colored pills (matching Holdings view)
-        filter_row = tk.Frame(filters, bg=ModernStyle.BG_SECONDARY)
+        filter_row = tk.Frame(filters.content, bg=ModernStyle.BG_SECONDARY)
         filter_row.pack(fill=tk.X, padx=12, pady=5)
         
         # Broker filter with background pill
-        broker_pill = tk.Frame(filter_row, bg=ModernStyle.BG_SECONDARY, highlightbackground="#DBEAFE", highlightthickness=1)
-        broker_pill.pack(side=tk.LEFT, padx=3, pady=3, ipady=2, ipadx=4)
-        tk.Label(broker_pill, text="🏦 Broker:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=(ModernStyle.FONT_FAMILY, 14, "bold")).pack(side=tk.LEFT, padx=3, pady=3)
-        self.th_broker_cb = ttk.Combobox(broker_pill, textvariable=self.th_broker_var, state="readonly", font=(ModernStyle.FONT_FAMILY, 13), height=5, width=11)
-        self.th_broker_cb.pack(side=tk.LEFT, padx=3, pady=3)
-        self.th_broker_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filters())
+        broker_pill = ModernCard(filter_row, bg=ModernStyle.BG_SECONDARY, highlight_color="#DBEAFE", highlight_thickness=1, radius=8)
+        broker_pill.pack(side=tk.LEFT, padx=3, pady=3)
+        tk.Label(broker_pill.content, text="🏦 Broker:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
+        self.th_broker_cb = ttk.Combobox(broker_pill.content, textvariable=self.th_broker_var, values=["All"], state="readonly", width=13, font=ModernStyle.FONT_TABLE)
+        self.th_broker_cb.pack(side=tk.LEFT, padx=3, pady=5)
+        try:
+             self.th_broker_var.trace_add("write", lambda *args: self._apply_filters())
+        except Exception:
+             pass
         
         # Symbol filter with background pill
-        symbol_pill = tk.Frame(filter_row, bg=ModernStyle.BG_SECONDARY, highlightbackground="#E9D5FF", highlightthickness=1)
-        symbol_pill.pack(side=tk.LEFT, padx=3, pady=3, ipady=2, ipadx=4)
-        tk.Label(symbol_pill, text="📌 Symbol:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=(ModernStyle.FONT_FAMILY, 14, "bold")).pack(side=tk.LEFT, padx=3, pady=3)
-        self.th_symbol_entry = tk.Entry(symbol_pill, textvariable=self.th_symbol_var, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY, font=(ModernStyle.FONT_FAMILY, 13), relief=tk.FLAT, width=11)
-        self.th_symbol_entry.pack(side=tk.LEFT, padx=3, pady=3)
-        
+        symbol_pill = ModernCard(filter_row, bg=ModernStyle.BG_SECONDARY, highlight_color="#E9D5FF", highlight_thickness=1, radius=8)
+        symbol_pill.pack(side=tk.LEFT, padx=3, pady=3)
+        tk.Label(symbol_pill.content, text="📌 Symbol:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
+        self.th_symbol_entry = ClearableEntry(
+            symbol_pill.content,
+            placeholder="Search...",
+            on_change=lambda e: self.th_symbol_var.set(self.th_symbol_entry.get()) or self._apply_filters(),
+            bg=ModernStyle.ENTRY_BG,
+            fg=ModernStyle.ACCENT_PRIMARY,
+            font=ModernStyle.FONT_INPUT,
+            width=11,
+        ).entry
+        self.th_symbol_entry.master.pack(side=tk.LEFT, padx=3, pady=3)
+        self.th_symbol_entry.bind("<FocusIn>",  lambda e: fade_color_transition(symbol_pill, "#E9D5FF", "#D8B4FE", attr='highlight_color'), add="+")
+        self.th_symbol_entry.bind("<FocusOut>", lambda e: fade_color_transition(symbol_pill, "#D8B4FE", "#E9D5FF", attr='highlight_color'), add="+")
+
         # Type filter with background pill (segmented radios)
-        type_pill = tk.Frame(filter_row, bg=ModernStyle.BG_SECONDARY, highlightbackground="#DCFCE7", highlightthickness=1)
-        type_pill.pack(side=tk.LEFT, padx=3, pady=3, ipady=2, ipadx=4)
-        tk.Label(type_pill, text="📊 Type:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=(ModernStyle.FONT_FAMILY, 14, "bold")).pack(side=tk.LEFT, padx=3, pady=3)
-        self.th_type_wrap = tk.Frame(type_pill, bg=ModernStyle.BG_SECONDARY)
+        type_pill = ModernCard(filter_row, bg=ModernStyle.BG_SECONDARY, highlight_color="#DCFCE7", highlight_thickness=1, radius=8)
+        type_pill.pack(side=tk.LEFT, padx=3, pady=3)
+        tk.Label(type_pill.content, text="📊 Type:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
+        self.th_type_wrap = tk.Frame(type_pill.content, bg=ModernStyle.BG_SECONDARY)
         self.th_type_wrap.pack(side=tk.LEFT, padx=3, pady=3)
         
         # All / BUY / SELL segmented toggle — semantic colors (slate / green / red)
@@ -88,7 +104,7 @@ class TradeHistoryView(BaseView):
             value="All",
             indicatoron=0,
             width=4, padx=6, pady=4,
-            font=(ModernStyle.FONT_FAMILY, 12,"bold"),
+            font=ModernStyle.FONT_SUBHEADING,
             relief=tk.FLAT, bd=0,
             bg=_RB_UNSEL_BG, fg=_RB_UNSEL_FG,
             selectcolor=_RB_ALL_SEL,
@@ -102,7 +118,7 @@ class TradeHistoryView(BaseView):
             value="BUY",
             indicatoron=0,
             width=4, padx=6, pady=4,
-            font=(ModernStyle.FONT_FAMILY, 12,"bold"),
+            font=ModernStyle.FONT_SUBHEADING,
             relief=tk.FLAT, bd=0,
             bg=_RB_UNSEL_BG, fg=_RB_UNSEL_FG,
             selectcolor=_RB_BUY_SEL,
@@ -116,7 +132,7 @@ class TradeHistoryView(BaseView):
             value="SELL",
             indicatoron=0,
             width=4, padx=6, pady=4,
-            font=(ModernStyle.FONT_FAMILY, 12,"bold"),
+            font=ModernStyle.FONT_SUBHEADING,
             relief=tk.FLAT, bd=0,
             bg=_RB_UNSEL_BG, fg=_RB_UNSEL_FG,
             selectcolor=_RB_SELL_SEL,
@@ -128,16 +144,16 @@ class TradeHistoryView(BaseView):
         self.th_type_sell_rb.pack(side="left")
         
         # Date range filters with colored pills
-        start_pill = tk.Frame(filter_row, bg=ModernStyle.BG_SECONDARY, highlightbackground="#FEF3C7", highlightthickness=1)
-        start_pill.pack(side=tk.LEFT, padx=3, pady=3, ipady=2, ipadx=4)
-        tk.Label(start_pill, text="📅 Start:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=(ModernStyle.FONT_FAMILY, 14, "bold")).pack(side=tk.LEFT, padx=3, pady=3)
-        self.th_start_entry = _create_date_input(start_pill, self.th_start_var)
+        start_pill = ModernCard(filter_row, bg=ModernStyle.BG_SECONDARY, highlight_color="#FEF3C7", highlight_thickness=1, radius=8)
+        start_pill.pack(side=tk.LEFT, padx=3, pady=3)
+        tk.Label(start_pill.content, text="📅 Start Date:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
+        self.th_start_entry = _create_date_input(start_pill.content, self.th_start_var)
         self.th_start_entry.pack(side=tk.LEFT, padx=3, pady=3)
         
-        end_pill = tk.Frame(filter_row, bg=ModernStyle.BG_SECONDARY, highlightbackground="#FEF3C7", highlightthickness=1)
-        end_pill.pack(side=tk.LEFT, padx=3, pady=3, ipady=2, ipadx=4)
-        tk.Label(end_pill, text="📅 End:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=(ModernStyle.FONT_FAMILY, 14, "bold")).pack(side=tk.LEFT, padx=3, pady=3)
-        self.th_end_entry = _create_date_input(end_pill, self.th_end_var)
+        end_pill = ModernCard(filter_row, bg=ModernStyle.BG_SECONDARY, highlight_color="#FEF3C7", highlight_thickness=1, radius=8)
+        end_pill.pack(side=tk.LEFT, padx=3, pady=3)
+        tk.Label(end_pill.content, text="📆 End Date:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
+        self.th_end_entry = _create_date_input(end_pill.content, self.th_end_var)
         self.th_end_entry.pack(side=tk.LEFT, padx=3, pady=3)
         
         # Spacer
@@ -220,13 +236,13 @@ class TradeHistoryView(BaseView):
         ]
         
         for label, key, color, pill_bg in stat_configs:
-            stat_pill = tk.Frame(sum_row, bg=ModernStyle.BG_SECONDARY, highlightbackground=pill_bg, highlightthickness=2)
-            stat_pill.pack(side=tk.LEFT, padx=3, pady=3, expand=True, fill=tk.X, ipady=3, ipadx=4)
+            stat_pill = ModernCard(sum_row, bg=ModernStyle.BG_SECONDARY, highlight_color=pill_bg, highlight_thickness=2, radius=8)
+            stat_pill.pack(side=tk.LEFT, padx=3, pady=3, expand=True, fill=tk.BOTH)
             
-            tk.Label(stat_pill, text=label, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY, font=(ModernStyle.FONT_FAMILY, 12, "bold")).pack()
+            tk.Label(stat_pill.content, text=label, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_KPI_LABEL).pack(pady=(4, 0))
             
-            val_label = tk.Label(stat_pill, text="—", bg=ModernStyle.BG_SECONDARY, fg=color, font=(ModernStyle.FONT_FAMILY, 16, "bold"))
-            val_label.pack(pady=(2, 0))
+            val_label = tk.Label(stat_pill.content, text="—", bg=ModernStyle.BG_SECONDARY, fg=color, font=ModernStyle.FONT_KPI_VALUE)
+            val_label.pack(pady=(2, 4))
             
             setattr(self, f"sum_{key}", val_label)
 
@@ -240,23 +256,34 @@ class TradeHistoryView(BaseView):
         # Copy Selected button removed per user request
         ModernButton(
             actions,
+            text=" ➕ ",
+            command=self._open_add_trade_dialog,
+            bg=ModernStyle.SUCCESS,
+            fg=ModernStyle.TEXT_ON_ACCENT,
+            canvas_bg=ModernStyle.BG_PRIMARY,
+            width=60,
+            height=28,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        ModernButton(
+            actions,
+            text=" ➖ ",
+            command=self._delete_selected,
+            bg=ModernStyle.ERROR,
+            fg=ModernStyle.TEXT_ON_ACCENT,
+            canvas_bg=ModernStyle.BG_PRIMARY,
+            width=60,
+            height=28,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        ModernButton(
+            actions,
             text="Copy All",
             command=self._copy_all,
             bg=ModernStyle.ACCENT_PRIMARY,
             fg=ModernStyle.TEXT_ON_ACCENT,
             canvas_bg=ModernStyle.BG_PRIMARY,
             width=90,
-            height=28,
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        
-        ModernButton(
-            actions,
-            text="Delete",
-            command=self._delete_selected,
-            bg=ModernStyle.ERROR,
-            fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_PRIMARY,
-            width=110,
             height=28,
         ).pack(side=tk.LEFT)
 
@@ -272,7 +299,7 @@ class TradeHistoryView(BaseView):
             "Type",
             "Qty",
             "Price ₹",
-            "Run. Qty",
+            "Running Qty",
             "AvgCost ₹",
             "Running PnL ₹",
             "Fees ₹",
@@ -280,44 +307,61 @@ class TradeHistoryView(BaseView):
         self.trade_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=18, selectmode="extended")
 
         widths = [40, 100, 95, 80, 60, 70, 90, 80, 90, 120, 80]
+        sortable_cols = ("Symbol", "Date", "Type")
         for col, w in zip(columns, widths):
-            self.trade_table.heading(col, text=col)
+            if col in sortable_cols:
+                self.trade_table.heading(col, text=f"{col} ↕", command=lambda c=col: treeview_sort_column(self.trade_table, c, False))
+            else:
+                self.trade_table.heading(col, text=col)
             self.trade_table.column(col, width=w)
 
         try:
             # Custom style to increase font size
             style = ttk.Style()
-            style.configure("TH.Treeview", font=(ModernStyle.FONT_FAMILY, 12), rowheight=30)
-            style.configure("TH.Treeview.Heading", font=(ModernStyle.FONT_FAMILY, 13, "bold"))
+            style.configure("TH.Treeview", font=ModernStyle.FONT_TABLE, rowheight=30)
+            style.configure("TH.Treeview.Heading", font=ModernStyle.FONT_TABLE_BOLD)
             self.trade_table.configure(style="TH.Treeview")
+            
+            add_treeview_copy_menu(self.trade_table)
 
-            # Zebra striping — alternating light backgrounds for readability
+            # Zebra striping — group-based backgrounds for readability
             self.trade_table.tag_configure("odd",  background="#FFFFFF")  # pure white
-            self.trade_table.tag_configure("even", background="#F8FAFC")  # ultra faint slate
+            self.trade_table.tag_configure("even", background="#F0FDF4")  # mild green shade
             # Trade-type semantic colouring (applies alongside even/odd)
             # Removed foreground tinting to reduce visual noise; using Emoji badges instead.
         except Exception:
             pass
 
         vsb = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.trade_table.yview)
-        hsb = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.trade_table.xview)
-        self.trade_table.configure(yscroll=vsb.set, xscroll=hsb.set)
+        self.trade_table.configure(yscroll=vsb.set)
 
         self.trade_table.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
-        # Empty-state overlay label (shown when the filter returns 0 rows)
-        self._empty_label = tk.Label(
-            table_frame,
-            text="🔍  No trades found for the selected filters",
-            font=(ModernStyle.FONT_FAMILY, 13),
+        # Empty-state overlay frame (shown when the filter returns 0 rows)
+        self._empty_frame = tk.Frame(table_frame, bg=ModernStyle.BG_SECONDARY)
+        tk.Label(
+            self._empty_frame,
+            text="🪹",
+            font=ModernStyle.FONT_EMPTY_STATE,
+            bg=ModernStyle.BG_SECONDARY,
+        ).pack(pady=(0, 4))
+        tk.Label(
+            self._empty_frame,
+            text="No trades found for the selected filters",
+            font=ModernStyle.FONT_HEADING,
+            fg=ModernStyle.TEXT_SECONDARY,
+            bg=ModernStyle.BG_SECONDARY,
+        ).pack()
+        tk.Label(
+            self._empty_frame,
+            text="Adjust your search criteria or add a new trade.",
+            font=ModernStyle.FONT_BODY,
             fg=ModernStyle.TEXT_TERTIARY,
             bg=ModernStyle.BG_SECONDARY,
-        )
-        # Not packed initially; shown/hidden in _update_trades
+        ).pack()
 
         # Edit on double-click
         try:
@@ -381,12 +425,19 @@ class TradeHistoryView(BaseView):
         if len(vals) < 11:
             return
 
-        date = str(vals[1])
-        symbol = str(vals[3])
-        t_type = str(vals[4]).upper()
-        qty = str(vals[5])
-        price = str(vals[6])
-        fee = str(vals[10])
+        # Fetch ALL editable fields from the DB directly — never use display-formatted
+        # treeview values (which may be stale, formatted with ₹/commas, or truncated)
+        try:
+            from model.database import db_session
+            with db_session() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT date, symbol, type, qty, price, fee FROM trades WHERE broker=? AND trade_id=?", (broker, trade_id))
+                row = cur.fetchone()
+                if not row:
+                    return
+                date, symbol, t_type, qty, price, fee = row[0], row[1], row[2], str(row[3]), str(row[4]), str(row[5])
+        except Exception:
+            return
 
         self._open_edit_trade_dialog(
             broker=broker,
@@ -424,9 +475,10 @@ class TradeHistoryView(BaseView):
         win = tk.Toplevel(self)
         self._th_edit_popup = win
         win.title("✏️ Edit Trade")
-        win.configure(bg="#0f1419")
+        ModernStyle.style_modal(win)
+        win.configure(bg=ModernStyle.BG_PRIMARY)
         win.resizable(False, False)
-        win.geometry("580x620")
+        win.geometry("600x540")
         try:
             win.transient(self.winfo_toplevel())
             win.grab_set()
@@ -438,159 +490,133 @@ class TradeHistoryView(BaseView):
         except Exception:
             pass
 
-        # Elegant header with gradient-like solid block
-        header = tk.Frame(win, bg="#0F172A", height=80)
-        header.pack(fill="x", padx=0, pady=0)
-        header.pack_propagate(False)
-        
-        tk.Label(
-            header, 
-            text="✏️ Edit Trade", 
-            bg="#0F172A", 
-            fg="#F8FAFC", 
-            font=(ModernStyle.FONT_FAMILY, 22, "bold")
-        ).pack(anchor="w", padx=28, pady=(20, 4))
-        
-        tk.Label(
-            header, 
-            text=f"Trade ID: {trade_id}", 
-            bg="#0F172A", 
-            fg="#94A3B8", 
-            font=(ModernStyle.FONT_FAMILY, 12)
-        ).pack(anchor="w", padx=28, pady=(0, 12))
+        # ── Header ─────────────────────────────────────────────────────────────
+        # Accent top bar
+        tk.Frame(win, bg=ModernStyle.ACCENT_PRIMARY, height=4).pack(fill="x")
 
-        # Main content card with refined clear styling
-        card = tk.Frame(win, bg="#FFFFFF", highlightbackground="#E2E8F0", highlightthickness=1)
-        card.pack(fill="both", expand=True, padx=24, pady=24)
+        header = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
+        header.pack(fill="x", padx=28, pady=(18, 0))
 
-        form = tk.Frame(card, bg="#FFFFFF")
-        form.pack(fill="x", padx=24, pady=24)
+        # Big stock name
+        tk.Label(
+            header,
+            text=symbol.upper() if symbol else "Edit Trade",
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.ACCENT_PRIMARY,
+            font=ModernStyle.FONT_SYMBOL_LARGE,
+        ).pack(anchor="w")
+
+        tk.Label(
+            header,
+            text=f"✏️  Editing Trade  ·  {trade_id}",
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            font=ModernStyle.FONT_BODY,
+        ).pack(anchor="w", pady=(2, 12))
+
+        # Thin divider
+        tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+
+        # ── Form card ──────────────────────────────────────────────────────────
+        card = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
+        card.pack(fill="both", expand=True, padx=24, pady=16)
+
+        form = tk.Frame(card, bg=ModernStyle.BG_PRIMARY)
+        form.pack(fill="x")
         for i in range(2):
             form.grid_columnconfigure(i, weight=1)
 
-        def _field(label: str, emoji: str, r: int, c: int, var: tk.StringVar, *, readonly: bool = False, is_date: bool = False):
-            # Label with emoji - larger, more readable
-            label_frame = tk.Frame(form, bg="#FFFFFF")
-            label_frame.grid(row=r * 2, column=c, sticky="w", pady=(8 if r > 0 else 0, 6), padx=(0, 16 if c == 0 else 0))
-            
-            tk.Label(
-                label_frame, 
-                text=f"{emoji} {label}", 
-                bg="#FFFFFF", 
-                fg="#0F172A", 
-                font=(ModernStyle.FONT_FAMILY, 13, "bold")
-            ).pack(side="left")
-            
-            # Entry with enhanced styling - soft premium look simulating rounded inputs
-            ent_wrap = tk.Frame(form, bg="#E2E8F0", padx=1, pady=1) # subtle border
-            ent_wrap.grid(row=r * 2 + 1, column=c, sticky="ew", pady=(0, 14), padx=(0, 16 if c == 0 else 0))
-            
+        BG = ModernStyle.BG_PRIMARY
+        BORDER = "#E2E8F0"
+        FG = "#0F172A"
+
+        def _label(text, r, c):
+            tk.Label(form, text=text, bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+                     font=ModernStyle.FONT_BODY_BOLD).grid(
+                row=r * 2, column=c, sticky="w",
+                pady=(10 if r > 0 else 0, 4), padx=(0, 12 if c == 0 else 0))
+
+        def _entry_widget(r, c, var, *, is_date=False):
+            wrap = tk.Frame(form, bg=BORDER, padx=1, pady=1)
+            wrap.grid(row=r * 2 + 1, column=c, sticky="ew",
+                      pady=(0, 4), padx=(0, 12 if c == 0 else 0))
             if is_date:
-                ent = _create_date_input(ent_wrap, var)
+                ent = _create_date_input(wrap, var)
                 ent.pack(fill="both", expand=True)
             else:
-                ent = tk.Entry(
-                    ent_wrap, 
-                    textvariable=var, 
-                    bg="#F8FAFC", 
-                    fg="#0F172A", 
-                    font=(ModernStyle.FONT_FAMILY, 14), 
-                    relief=tk.FLAT,
-                    insertbackground="#3b82f6",
-                    highlightthickness=0
-                )
-                if readonly:
-                    try:
-                        ent.configure(state="readonly", disabledbackground="#F1F5F9", disabledforeground="#94A3B8")
-                    except Exception:
-                        pass
-                
-                # Active style on focus
-                def _on_focus_in(e, wrap=ent_wrap, inner=ent):
-                    wrap.configure(bg="#3b82f6") # blue ring
-                    inner.configure(bg="#FFFFFF")
-                def _on_focus_out(e, wrap=ent_wrap, inner=ent):
-                    wrap.configure(bg="#E2E8F0") # neutral ring
-                    inner.configure(bg="#F8FAFC")
-                
-                ent.bind("<FocusIn>", _on_focus_in)
-                ent.bind("<FocusOut>", _on_focus_out)
-                
+                ent = tk.Entry(wrap, textvariable=var, bg="#F8FAFC", fg=FG,
+                               font=ModernStyle.FONT_TABLE, relief=tk.FLAT,
+                               insertbackground=ModernStyle.ACCENT_PRIMARY, highlightthickness=0)
+                def _fi(e, w=wrap, i=ent): w.configure(bg=ModernStyle.ACCENT_PRIMARY); i.configure(bg="#FFFFFF")
+                def _fo(e, w=wrap, i=ent): w.configure(bg=BORDER); i.configure(bg="#F8FAFC")
+                ent.bind("<FocusIn>", _fi)
+                ent.bind("<FocusOut>", _fo)
                 ent.pack(fill="both", expand=True, ipady=6, padx=8)
             return ent
 
         self._edit_broker_var = tk.StringVar(value=(broker or "").strip())
-        self._edit_date_var = tk.StringVar(value=(date or "").strip())
+        self._edit_date_var   = tk.StringVar(value=(date or "").strip())
         self._edit_symbol_var = tk.StringVar(value=(symbol or "").strip().upper())
-        self._edit_type_var = tk.StringVar(value=(trade_type or "BUY").strip().upper())
-        self._edit_qty_var = tk.StringVar(value=str(qty).replace(",", "").replace("₹", "").strip())
-        self._edit_price_var = tk.StringVar(value=str(price).replace(",", "").replace("₹", "").strip())
-        self._edit_fee_var = tk.StringVar(value=str(fee).replace(",", "").replace("₹", "").strip())
+        self._edit_type_var   = tk.StringVar(value=(trade_type or "BUY").strip().upper())
+        self._edit_qty_var    = tk.StringVar(value=str(qty).replace(",", "").replace("₹", "").strip())
+        self._edit_price_var  = tk.StringVar(value=str(price).replace(",", "").replace("₹", "").strip())
+        self._edit_fee_var    = tk.StringVar(value=str(fee).replace(",", "").replace("₹", "").strip())
 
-        _field("Broker", "👑", 0, 0, self._edit_broker_var)
-        _field("Trade Date", "📅", 0, 1, self._edit_date_var, is_date=True)
-        _field("Symbol", "💎", 1, 0, self._edit_symbol_var)
-        _field("Quantity", "📊", 1, 1, self._edit_qty_var)
+        # Row 0: Broker dropdown + Date
+        _label("👑  Broker", 0, 0)
+        # Broker dropdown — fetch distinct broker names from trade table
+        broker_wrap = tk.Frame(form, bg=BORDER, padx=1, pady=1)
+        broker_wrap.grid(row=1, column=0, sticky="ew", pady=(0, 4), padx=(0, 12))
+        try:
+            import model.crud as _crud
+            known_brokers = sorted(set(_crud.get_all_brokers()))
+        except Exception:
+            known_brokers = []
+        if broker and broker not in known_brokers:
+            known_brokers.insert(0, broker)
+        broker_cb = ttk.Combobox(broker_wrap, textvariable=self._edit_broker_var,
+                                  values=known_brokers, font=ModernStyle.FONT_TABLE,
+                                  state="normal")
+        broker_cb.pack(fill="both", expand=True, ipady=4, padx=4)
 
-        # Type with simple radio buttons - spans both columns
-        label_frame = tk.Frame(form, bg="#FFFFFF")
-        label_frame.grid(row=4, column=0, columnspan=2, sticky="w", pady=(16, 8), padx=(0, 0))
-        tk.Label(
-            label_frame, 
-            text="🌲 Trade Type", 
-            bg="#FFFFFF", 
-            fg="#0F172A", 
-            font=(ModernStyle.FONT_FAMILY, 13, "bold")
-        ).pack(side="left")
-        
-        type_wrap = tk.Frame(form, bg="#FFFFFF")
-        type_wrap.grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 14), padx=(0, 0))
-        
-        self._edit_type_buy_rb = tk.Radiobutton(
-            type_wrap,
-            text="BUY",
-            variable=self._edit_type_var,
-            value="BUY",
-            bg="#FFFFFF",
-            fg="#059669",
-            font=(ModernStyle.FONT_FAMILY, 13, "bold"),
-            selectcolor="#FFFFFF",
-            activebackground="#FFFFFF",
-            activeforeground="#10b981",
-        )
-        self._edit_type_buy_rb.pack(side="left", padx=(0, 30))
-        
-        self._edit_type_sell_rb = tk.Radiobutton(
-            type_wrap,
-            text="SELL",
-            variable=self._edit_type_var,
-            value="SELL",
-            bg="#FFFFFF",
-            fg="#DC2626",
-            font=(ModernStyle.FONT_FAMILY, 13, "bold"),
-            selectcolor="#FFFFFF",
-            activebackground="#FFFFFF",
-            activeforeground="#ef4444",
-        )
-        self._edit_type_sell_rb.pack(side="left")
+        _label("📅  Trade Date", 0, 1)
+        _entry_widget(0, 1, self._edit_date_var, is_date=True)
 
-        _field("Price (₹)", "💰", 3, 0, self._edit_price_var)
-        _field("Fees (₹)", "💸", 3, 1, self._edit_fee_var)
+        # Row 1: Symbol + Quantity
+        _label("💎  Symbol", 1, 0)
+        _entry_widget(1, 0, self._edit_symbol_var)
+        _label("📊  Quantity", 1, 1)
+        _entry_widget(1, 1, self._edit_qty_var)
 
-        # Status message area with refined styling
-        status = tk.Label(
-            card, 
-            text="", 
-            bg="#FFFFFF", 
-            fg="#64748b", 
-            font=(ModernStyle.FONT_FAMILY, 10, "italic"),
-            anchor="w"
-        )
-        status.pack(anchor="w", padx=24, pady=(8, 16), fill="x")
+        # Row 2: Price + Fees
+        _label("💰  Price (₹)", 2, 0)
+        _entry_widget(2, 0, self._edit_price_var)
+        _label("💸  Fees (₹)", 2, 1)
+        _entry_widget(2, 1, self._edit_fee_var)
 
-        # Action buttons with improved layout
-        actions = tk.Frame(card, bg="#FFFFFF")
-        actions.pack(fill="x", padx=20, pady=(0, 20))
+        # Row 3: Trade Type radio buttons
+        type_lbl_frame = tk.Frame(form, bg=BG)
+        type_lbl_frame.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        tk.Label(type_lbl_frame, text="🌲  Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+                 font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+
+        type_row = tk.Frame(form, bg=BG)
+        type_row.grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        for val, color in [("BUY", "#059669"), ("SELL", "#DC2626")]:
+            tk.Radiobutton(type_row, text=val, variable=self._edit_type_var, value=val,
+                           bg=BG, fg=color, font=ModernStyle.FONT_TABLE_BOLD,
+                           selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+
+        # ── Status + actions ──────────────────────────────────────────────────
+        tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=24, pady=(4, 0))
+
+        status = tk.Label(win, text="", bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY,
+                          font=ModernStyle.FONT_ITALIC, anchor="w")
+        status.pack(anchor="w", padx=28, pady=(8, 4), fill="x")
+
+        actions = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
+        actions.pack(fill="x", padx=24, pady=(0, 20))
 
         def _close():
             try:
@@ -599,32 +625,19 @@ class TradeHistoryView(BaseView):
                 pass
 
         ModernButton(
-            actions, 
-            text="✓ Update Trade", 
-            command=lambda: self._save_trade_edits(broker, trade_id, status, win), 
-            bg="#3b82f6", 
-            fg="#ffffff", 
-            canvas_bg="#FFFFFF", 
-            width=160, 
-            height=42,
-            radius=8,
-            font=(ModernStyle.FONT_FAMILY, 12, "bold")
+            actions, text="✓ Update Trade",
+            command=lambda: self._save_trade_edits(broker, trade_id, symbol, status, win),
+            bg=ModernStyle.ACCENT_PRIMARY, fg="#ffffff", canvas_bg=ModernStyle.BG_PRIMARY,
+            width=160, height=42, radius=8, font=ModernStyle.FONT_SUBHEADING
         ).pack(side="right")
-        
+
         ModernButton(
-            actions, 
-            text="✕ Cancel", 
-            command=_close, 
-            bg="#475569", 
-            fg="#ffffff", 
-            canvas_bg="#FFFFFF", 
-            width=130, 
-            height=42,
-            radius=8,
-            font=(ModernStyle.FONT_FAMILY, 12, "bold")
+            actions, text="✕ Cancel", command=_close,
+            bg=ModernStyle.TEXT_TERTIARY, fg="#ffffff", canvas_bg=ModernStyle.BG_PRIMARY,
+            width=120, height=42, radius=8, font=ModernStyle.FONT_SUBHEADING
         ).pack(side="right", padx=(0, 12))
 
-    def _save_trade_edits(self, broker_old: str, trade_id: str, status_label: tk.Label, dialog: tk.Toplevel) -> None:
+    def _save_trade_edits(self, broker_old: str, trade_id: str, symbol_old: str, status_label: tk.Label, dialog: tk.Toplevel) -> None:
         # Validate inputs
         try:
             broker = (self._edit_broker_var.get() or "").strip()
@@ -650,20 +663,34 @@ class TradeHistoryView(BaseView):
             status_label.configure(text=str(e), fg=ModernStyle.ERROR)
             return
 
+        rename_all = False
+        if symbol != symbol_old:
+            rename_all = messagebox.askyesno(
+                "Rename Symbol",
+                f"You changed the symbol from '{symbol_old}' to '{symbol}'.\n\nDo you want to rename ALL trades for '{symbol_old}' under broker '{broker_old}'?",
+                parent=dialog
+            )
+
         status_label.configure(text="Updating…", fg=ModernStyle.TEXT_TERTIARY)
 
         def _bg():
             err = None
             try:
-                import common.models.crud as crud
-                from common.engine import rebuild_holdings
+                import model.crud as crud
+                from model.engine import rebuild_holdings
+                from model.database import db_session
+
+                if rename_all:
+                    # Rename ALL matching trades for the old symbol under this broker
+                    with db_session() as conn:
+                        conn.execute("UPDATE trades SET symbol = ? WHERE broker = ? AND symbol = ?", (symbol, broker_old, symbol_old))
 
                 # If broker changed, delete old trade and add new one
                 if broker != broker_old:
                     crud.delete_trade(broker_old, trade_id)
                     crud.add_trade(broker, date, symbol, t_type, float(qty), float(price), float(fee), trade_id)
                 else:
-                    # Just update the trade
+                    # Just update the specific trade being actively edited (overwrites any partial rename if necessary)
                     crud.update_trade(broker, trade_id, date, symbol, t_type, float(qty), float(price), float(fee))
                 
                 try:
@@ -692,6 +719,278 @@ class TradeHistoryView(BaseView):
 
         threading.Thread(target=_bg, daemon=True).start()
 
+    def _open_add_trade_dialog(self) -> None:
+        try:
+            if self._th_edit_popup is not None and self._th_edit_popup.winfo_exists():
+                self._th_edit_popup.destroy()
+        except Exception:
+            pass
+
+        win = tk.Toplevel(self)
+        self._th_edit_popup = win
+        win.title("➕ New Trade")
+        ModernStyle.style_modal(win)
+        win.configure(bg=ModernStyle.BG_PRIMARY)
+        win.resizable(False, False)
+        win.geometry("600x540")
+        try:
+            win.transient(self.winfo_toplevel())
+            win.grab_set()
+        except Exception:
+            pass
+
+        try:
+            center_window(win, parent=self.winfo_toplevel())
+        except Exception:
+            pass
+
+        # ── Header ─────────────────────────────────────────────────────────────
+        tk.Frame(win, bg=ModernStyle.SUCCESS, height=4).pack(fill="x")
+
+        header = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
+        header.pack(fill="x", padx=28, pady=(18, 0))
+
+        tk.Label(
+            header,
+            text="➕  New Trade",
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.SUCCESS,
+            font=ModernStyle.FONT_SYMBOL_LARGE,
+        ).pack(anchor="w")
+
+        tk.Label(
+            header,
+            text="Add a new historical or manual trade entry",
+            bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            font=ModernStyle.FONT_BODY,
+        ).pack(anchor="w", pady=(2, 12))
+
+        tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+
+        # ── Form ───────────────────────────────────────────────────────────────
+        card = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
+        card.pack(fill="both", expand=True, padx=24, pady=16)
+
+        form = tk.Frame(card, bg=ModernStyle.BG_PRIMARY)
+        form.pack(fill="x")
+        for i in range(2):
+            form.grid_columnconfigure(i, weight=1)
+
+        BG = ModernStyle.BG_PRIMARY
+        BORDER = "#E2E8F0"
+        FG = "#0F172A"
+
+        def _label(text, r, c):
+            tk.Label(form, text=text, bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+                     font=ModernStyle.FONT_BODY_BOLD).grid(
+                row=r * 2, column=c, sticky="w",
+                pady=(10 if r > 0 else 0, 4), padx=(0, 12 if c == 0 else 0))
+
+        def _entry_widget(r, c, var, *, is_date=False):
+            wrap = tk.Frame(form, bg=BORDER, padx=1, pady=1)
+            wrap.grid(row=r * 2 + 1, column=c, sticky="ew",
+                      pady=(0, 4), padx=(0, 12 if c == 0 else 0))
+            if is_date:
+                ent = _create_date_input(wrap, var)
+                ent.pack(fill="both", expand=True)
+            else:
+                ent = tk.Entry(wrap, textvariable=var, bg="#F8FAFC", fg=FG,
+                               font=ModernStyle.FONT_TABLE, relief=tk.FLAT,
+                               insertbackground=ModernStyle.SUCCESS, highlightthickness=0)
+                def _fi(e, w=wrap, i=ent): w.configure(bg=ModernStyle.SUCCESS); i.configure(bg="#FFFFFF")
+                def _fo(e, w=wrap, i=ent): w.configure(bg=BORDER); i.configure(bg="#F8FAFC")
+                ent.bind("<FocusIn>", _fi)
+                ent.bind("<FocusOut>", _fo)
+                ent.pack(fill="both", expand=True, ipady=6, padx=8)
+            return ent
+
+        # Try to infer broker from current filter
+        initial_broker = ""
+        try:
+            cur_broker = self.th_broker_var.get()
+            if cur_broker and cur_broker != "All":
+                initial_broker = cur_broker
+        except Exception:
+            pass
+
+        self._add_broker_var = tk.StringVar(value=initial_broker)
+        self._add_date_var   = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        self._add_symbol_var = tk.StringVar(value="")
+        self._add_type_var   = tk.StringVar(value="BUY")
+        self._add_qty_var    = tk.StringVar(value="")
+        self._add_price_var  = tk.StringVar(value="")
+        self._add_fee_var    = tk.StringVar(value="0.0")
+
+        # Broker dropdown
+        _label("👑  Broker", 0, 0)
+        broker_wrap = tk.Frame(form, bg=BORDER, padx=1, pady=1)
+        broker_wrap.grid(row=1, column=0, sticky="ew", pady=(0, 4), padx=(0, 12))
+        try:
+            import model.crud as _crud
+            known_brokers = sorted(set(_crud.get_all_brokers()))
+        except Exception:
+            known_brokers = []
+        if initial_broker and initial_broker not in known_brokers:
+            known_brokers.insert(0, initial_broker)
+        broker_cb = ttk.Combobox(broker_wrap, textvariable=self._add_broker_var,
+                                  values=known_brokers, font=ModernStyle.FONT_TABLE,
+                                  state="normal")
+        broker_cb.pack(fill="both", expand=True, ipady=4, padx=4)
+
+        _label("📅  Trade Date", 0, 1)
+        _entry_widget(0, 1, self._add_date_var, is_date=True)
+
+        _label("💎  Symbol", 1, 0)
+        sym_ent = _entry_widget(1, 0, self._add_symbol_var)
+        _label("📊  Quantity", 1, 1)
+        _entry_widget(1, 1, self._add_qty_var)
+
+        # Stock name display: shown below the symbol entry, updated on focus-out
+        stock_name_lbl = tk.Label(form, text="", bg=BG, fg=ModernStyle.ACCENT_PRIMARY,
+                                  font=ModernStyle.FONT_BODY_BOLD, anchor="w")
+        stock_name_lbl.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+        def _on_symbol_focusout(e):
+            sym = self._add_symbol_var.get().strip().upper()
+            if not sym:
+                stock_name_lbl.configure(text="")
+                return
+            stock_name_lbl.configure(text="⏳ Looking up stock name...")
+            def _fetch():
+                try:
+                    import yfinance as yf
+                    info = yf.Ticker(sym + ".NS").info
+                    name = info.get("longName") or info.get("shortName") or ""
+                    if not name:
+                        info2 = yf.Ticker(sym).info
+                        name = info2.get("longName") or info2.get("shortName") or sym
+                except Exception:
+                    name = ""
+                def _update():
+                    stock_name_lbl.configure(text=name if name else "")
+                try:
+                    win.after(0, _update)
+                except Exception:
+                    pass
+            threading.Thread(target=_fetch, daemon=True).start()
+
+        sym_ent.bind("<FocusOut>", _on_symbol_focusout)
+
+        _label("💰  Price (₹)", 2, 0)
+        _entry_widget(2, 0, self._add_price_var)
+        _label("💸  Fees (₹)", 2, 1)
+        _entry_widget(2, 1, self._add_fee_var)
+
+        # Trade Type radio buttons
+        type_lbl_frame = tk.Frame(form, bg=BG)
+        type_lbl_frame.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        tk.Label(type_lbl_frame, text="🌲  Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+                 font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+
+        type_row = tk.Frame(form, bg=BG)
+        type_row.grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        for val, color in [("BUY", "#059669"), ("SELL", "#DC2626")]:
+            tk.Radiobutton(type_row, text=val, variable=self._add_type_var, value=val,
+                           bg=BG, fg=color, font=ModernStyle.FONT_TABLE_BOLD,
+                           selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+
+        # ── Status + Actions ────────────────────────────────────────────────────
+        tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=24, pady=(4, 0))
+
+        status = tk.Label(win, text="", bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY,
+                          font=ModernStyle.FONT_ITALIC, anchor="w")
+        status.pack(anchor="w", padx=28, pady=(8, 4), fill="x")
+
+        actions = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
+        actions.pack(fill="x", padx=24, pady=(0, 20))
+
+        def _close():
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        ModernButton(
+            actions, text="✓ Add Trade",
+            command=lambda: self._save_new_trade(status, win),
+            bg=ModernStyle.SUCCESS, fg="#ffffff", canvas_bg=ModernStyle.BG_PRIMARY,
+            width=160, height=42, radius=8, font=ModernStyle.FONT_SUBHEADING
+        ).pack(side="right")
+
+        ModernButton(
+            actions, text="✕ Cancel", command=_close,
+            bg=ModernStyle.TEXT_TERTIARY, fg="#ffffff", canvas_bg=ModernStyle.BG_PRIMARY,
+            width=120, height=42, radius=8, font=ModernStyle.FONT_SUBHEADING
+        ).pack(side="right", padx=(0, 12))
+
+    def _save_new_trade(self, status_label: tk.Label, dialog: tk.Toplevel) -> None:
+        # Validate inputs
+        try:
+            broker = (self._add_broker_var.get() or "").strip()
+            if not broker:
+                raise ValueError("Broker is required")
+            date = self._parse_date_or_none(self._add_date_var.get() or "")
+            if not date:
+                raise ValueError("Date must be YYYY-MM-DD")
+            symbol = (self._add_symbol_var.get() or "").strip().upper()
+            if not symbol:
+                raise ValueError("Symbol is required")
+            t_type = (self._add_type_var.get() or "BUY").strip().upper()
+            if t_type not in ("BUY", "SELL"):
+                raise ValueError("Type must be BUY or SELL")
+            qty = self._parse_float(self._add_qty_var.get())
+            price = self._parse_float(self._add_price_var.get())
+            fee = self._parse_float(self._add_fee_var.get())
+            if qty <= 0:
+                raise ValueError("Qty must be > 0")
+            if price <= 0:
+                raise ValueError("Price must be > 0")
+        except Exception as e:
+            status_label.configure(text=str(e), fg=ModernStyle.ERROR)
+            return
+
+        status_label.configure(text="Saving trade…", fg=ModernStyle.TEXT_TERTIARY)
+
+        def _bg():
+            err = None
+            try:
+                import model.crud as crud
+                from model.engine import rebuild_holdings
+                from model.database import db_session
+
+                import uuid
+                trade_id = str(uuid.uuid4())[:8] # Generate a temporary nice tight ID similar to the other ones
+                
+                crud.add_trade(broker, date, symbol, t_type, float(qty), float(price), float(fee), trade_id)
+                
+                try:
+                    rebuild_holdings()
+                except Exception:
+                    pass
+                try:
+                    if self.app_state and hasattr(self.app_state, "refresh_data_cache"):
+                        self.app_state.refresh_data_cache()
+                except Exception:
+                    pass
+            except Exception as e:
+                err = str(e)
+
+            def _done():
+                if err:
+                    status_label.configure(text=f"Save failed: {err}", fg=ModernStyle.ERROR)
+                    return
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
+                self._apply_filters()
+
+            self.after(0, _done)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _delete_selected(self) -> None:
         try:
             items = list(self.trade_table.selection() or [])
@@ -701,15 +1000,25 @@ class TradeHistoryView(BaseView):
             messagebox.showinfo("Trade History", "Select one or more rows to delete (Cmd-click / Shift-click).")
             return
 
+        count = len(items)
+        if count == 1:
+            vals = self.trade_table.item(items[0], "values")
+            trade_id = str(vals[2]).strip() if len(vals) > 2 else "Unknown"
+            msg = f"Are you sure you want to delete trade {trade_id}?\n\nThis action cannot be undone."
+            title = "Delete Trade"
+        else:
+            msg = f"Are you sure you want to delete {count} selected trades?\n\nThis action cannot be undone."
+            title = f"Delete {count} Trades"
+
         # Confirm
-        if not messagebox.askyesno("Delete Trades", f"Delete {len(items)} selected trade(s)?\n\nThis cannot be undone."):
+        if not messagebox.askyesno(title, msg, parent=self.winfo_toplevel()):
             return
 
         def _bg():
             err = None
             try:
-                import common.models.crud as crud
-                from common.engine import rebuild_holdings
+                import model.crud as crud
+                from model.engine import rebuild_holdings
 
                 for iid in items:
                     broker, trade_id = self._split_trade_iid(iid)
@@ -761,7 +1070,7 @@ class TradeHistoryView(BaseView):
         lines = ["\t".join(cols)]
         for iid in items:
             vals = self.trade_table.item(iid, "values")
-            lines.append("\t".join(str(v) for v in vals))
+            lines.append("\t".join(str(v).replace("₹", "").replace(",", "").replace("%", "").strip() for v in vals))
         text = "\n".join(lines)
         try:
             self.clipboard_clear()
@@ -811,7 +1120,8 @@ class TradeHistoryView(BaseView):
 
             date = str(vals[1])
             symbol = str(vals[3])
-            t_type = str(vals[4]).upper()
+            t_type_raw = str(vals[4]).upper()
+            t_type = "BUY" if "BUY" in t_type_raw else "SELL"
             qty = str(vals[5])
             price = str(vals[6])
             fee = str(vals[10])
@@ -839,15 +1149,24 @@ class TradeHistoryView(BaseView):
         """Load broker list in background to populate dropdown."""
         def _bg():
             try:
-                import common.models.crud as crud
+                import model.crud as crud
                 brokers = ["All"] + list(crud.get_all_brokers())
-                self.after(0, lambda: self.th_broker_cb.configure(values=brokers))
-                # Validate current selection against new list
-                self.after(0, lambda: self.th_broker_var.set(
-                    self.th_broker_var.get() if self.th_broker_var.get() in brokers else "All"
-                ))
+                
+                def _update_ui():
+                    curr = self.th_broker_var.get()
+                    self.th_broker_cb["values"] = brokers
+                    # Restore selection if it still exists in the new list, otherwise default to All
+                    if curr not in brokers:
+                        self.th_broker_var.set("All")
+                    else:
+                        self.th_broker_var.set(curr)
+
+                self.after(0, _update_ui)
             except Exception as e:
-                    pass
+                # Fallback to at least "All" if database fails
+                self.after(0, lambda: self.th_broker_cb.configure(values=["All"]))
+                print(f"Error loading brokers in TradeHistoryView: {e}")
+
         import threading
         threading.Thread(target=_bg, daemon=True).start()
 
@@ -909,10 +1228,19 @@ class TradeHistoryView(BaseView):
 
             def _bg():
                 try:
-                    from common.data_cache import TradeHistoryFilters
+                    from model.database import _invalidate_thread_connection
+                    from model.data_cache import TradeHistoryFilters
+                    _invalidate_thread_connection()
+                    
+                    # Refresh cache from DB to pick up latest changes
+                    try:
+                        self.app_state.data_cache.refresh_from_db()
+                    except Exception:
+                        pass
 
                     broker = (getattr(self, "th_broker_var", None).get() if hasattr(self, "th_broker_var") else "All")
-                    symbol_like = (getattr(self, "th_symbol_var", None).get() if hasattr(self, "th_symbol_var") else "")
+                    # Use get_value() from ModernEntry to ignore placeholder text
+                    symbol_like = (self.th_symbol_entry.get_value() if hasattr(self, "th_symbol_entry") else "")
                     trade_type = (getattr(self, "th_type_var", None).get() if hasattr(self, "th_type_var") else "All")
 
                     start_raw = (getattr(self, "th_start_var", None).get() if hasattr(self, "th_start_var") else "")
@@ -980,26 +1308,46 @@ class TradeHistoryView(BaseView):
         if df is None or getattr(df, "empty", True):
             # Show the empty-state overlay
             try:
-                self._empty_label.place(relx=0.5, rely=0.5, anchor="center")
+                self._empty_frame.place(relx=0.5, rely=0.5, anchor="center")
             except Exception:
                 pass
             return
 
         # Hide empty-state overlay
         try:
-            self._empty_label.place_forget()
+            self._empty_frame.place_forget()
         except Exception:
             pass
 
+        current_date = None
+        current_stripe = "odd"
+        running_tpnl = 0.0
+
         for idx, row in enumerate(df.itertuples(index=False)):
+            row_date = str(getattr(row, "date", ""))
+            try:
+                from datetime import datetime
+                disp_date = datetime.strptime(row_date, "%Y-%m-%d").strftime("%Y-%b-%d")
+            except Exception:
+                disp_date = row_date
+
+            if row_date != current_date:
+                current_date = row_date
+                current_stripe = "even" if current_stripe == "odd" else "odd"
+
             row_type = str(getattr(row, "type", "")).upper()
             qty = float(getattr(row, "qty", 0.0) or 0.0)
             price = float(getattr(row, "price", 0.0) or 0.0)
             fee = float(getattr(row, "fee", 0.0) or 0.0)
             run_qty = float(getattr(row, "run_qty", 0.0) or 0.0)
             avg_cost = float(getattr(row, "avg_cost", 0.0) or 0.0)
-            r_pnl = float(getattr(row, "running_pnl", 0.0) or 0.0)
-            pnl_disp = f"₹{r_pnl:,.2f}" if row_type == "SELL" else "—"
+            trade_pnl = float(getattr(row, "trade_pnl", 0.0) or 0.0)
+            running_tpnl += trade_pnl
+            if row_type == "SELL":
+                arrow = "🌲" if running_tpnl >= 0 else "🔻"
+                pnl_disp = f"{arrow} ₹{abs(running_tpnl):,.2f}"
+            else:
+                pnl_disp = "—"
 
             broker = str(getattr(row, "broker", "") or "").strip()
             trade_id = str(getattr(row, "trade_id", "") or "").strip()
@@ -1007,13 +1355,13 @@ class TradeHistoryView(BaseView):
 
             type_disp = row_type
             if row_type == "BUY":
-                type_disp = "🟢  B"
+                type_disp = "🌲 Buy"
             elif row_type == "SELL":
-                type_disp = "🔻  S" # 🔴
+                type_disp = "🔻 Sell" # 🔴
 
             values = (
                 str(idx + 1),
-                str(getattr(row, "date", "")),
+                disp_date,
                 trade_id,
                 str(getattr(row, "symbol", "")),
                 type_disp,
@@ -1024,11 +1372,10 @@ class TradeHistoryView(BaseView):
                 pnl_disp,
                 f"₹{fee:,.2f}",
             )
-            stripe = "even" if (idx % 2 == 0) else "odd"
             type_tag = "buy" if row_type == "BUY" else "sell"
             try:
-                self.trade_table.insert("", "end", iid=iid, values=values, tags=(stripe, type_tag))
+                self.trade_table.insert("", "end", iid=iid, values=values, tags=(current_stripe, type_tag))
             except Exception:
                 # Fallback if iid collides (should be rare)
-                self.trade_table.insert("", "end", values=values, tags=(stripe, type_tag))
+                self.trade_table.insert("", "end", values=values, tags=(current_stripe, type_tag))
 

@@ -20,13 +20,11 @@ class SettingsView(BaseView):
         self._data_loaded = False
         self._broker_trade_counts = {}
 
-        header_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY, height=60)
-        header_frame.pack(fill="x", padx=15, pady=(15, 10))
-        tk.Label(header_frame, text="⚙️ Settings", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_TITLE).pack(anchor="w")
-        tk.Label(header_frame, text="Configuration and broker management", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
-
-        # Accent divider
-        tk.Frame(self, bg="#D4AF37", height=1).pack(fill="x", padx=15, pady=(10, 10))
+        self.add_gradient_header(
+            self,
+            "⚙️ Settings",
+            "Configure application preferences and data management."
+        )
 
         # Main content area using a 2-column layout to avoid vertical scroll
         content = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)

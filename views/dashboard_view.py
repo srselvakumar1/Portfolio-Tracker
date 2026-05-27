@@ -13,15 +13,12 @@ from ui_theme import ModernStyle
 from ui_widgets import ModernButton, PremiumModal, ModernCard
 from ui_utils import center_window, add_treeview_copy_menu
 
-
 # ── Small utility helpers ──────────────────────────────────────────────────────
 
-def _money(v) -> str:
-    """Format a float as ₹ with commas."""
-    try:
-        return f"₹{float(v or 0.0):,.2f}"
-    except Exception:
-        return "₹0.00"
+def _money(v, currency: str = "INR") -> str:
+    """Format a float with correct currency symbol."""
+    from ui_utils import format_money
+    return format_money(v, currency)
 
 
 def _pct(v) -> str:
@@ -32,17 +29,20 @@ def _pct(v) -> str:
         return "0.00%"
 
 
-def _compact_money(v) -> str:
-    """Format large rupee amounts as 1.2L / 50K / etc."""
+def _compact_money(v, currency: str = "INR") -> str:
+    """Format large amounts as compact strings (1.2L / 50K / etc.) with correct symbol."""
+    from ui_utils import format_money
+    symbols = {"INR": "₹", "JPY": "¥", "USD": "$", "GBP": "£", "CNY": "¥"}
+    sym = symbols.get(currency.upper(), "₹")
     try:
         f = float(v or 0.0)
         if abs(f) >= 1_00_000:
-            return f"₹{f/1_00_000:.2f}L"
+            return f"{sym}{f/1_00_000:.2f}L"
         if abs(f) >= 1_000:
-            return f"₹{f/1_000:.1f}K"
-        return f"₹{f:,.0f}"
+            return f"{sym}{f/1_000:.1f}K"
+        return f"{sym}{f:,.0f}"
     except Exception:
-        return "₹0"
+        return f"{sym}0"
 
 
 class DashboardView(BaseView):
@@ -56,9 +56,6 @@ class DashboardView(BaseView):
         self._polling_active = False # Tracks if the robust poller is running
 
         self._main_canvas = tk.Canvas(self, bg=ModernStyle.BG_PRIMARY, highlightthickness=0)
-        # vscroll = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        # canvas.configure(yscrollcommand=vscroll.set)
-        # vscroll.pack(side="right", fill="y")
         self._main_canvas.pack(side="left", fill="both", expand=True)
 
         self._content = tk.Frame(self._main_canvas, bg=ModernStyle.BG_PRIMARY)
@@ -72,57 +69,119 @@ class DashboardView(BaseView):
         self._main_canvas.bind("<Configure>", _on_configure)
         _enable_canvas_mousewheel(self._main_canvas, include_widget=self._content)
 
-        # ── Header row ─────────────────────────────────────────────────────────
-        header = tk.Frame(self._content, bg=ModernStyle.BG_PRIMARY)
-        header.pack(fill="x", padx=20, pady=(20, 4))
+        # ── Gradient Header Banner ─────────────────────────────────────────────
+        self._header_canvas = tk.Canvas(
+            self._content, bg=ModernStyle.BG_PRIMARY, highlightthickness=0, height=75
+        )
+        self._header_canvas.pack(fill="x", padx=20, pady=(6, 4))
 
-        left_hdr = tk.Frame(header, bg=ModernStyle.BG_PRIMARY)
-        left_hdr.pack(side="left", fill="y")
-        tk.Label(
-            left_hdr,
-            text="🇮🇳 Portfolio Dashboard",
-            fg=ModernStyle.ACCENT_PRIMARY,
-            bg=ModernStyle.BG_PRIMARY,
+        # Gradient colors: deep blue → teal
+        self._grad_start = (30, 58, 138)   # #1E3A8A
+        self._grad_end   = (13, 148, 136)  # #0D9488
+
+        def _draw_header_gradient(event=None):
+            w = event.width if event else self._header_canvas.winfo_width()
+            h = event.height if event else self._header_canvas.winfo_height()
+            if w < 10:
+                return
+            self._header_canvas.delete("gradient")
+            steps = max(1, w // 4)  # ~1 rect per 4px for performance
+            for i in range(steps):
+                t = i / max(1, steps - 1)
+                r = int(self._grad_start[0] + (self._grad_end[0] - self._grad_start[0]) * t)
+                g = int(self._grad_start[1] + (self._grad_end[1] - self._grad_start[1]) * t)
+                b = int(self._grad_start[2] + (self._grad_end[2] - self._grad_start[2]) * t)
+                color = f"#{r:02x}{g:02x}{b:02x}"
+                x0 = int(i * w / steps)
+                x1 = int((i + 1) * w / steps) + 1
+                self._header_canvas.create_rectangle(x0, 0, x1, h, fill=color, outline="", tags="gradient")
+            # Dynamically match right frame background to the gradient color
+            t_right = max(0, min(1, (w - 70) / max(1, w)))
+            r = int(self._grad_start[0] + (self._grad_end[0] - self._grad_start[0]) * t_right)
+            g = int(self._grad_start[1] + (self._grad_end[1] - self._grad_start[1]) * t_right)
+            b = int(self._grad_start[2] + (self._grad_end[2] - self._grad_start[2]) * t_right)
+            right_color = f"#{r:02x}{g:02x}{b:02x}"
+            try:
+                _right_frame.config(bg=right_color)
+                self.refresh_status.config(bg=right_color)
+                self.refresh_btn.config(bg=right_color)
+            except NameError:
+                pass
+
+            # Raise text items above gradient
+            self._header_canvas.tag_raise("header_content")
+
+        # Greeting text on the gradient
+        hour = datetime.now().hour
+        if 5 <= hour < 12:
+            greeting = "Good Morning ☀️"
+        elif 12 <= hour < 17:
+            greeting = "Good Afternoon 🌤️"
+        else:
+            greeting = "Good Evening 🌙"
+
+        # Place labels as Canvas window items for correct layering
+        # Actually, for Tkinter compatibility, embed frames on the canvas:
+        _greeting_lbl = tk.Label(
+            self._header_canvas,
+            text=f"⚡ {greeting}, Selvakumar Rajagopalan",
+            fg="#FFFFFF",
+            bg="#1E3A8A",
             font=ModernStyle.FONT_PAGE_TITLE,
-        ).pack(anchor="w")
+        )
+        self._header_canvas.create_window(
+            20, 18, window=_greeting_lbl, anchor="w", tags="header_content"
+        )
+
         self._header_subtitle = tk.Label(
-            left_hdr,
+            self._header_canvas,
             text="Loading portfolio data…",
-            fg=ModernStyle.TEXT_TERTIARY,
-            bg=ModernStyle.BG_PRIMARY,
+            fg="#94A3B8",
+            bg="#1E3A8A",
             font=ModernStyle.FONT_BODY,
         )
-        self._header_subtitle.pack(anchor="w", pady=(2, 0))
+        self._header_canvas.create_window(
+            20, 45, window=self._header_subtitle, anchor="w", tags="header_content"
+        )
 
-        right_hdr = tk.Frame(header, bg=ModernStyle.BG_PRIMARY)
-        right_hdr.pack(side="right", fill="y")
-
+        # Right side: refresh status + button
+        _right_frame = tk.Frame(self._header_canvas, bg="#0D9488")
         self.refresh_status = tk.Label(
-            right_hdr,
+            _right_frame,
             text="",
-            fg=ModernStyle.TEXT_TERTIARY,
-            bg=ModernStyle.BG_PRIMARY,
+            fg="#CBD5E1",
+            bg="#0D9488",
             font=ModernStyle.FONT_SMALL,
         )
         self.refresh_status.pack(anchor="e", pady=(0, 4))
 
         self.refresh_btn = ModernButton(
-            right_hdr,
+            _right_frame,
             text="⚡️ Refresh",
             command=self._on_refresh_market_data,
-            bg=ModernStyle.ACCENT_TERTIARY,
+            bg="#D97706",
             fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_PRIMARY,
+            canvas_bg="#0D9488",
             width=100,
             height=32,
             radius=10,
             font=ModernStyle.FONT_SUBHEADING,
         )
         self.refresh_btn.pack(anchor="e")
+        self._header_canvas.create_window(
+            0, 37, window=_right_frame, anchor="e", tags=("header_content", "right_hdr")
+        )
+
+        # Reposition right_frame to the right edge on resize
+        def _reposition_right(event=None):
+            w = event.width if event else self._header_canvas.winfo_width()
+            if w > 10:
+                self._header_canvas.coords("right_hdr", w - 20, 37)
+        self._header_canvas.bind("<Configure>", lambda e: (_draw_header_gradient(e), _reposition_right(e)))
 
         # Thin accent divider under header
-        tk.Frame(self._content, bg=ModernStyle.BRAND_GOLD, height=1).pack(
-            fill="x", padx=20, pady=(10, 0)
+        tk.Frame(self._content, bg=ModernStyle.BRAND_GOLD, height=2).pack(
+            fill="x", padx=20, pady=(4, 0)
         )
 
         # ── KPI Cards ─────────────────────────────────────────────────────────
@@ -197,7 +256,10 @@ class DashboardView(BaseView):
                 bg=ModernStyle.BG_SECONDARY,
                 font=ModernStyle.FONT_TINY,
             )
-            trend_lbl.pack(anchor="w")
+            trend_lbl.pack(anchor="w", pady=(0, 4))
+            
+            # Store the card itself for styling
+            self._kpi_cards[key] = card
             # Store a ref so we can update it later
             setattr(val, "_trend_lbl", trend_lbl)
 
@@ -446,6 +508,112 @@ class DashboardView(BaseView):
             print(f"Dashboard load error: {e}")
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Animated KPI counter
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _animate_counter(
+        self,
+        label: tk.Label,
+        end_val: float,
+        *,
+        is_currency: bool = True,
+        duration_ms: int = 400,
+        fg: str | None = None,
+    ) -> None:
+        """Animate a label's text from 0 to end_val with ease-out cubic easing."""
+        if fg:
+            label.config(fg=fg)
+
+        # Cancel any existing animation on this label
+        anim_key = f"_anim_{id(label)}"
+        old_id = getattr(self, anim_key, None)
+        if old_id:
+            try:
+                self.after_cancel(old_id)
+            except Exception:
+                pass
+
+        start_val = 0.0
+        frame_ms = 16  # ~60fps
+        total_frames = max(1, duration_ms // frame_ms)
+        frame = [0]  # mutable counter
+
+        def _fmt(v: float) -> str:
+            if is_currency:
+                # Dashboard KPI totals are always INR-converted aggregates
+                return f"₹{v:,.2f}"
+            else:
+                return f"{v:,.2f}%"
+
+        def _ease_out_cubic(t: float) -> float:
+            return 1.0 - (1.0 - t) ** 3
+
+        def _step():
+            frame[0] += 1
+            t = min(1.0, frame[0] / total_frames)
+            eased = _ease_out_cubic(t)
+            current = start_val + (end_val - start_val) * eased
+            try:
+                label.config(text=_fmt(current))
+            except Exception:
+                return
+            if t < 1.0:
+                aid = self.after(frame_ms, _step)
+                setattr(self, anim_key, aid)
+            else:
+                label.config(text=_fmt(end_val))  # ensure exact final value
+                setattr(self, anim_key, None)
+
+        # Start immediately
+        label.config(text=_fmt(0.0))
+        aid = self.after(frame_ms, _step)
+        setattr(self, anim_key, aid)
+
+    def _tint_kpi_card(
+        self,
+        key: str,
+        value: float,
+        *,
+        force_negative: bool = False,
+    ) -> None:
+        """Apply a faint green/red background tint to a KPI card based on its value."""
+        card = self._kpi_cards.get(key)
+        if card is None:
+            return
+
+        if force_negative or value < 0:
+            tint_bg = "#FEF2F2"   # Very faint red (Red 50)
+            tint_inner = "#FEE2E2"  # Red 100 for inner content
+        elif value > 0:
+            tint_bg = "#F0FDF4"   # Very faint green (Green 50)
+            tint_inner = "#DCFCE7"  # Green 100
+        else:
+            return  # No tint for zero
+
+        try:
+            # Update the card's content frame background
+            card.content.configure(bg=tint_inner)
+            # Update all immediate children of content
+            for child in card.content.winfo_children():
+                try:
+                    child.configure(bg=tint_inner)
+                except Exception:
+                    pass
+                # And their children (body, title_row, labels)
+                for grandchild in child.winfo_children():
+                    try:
+                        grandchild.configure(bg=tint_inner)
+                    except Exception:
+                        pass
+                    for gc in grandchild.winfo_children():
+                        try:
+                            gc.configure(bg=tint_inner)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Payload application
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -480,15 +648,29 @@ class DashboardView(BaseView):
             xirr      = float(metrics.get("overall_xirr", 0.0) or 0.0)
             cagr      = float(metrics.get("overall_cagr", 0.0) or 0.0)
 
-            _set("total_value",   _money(total_v))
-            _set("total_invested",_money(total_inv))
-            _set("overall_pnl",  _money(pnl),  ModernStyle.SUCCESS if pnl >= 0 else ModernStyle.ERROR)
-            _set("unrealized_pnl",_money(upnl), ModernStyle.SUCCESS if upnl >= 0 else ModernStyle.ERROR)
-            _set("unrealized_loss",_money(uloss), ModernStyle.ERROR)
-            _set("realized_pnl", _money(rpnl),  ModernStyle.SUCCESS if rpnl >= 0 else ModernStyle.ERROR)
-            _set("realized_loss",_money(rloss),  ModernStyle.ERROR)
-            _set("overall_xirr", _pct(xirr),    ModernStyle.SUCCESS if xirr >= 0 else ModernStyle.ERROR)
-            _set("overall_cagr", _pct(cagr),    ModernStyle.SUCCESS if cagr >= 0 else ModernStyle.ERROR)
+            # ── Animated KPI counters (count-up from 0) ────────────────────
+            def _anim(key: str, val: float, *, is_cur: bool = True, fg: str | None = None):
+                lbl = self.kpi_labels.get(key)
+                if lbl is None:
+                    return
+                self._animate_counter(lbl, val, is_currency=is_cur, fg=fg)
+
+            _anim("total_value",    total_v)
+            _anim("total_invested", total_inv)
+            _anim("overall_pnl",    pnl,   fg=ModernStyle.SUCCESS if pnl >= 0 else ModernStyle.ERROR)
+            _anim("unrealized_pnl", upnl,  fg=ModernStyle.SUCCESS if upnl >= 0 else ModernStyle.ERROR)
+            _anim("unrealized_loss", uloss, fg=ModernStyle.ERROR)
+            _anim("realized_pnl",   rpnl,  fg=ModernStyle.SUCCESS if rpnl >= 0 else ModernStyle.ERROR)
+            _anim("realized_loss",  rloss, fg=ModernStyle.ERROR)
+            _anim("overall_xirr",   xirr,  is_cur=False, fg=ModernStyle.SUCCESS if xirr >= 0 else ModernStyle.ERROR)
+            _anim("overall_cagr",   cagr,  is_cur=False, fg=ModernStyle.SUCCESS if cagr >= 0 else ModernStyle.ERROR)
+
+            # ── Color-coded P&L background tinting ────────────────────────
+            self._tint_kpi_card("overall_pnl",    pnl)
+            self._tint_kpi_card("unrealized_pnl", upnl)
+            self._tint_kpi_card("unrealized_loss", uloss, force_negative=True)
+            self._tint_kpi_card("realized_pnl",   rpnl)
+            self._tint_kpi_card("realized_loss",  rloss, force_negative=True)
 
             # Trend labels and Sparklines
             def _set_trend(key: str, text: str, trend_points: list = None):
@@ -722,17 +904,19 @@ class DashboardView(BaseView):
                 top_line = tk.Frame(row, bg=row_bg)
                 top_line.pack(fill="x", padx=10, pady=(8, 2))
 
+                _cur = str(item.get("currency", "INR") or "INR").upper()
+                from ui_utils import format_money
                 tk.Label(top_line, text="⚠️", bg=row_bg, font=ModernStyle.FONT_SUBHEADING).pack(side="left", padx=(0, 6))
                 tk.Label(top_line, text=sym or "—", fg=ModernStyle.ACCENT_PRIMARY, bg=row_bg, font=ModernStyle.FONT_SUBHEADING).pack(side="left")
                 tk.Label(
                     top_line,
-                    text=f"₹{loss:,.2f}",
+                    text=format_money(loss, _cur),
                     fg=ModernStyle.ERROR if loss < 0 else ModernStyle.SUCCESS,
                     bg=row_bg,
                     font=ModernStyle.FONT_BODY_BOLD,
                 ).pack(side="right")
 
-                tk.Label(row, text=f"Qty {qty}  •  Avg ₹{avg:,.2f}",
+                tk.Label(row, text=f"Qty {qty}  \u2022  Avg {format_money(avg, _cur)}",
                          fg=ModernStyle.TEXT_SECONDARY, bg=row_bg,
                          font=ModernStyle.FONT_TINY).pack(anchor="w", padx=36, pady=(0, 8))
 
@@ -812,7 +996,8 @@ class DashboardView(BaseView):
                 )
                 chip.pack(side="right", padx=(0, 2))
 
-                detail = f"IV ₹{iv:,.0f}  •  Curr ₹{cp:,.0f}  •  Gap {diff_pct:+.1f}%"
+                _sym_iv = "¥" if str(item.get("currency", "INR")).upper() == "JPY" else "₹"
+                detail = f"IV {_sym_iv}{iv:,.0f}  •  Curr {_sym_iv}{cp:,.0f}  •  Gap {diff_pct:+.1f}%"
                 tk.Label(row, text=detail, fg=ModernStyle.TEXT_TERTIARY, bg=row_bg, font=ModernStyle.FONT_TINY).pack(anchor="w", padx=36, pady=(0, 8))
 
 
@@ -914,7 +1099,7 @@ class DashboardView(BaseView):
         act = tk.Frame(body, bg=ModernStyle.BG_PRIMARY)
         act.pack(fill="x", pady=(0, 8))
 
-        cols = ("#", "Date", "Trade ID", "Type", "Qty", "Price ₹", "Fees ₹", "Run Qty", "AvgCost ₹", "Running PnL ₹", "Broker")
+        cols = ("#", "Date", "Trade ID", "Type", "Qty", "Price ₹", "Fees ₹", "Running Qty", "AvgCost ₹", "Running PnL ₹", "Broker")
         table = tk.Frame(body, bg=ModernStyle.BG_PRIMARY)
         table.pack(fill="both", expand=True)
 
@@ -1018,6 +1203,8 @@ class DashboardView(BaseView):
                     run_qty = float(getattr(r, "run_qty", 0.0) or 0.0)
                     avg_cost = float(getattr(r, "avg_cost", 0.0) or 0.0)
                     rpnl  = float(getattr(r, "running_pnl", 0.0) or 0.0)
+                    row_currency = str(getattr(r, "currency", "INR") or "INR").upper()
+                    from ui_utils import format_money
 
                     if rtype in {"BUY", "B"}:
                         total_buy += qty
@@ -1042,11 +1229,11 @@ class DashboardView(BaseView):
                         str(getattr(r, "trade_id", "")),
                         type_disp,
                         f"{qty:g}",
-                        f"₹{price:,.2f}",
-                        f"₹{fee:,.2f}",
+                        format_money(price, row_currency),
+                        format_money(fee, row_currency),
                         f"{run_qty:g}",
-                        f"₹{avg_cost:,.2f}",
-                        f"₹{rpnl:,.2f}",
+                        format_money(avg_cost, row_currency),
+                        format_money(rpnl, row_currency),
                         str(getattr(r, "broker", "")),
                     )
                     stripe   = "odd" if idx % 2 else "even"
@@ -1261,6 +1448,12 @@ class DashboardView(BaseView):
             self.refresh_status.config(text=f"✅ Updated {datetime.now().strftime('%H:%M:%S')}")
             self._data_loaded = False
             self.load_data()
+            # Also refresh sidebar investment & status data
+            try:
+                if self.app_state and hasattr(self.app_state, 'sidebar'):
+                    self.app_state.sidebar.refresh_sidebar_data()
+            except Exception:
+                pass
 
     def _copy_performers(self, is_top: bool):
         try:
@@ -1304,8 +1497,10 @@ class DashboardView(BaseView):
                 signal = str(item.get("signal", "") or "").strip().upper()
                 iv = float(item.get("iv", 0.0) or 0.0)
                 cp = float(item.get("current_price", 0.0) or 0.0)
+                cur = str(item.get("currency", "INR") or "INR").upper()
                 diff = ((iv - cp) / cp * 100.0) if cp else 0.0
-                lines.append(f"{signal}	{sym}	₹{iv:,.0f}	₹{cp:,.0f}	{diff:+.1f}%")
+                _s = "¥" if cur == "JPY" else "₹"
+                lines.append(f"{signal}	{sym}	{_s}{iv:,.0f}	{_s}{cp:,.0f}	{diff:+.1f}%")
                 
             if len(lines) == 1:
                 messagebox.showinfo("Copy", "No structured insights to copy.")
@@ -1334,8 +1529,10 @@ class DashboardView(BaseView):
                     qty = item.get("qty", "")
                     avg = float(item.get("avg_price", 0.0) or 0.0)
                     broker = str(item.get("broker", "") or "").strip()
+                    cur = str(item.get("currency", "INR") or "INR").upper()
+                    from ui_utils import format_money
                     if sym:
-                        lines.append(f"{sym}	₹{loss:,.2f}	{qty}	₹{avg:,.2f}	{broker}")
+                        lines.append(f"{sym}	{format_money(loss, cur)}	{qty}	{format_money(avg, cur)}	{broker}")
                 
             if len(lines) == 1:
                 messagebox.showinfo("Copy", "No structured symbols to copy.")

@@ -37,133 +37,142 @@ class HoldingsView(BaseView):
         self.load_data()
     
     def _build_header(self):
-        header = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        header.pack(fill=tk.X, padx=20, pady=4)
-        
-        title = tk.Label(
-            header,
-            text="💹 Holdings",
-            font=ModernStyle.FONT_PAGE_TITLE,
-            bg=ModernStyle.BG_PRIMARY,
-            fg=ModernStyle.ACCENT_PRIMARY
+        self.add_gradient_header(
+            self,
+            "💹 Holdings",
+            "Manage and monitor your stock portfolio",
+            show_divider=False
         )
-        title.pack(anchor=tk.W)
-        
-        subtitle = tk.Label(
-            header,
-            text="Manage and monitor your stock portfolio",
-            font=ModernStyle.FONT_BODY,
-            bg=ModernStyle.BG_PRIMARY,
-            fg=ModernStyle.TEXT_SECONDARY
-        )
-        subtitle.pack(anchor=tk.W)
-        
-        # Accent divider
-        tk.Frame(self, bg=ModernStyle.BRAND_GOLD, height=1).pack(fill="x", padx=20, pady=(10, 5))
     
     def _build_filter_panel(self):
-        """Build filters: broker, symbol, signal with colored pill styling."""
-        filter_frame = tk.Frame(
-            self,
-            bg=ModernStyle.BG_PRIMARY,
-            highlightbackground=ModernStyle.BORDER_COLOR,
-            highlightthickness=0,
-        )
-        filter_frame.pack(fill=tk.X, padx=20, pady=4)
-        
-        # Broker filter with background pill
-        broker_pill = ModernCard(filter_frame, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.ACCENT_PRIMARY_PALE, highlight_thickness=1, radius=8)
-        broker_pill.pack(side=tk.LEFT, padx=3, pady=3)
-        tk.Label(broker_pill.content, text="🏦 Broker:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
+        """Build filters grouped into two visual zones, separated by a colored divider."""
+        from ui_widgets import ModernSegmentedControl
+
+        CTRL_HEIGHT = 32  # unified control height for the whole bar
+        FONT = ModernStyle.FONT_HEADING
+
+        filter_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        filter_frame.pack(fill=tk.X, padx=20, pady=(4, 2))
+
+        # ── GROUP 1: Search ────────────────────────────────────────────────────
+        grp1 = tk.Frame(filter_frame, bg=ModernStyle.BG_SECONDARY)
+        grp1.pack(side=tk.LEFT, padx=(0, 0), pady=4, anchor=tk.CENTER)
+
+        # Broker
+        tk.Label(
+            grp1, text="🏦 Broker:", bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_PRIMARY, font=FONT
+        ).pack(side=tk.LEFT, padx=(10, 4), pady=4, anchor=tk.CENTER)
         self.broker_var = tk.StringVar(value="All")
-        self.broker_combo = ttk.Combobox(broker_pill.content, textvariable=self.broker_var, values=["All"], state="readonly", width=13, font=ModernStyle.FONT_TABLE)
-        self.broker_combo.pack(side=tk.LEFT, padx=3, pady=5)
+        self.broker_combo = ttk.Combobox(
+            grp1, textvariable=self.broker_var,
+            values=["All"], state="readonly", width=12, font=ModernStyle.FONT_TABLE
+        )
+        self.broker_combo.pack(side=tk.LEFT, padx=(0, 6), pady=6, anchor=tk.CENTER)
         try:
             self.broker_var.trace_add("write", lambda *args: self.on_filter_change())
         except Exception:
             pass
-        
-        # Symbol search with background pill
-        symbol_pill = ModernCard(filter_frame, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.ACCENT_PURPLE_PALE, highlight_thickness=1, radius=8)
-        symbol_pill.pack(side=tk.LEFT, padx=3, pady=3)
-        tk.Label(symbol_pill.content, text="🔍 Symbol:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
-        self.symbol_var = tk.StringVar()
+
+        # Thin inner divider
+        tk.Frame(grp1, bg=ModernStyle.ACCENT_PRIMARY, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, pady=6
+        )
+
+        # Symbol search
+        tk.Label(
+            grp1, text="🔍 Symbol:", bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_PRIMARY, font=FONT
+        ).pack(side=tk.LEFT, padx=(8, 4), pady=4, anchor=tk.CENTER)
         self._symbol_bar = ClearableEntry(
-            symbol_pill.content,
+            grp1,
             placeholder="Search...",
             on_change=self._on_symbol_search,
             bg=ModernStyle.ENTRY_BG,
             fg=ModernStyle.ACCENT_PRIMARY,
             font=ModernStyle.FONT_INPUT,
-            width=17,
+            width=15,
         )
-        self._symbol_bar.pack(side=tk.LEFT, padx=3, pady=3)
-        self._symbol_bar.entry.bind("<FocusIn>",  lambda e: fade_color_transition(symbol_pill, ModernStyle.ACCENT_PURPLE_PALE, ModernStyle.ACCENT_PURPLE, attr='highlight_color'), add="+")
-        self._symbol_bar.entry.bind("<FocusOut>", lambda e: fade_color_transition(symbol_pill, ModernStyle.ACCENT_PURPLE, ModernStyle.ACCENT_PURPLE_PALE, attr='highlight_color'), add="+")
+        self._symbol_bar.pack(side=tk.LEFT, padx=(0, 10), pady=6, anchor=tk.CENTER)
         self.symbol_entry = self._symbol_bar.entry
-        
-        # Signal filter with background pill
-        signal_pill = ModernCard(filter_frame, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.ACCENT_SECONDARY_PALE, highlight_thickness=1, radius=8)
-        signal_pill.pack(side=tk.LEFT, padx=3, pady=3)
-        tk.Label(signal_pill.content, text="📊 Signal:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
-        self.signal_var = tk.StringVar(value="All")
-        signal_combo = ttk.Combobox(signal_pill.content, textvariable=self.signal_var, values=["All", "ACCUMULATE", "REDUCE", "N/A"], state="readonly", width=11, font=ModernStyle.FONT_HEADING)
-        signal_combo.pack(side=tk.LEFT, padx=3, pady=5)
-        try:
-            self.signal_var.trace_add("write", lambda *args: self.on_filter_change())
-        except Exception:
-            pass
 
-        # Holdings state filter (segmented control in a normal frame)
-        state_frame = tk.Frame(filter_frame, bg=ModernStyle.BG_PRIMARY)
-        state_frame.pack(side=tk.LEFT, padx=3, pady=3)
-        tk.Label(state_frame, text=" 🛡️ Filter: ", bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, pady=3)
-        
+        # ── COLORED VERTICAL DIVIDER ─────────────────────────────────────────
+        tk.Frame(filter_frame, bg=ModernStyle.ACCENT_PRIMARY, width=3).pack(
+            side=tk.LEFT, fill=tk.Y, padx=8, pady=6
+        )
+
+        # ── GROUP 2: Filters ──────────────────────────────────────────────────
+        grp2 = tk.Frame(filter_frame, bg=ModernStyle.BG_SECONDARY)
+        grp2.pack(side=tk.LEFT, padx=(0, 0), pady=4, anchor=tk.CENTER)
+
+        # Signal segmented control
+        tk.Label(
+            grp2, text="📊 Signal:", bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_PRIMARY, font=FONT
+        ).pack(side=tk.LEFT, padx=(10, 4), pady=4, anchor=tk.CENTER)
+        self.signal_var = tk.StringVar(value="All")
+        signal_seg = ModernSegmentedControl(
+            grp2,
+            options=["All", "Accumulate", "Reduce", "None"],
+            variable=self.signal_var,
+            command=self.on_filter_change,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            container_bg=ModernStyle.BG_SECONDARY,
+            font=FONT,
+            height=CTRL_HEIGHT,
+            per_option_colors={
+                "Accumulate": (ModernStyle.SUCCESS,        ModernStyle.TEXT_ON_ACCENT),
+                "Reduce":     (ModernStyle.ERROR,          ModernStyle.TEXT_ON_ACCENT),
+                "All":        (ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ON_ACCENT),
+                "None":       (ModernStyle.TEXT_SECONDARY, ModernStyle.TEXT_ON_ACCENT),
+            },
+        )
+        signal_seg.pack(side=tk.LEFT, padx=(0, 6), pady=4, anchor=tk.CENTER)
+
+        # Thin inner divider
+        tk.Frame(grp2, bg=ModernStyle.SUCCESS, width=1).pack(
+            side=tk.LEFT, fill=tk.Y, pady=6
+        )
+
+        # Position / state segmented control
+        tk.Label(
+            grp2, text="🛡️ Filter:", bg=ModernStyle.BG_SECONDARY,
+            fg=ModernStyle.TEXT_PRIMARY, font=FONT
+        ).pack(side=tk.LEFT, padx=(8, 4), pady=4, anchor=tk.CENTER)
         self.holding_state_var = tk.StringVar(value="Active")
-        from ui_widgets import ModernSegmentedControl
         state_seg = ModernSegmentedControl(
-            state_frame,
-            options=["Active", "Closed", "All"],
+            grp2,
+            options=["All", "Active", "Closed"],
             variable=self.holding_state_var,
             command=self.on_filter_change,
-            bg=ModernStyle.BG_SECONDARY,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            container_bg=ModernStyle.BG_SECONDARY,
             active_bg=ModernStyle.SUCCESS,
-            font=ModernStyle.FONT_HEADING,
-            height=45
+            font=FONT,
+            height=CTRL_HEIGHT,
         )
-        state_seg.pack(side=tk.LEFT, padx=(6, 6), pady=3)
-        
+        state_seg.pack(side=tk.LEFT, padx=(0, 10), pady=4, anchor=tk.CENTER)
 
-        # Spacer
-        tk.Frame(filter_frame, bg=ModernStyle.BG_PRIMARY).pack(side=tk.LEFT, expand=True)
-        
-        # Buttons in a row
-        apply_btn = ModernButton(
-            filter_frame,
-            text="Search",
-            command=self.on_filter_change,
-            bg=ModernStyle.ACCENT_PRIMARY,
-            fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_PRIMARY,
-            width=100,
-            height=32,
-        )
-        apply_btn.pack(side=tk.LEFT, padx=2, pady=3)
+        # ── SPACER + REFRESH ─────────────────────────────────────────────────
+        tk.Frame(filter_frame, bg=ModernStyle.BG_PRIMARY).pack(side=tk.LEFT, expand=True, fill=tk.X)
 
         refresh_btn = ModernButton(
             filter_frame,
-            text="Refresh",
+            text="⟳ Refresh",
             command=self.refresh,
             bg=ModernStyle.ACCENT_TERTIARY,
             fg=ModernStyle.TEXT_ON_ACCENT,
             canvas_bg=ModernStyle.BG_PRIMARY,
             width=100,
-            height=32,
+            height=CTRL_HEIGHT,
         )
-        refresh_btn.pack(side=tk.LEFT, padx=2, pady=3)
-        
-        # Load brokers
+        refresh_btn.pack(side=tk.LEFT, padx=(4, 0), pady=4, anchor=tk.CENTER)
+
+        # Load brokers in the background
         threading.Thread(target=self._load_brokers, daemon=True).start()
+
 
     def _sort_and_remember(self, col: str):
         """Sort the treeview by the given column and remember the state for re-apply after refresh."""
@@ -246,17 +255,17 @@ class HoldingsView(BaseView):
             "Symbol",
             "Name",
             "Qty",
-            "Avg Prc ₹",
-            "Mkt Prc ₹",
+            "Avg Price",
+            "Mkt Price",
             "PE Ratio",
             "Daily Chg %",
-            "Unreal PnL ₹",
+            "Unreal PnL",
             "Weight %",
             "XIRR %",
             "CAGR %",
-            "Real PnL ₹",
-            "Net PnL ₹",
-            "Fees ₹",
+            "Real PnL",
+            "Net PnL",
+            "Fees",
             "IV Signal",
         )
         self.tree = ttk.Treeview(inner, columns=columns, height=20, show="headings")
@@ -267,7 +276,7 @@ class HoldingsView(BaseView):
         self._sort_col = None
         self._sort_reverse = False
         
-        sortable_cols = ("Symbol", "PE Ratio", "Fees ₹", "Realized PnL ₹", "Total PnL ₹", "XIRR %", "CAGR %", "IV Signal")
+        sortable_cols = ("Symbol", "PE Ratio", "Fees", "Real PnL", "Net PnL", "XIRR %", "CAGR %", "IV Signal")
         for col, w in zip(columns, widths):
             if col in sortable_cols:
                 self.tree.heading(col, text=f"{col} ↕", command=lambda c=col: self._sort_and_remember(c))
@@ -375,7 +384,7 @@ class HoldingsView(BaseView):
         lines = ["\t".join(cols)]
         for iid in items:
             vals = self.tree.item(iid, "values")
-            lines.append("\t".join(str(v).replace("₹", "").replace(",", "").replace("%", "").strip() for v in vals))
+            lines.append("\t".join(str(v).replace("₹", "").replace("¥", "").replace("$", "").replace(",", "").replace("%", "").strip() for v in vals))
         text = "\n".join(lines)
         try:
             self.clipboard_clear()
@@ -532,6 +541,7 @@ class HoldingsView(BaseView):
         _add_qty_var     = tk.StringVar(value="")
         _add_price_var   = tk.StringVar(value="")
         _add_fee_var     = tk.StringVar(value="0.0")
+        _add_currency_var = tk.StringVar(value="INR")
 
         # Broker dropdown
         _label("👑  Broker", 0, 0)
@@ -554,22 +564,31 @@ class HoldingsView(BaseView):
         _label("📊  Quantity", 1, 0)
         _qty_entry = _entry(1, 0, _add_qty_var)
         _qty_entry_ref[0] = _qty_entry
-        _label("💰  Price (₹)", 1, 1)
+        _label("💰  Price", 1, 1)
         _entry(1, 1, _add_price_var)
 
-        _label("💸  Fees (₹)", 2, 0)
+        _label("💸  Fees", 2, 0)
         _entry(2, 0, _add_fee_var)
 
-        # Trade type radio
-        type_lbl_row = tk.Frame(form, bg=BG)
-        type_lbl_row.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 4))
-        tk.Label(type_lbl_row, text="🌲 Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+        # Trade type + Currency on same row
+        tc_lbl_row = tk.Frame(form, bg=BG)
+        tc_lbl_row.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        tk.Label(tc_lbl_row, text="🌲 Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
                  font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
-        type_row = tk.Frame(form, bg=BG)
-        type_row.grid(row=7, column=0, columnspan=2, sticky="w")
+        tk.Frame(tc_lbl_row, width=16, bg=BG).pack(side="left")
+        tk.Label(tc_lbl_row, text="💱 Currency", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+                 font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+
+        tc_row = tk.Frame(form, bg=BG)
+        tc_row.grid(row=7, column=0, columnspan=2, sticky="w")
         for val, color in [("BUY", "#059669"), ("SELL", "#DC2626")]:
-            tk.Radiobutton(type_row, text=val, variable=_add_type_var, value=val,
+            tk.Radiobutton(tc_row, text=val, variable=_add_type_var, value=val,
                            bg=BG, fg=color, font=ModernStyle.FONT_TABLE_BOLD,
+                           selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+        tk.Frame(tc_row, bg=ModernStyle.DIVIDER_COLOR, width=2, height=20).pack(side="left", padx=16)
+        for val in ["INR", "JPY"]:
+            tk.Radiobutton(tc_row, text=val, variable=_add_currency_var, value=val,
+                           bg=BG, fg=ModernStyle.ACCENT_PRIMARY, font=ModernStyle.FONT_TABLE_BOLD,
                            selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
 
         # ── Actions ─────────────────────────────────────────────────────────────
@@ -600,8 +619,8 @@ class HoldingsView(BaseView):
                 if not sym: raise ValueError("Symbol is required")
                 t = _add_type_var.get().strip().upper()
                 qty = float(_add_qty_var.get().replace(",", "") or 0)
-                price = float(_add_price_var.get().replace(",", "").replace("₹", "") or 0)
-                fee = float(_add_fee_var.get().replace(",", "").replace("₹", "") or 0)
+                price = float(_add_price_var.get().replace(",", "").replace("₹", "").replace("¥", "").replace("$", "") or 0)
+                fee = float(_add_fee_var.get().replace(",", "").replace("₹", "").replace("¥", "").replace("$", "") or 0)
                 if qty <= 0: raise ValueError("Qty must be > 0")
                 if price <= 0: raise ValueError("Price must be > 0")
             except Exception as ex:
@@ -616,7 +635,8 @@ class HoldingsView(BaseView):
                     import model.crud as _crud2
                     import uuid
                     trade_id = str(uuid.uuid4())[:8]
-                    _crud2.add_trade(b, d_str, sym, t, qty, price, fee, trade_id)
+                    cur = _add_currency_var.get() or "INR"
+                    _crud2.add_trade(b, d_str, sym, t, qty, price, fee, trade_id, currency=cur)
                     try:
                         from model.engine import rebuild_holdings
                         rebuild_holdings()
@@ -697,8 +717,10 @@ class HoldingsView(BaseView):
             symbol = str(meta.get("symbol") or (values[1] if len(values) > 1 else "")).strip()
             broker = str(meta.get("broker") or "").strip()
             stock_name = str(values[2] if len(values) > 2 else "—").replace("—", "").strip()
-            avg_cost = str(values[4] if len(values) > 4 else "0").replace("₹", "").replace(",", "").strip()
-            total_fees = str(meta.get("total_fees") or "0").replace("₹", "").replace(",", "").strip()
+            avg_cost = str(values[4] if len(values) > 4 else "0").replace("₹", "").replace("¥", "").replace("$", "").replace("£", "").replace(",", "").strip()
+            total_fees = str(meta.get("total_fees") or "0").replace("₹", "").replace("¥", "").replace("$", "").replace("£", "").replace(",", "").strip()
+            row_currency = str(meta.get("currency") or "INR").upper()
+            cur_sym = "¥" if row_currency == "JPY" else ("USD" if row_currency == "USD" else "₹")
             
             if not symbol or not broker:
                 messagebox.showerror("Edit Holding", "Could not determine symbol/broker for selected row.")
@@ -781,8 +803,8 @@ class HoldingsView(BaseView):
             total_fees_var = tk.StringVar(value=total_fees)
             
             _field("Stock Name", "💠", 0, stock_name_var, "(optional)")
-            _field("Avg Cost", "💎", 2, avg_cost_var, "(₹)")
-            _field("Total Fees", "💙", 4, total_fees_var, "(₹)")
+            _field("Avg Cost", "💎", 2, avg_cost_var, f"({cur_sym})")
+            _field("Total Fees", "💙", 4, total_fees_var, f"({cur_sym})")
             
             # We use PremiumModal's actions_frame
             actions = win.actions_frame
@@ -907,11 +929,13 @@ class HoldingsView(BaseView):
             top.title_lbl.config(text=f"{symbol} Drilldown")
 
         # Summary line displayed inline as chips
-        def _update_chips_ui(c_qty, c_avg, c_mkt, c_fees, c_pnl):
+        def _update_chips_ui(c_qty, c_avg, c_mkt, c_fees, c_pnl, c_currency):
             for w in top.chips_row.winfo_children():
                 w.destroy()
             
             f_bold = ModernStyle.FONT_BODY_BOLD
+            
+            from ui_utils import format_money
             
             top.add_chip("📈", symbol, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.SLATE_300, font=f_bold)
             top.add_chip("🏦", broker if broker else "All brokers", bg_color=ModernStyle.SLATE_800, fg_color=ModernStyle.SLATE_300, font=f_bold)
@@ -920,10 +944,10 @@ class HoldingsView(BaseView):
             
             # Format nicely. Added alongside chips to stay inline top
             top.add_chip("📊", f"Qty: {c_qty:g}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.TEXT_PRIMARY, font=f_bold)
-            top.add_chip("💵", f"Avg: ₹{c_avg:,.2f}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.TEXT_PRIMARY, font=f_bold)
-            top.add_chip("💰", f"Mkt: ₹{c_mkt:,.2f}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.TEXT_PRIMARY, font=f_bold)
-            top.add_chip("📉", f"Fees: ₹{c_fees:,.2f}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.WARNING, font=f_bold)
-            top.add_chip("🏆", f"P&L: ₹{c_pnl:,.2f}", bg_color=ModernStyle.BG_PRIMARY, fg_color=pnl_color, font=f_bold)
+            top.add_chip("💵", f"Avg: {format_money(c_avg, c_currency)}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.TEXT_PRIMARY, font=f_bold)
+            top.add_chip("💰", f"Mkt: {format_money(c_mkt, c_currency)}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.TEXT_PRIMARY, font=f_bold)
+            top.add_chip("📉", f"Fees: {format_money(c_fees, c_currency)}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.WARNING, font=f_bold)
+            top.add_chip("🏆", f"P&L: {format_money(c_pnl, c_currency)}", bg_color=ModernStyle.BG_PRIMARY, fg_color=pnl_color, font=f_bold)
 
         try:
             qty = float(meta.get("qty", 0.0) or 0.0)
@@ -931,7 +955,8 @@ class HoldingsView(BaseView):
             mkt = float(meta.get("market_price", 0.0) or 0.0)
             pnl = float(meta.get("running_pnl", 0.0) or 0.0)
             fees = float(meta.get("total_fees", 0.0) or 0.0)
-            _update_chips_ui(qty, avg, mkt, fees, pnl)
+            currency = str(meta.get("currency") or "INR")
+            _update_chips_ui(qty, avg, mkt, fees, pnl, currency)
         except Exception:
             pass
 
@@ -946,18 +971,20 @@ class HoldingsView(BaseView):
             def _load_bg():
                 # fetch fresh holdings stats for chips
                 c_qty, c_avg, c_mkt, c_fees, c_pnl = 0.0, 0.0, 0.0, 0.0, 0.0
+                cur_currency = str(meta.get("currency") or "INR")
                 try:
                     from model.database import _invalidate_thread_connection, db_session
                     _invalidate_thread_connection()
                     with db_session() as conn:
                         cur = conn.cursor()
                         if broker:
-                            cur.execute("SELECT h.qty, h.avg_price, m.current_price, h.total_fees, h.running_pnl FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol WHERE h.symbol=? AND h.broker=?", (symbol, broker))
+                            cur.execute("SELECT h.qty, h.avg_price, m.current_price, h.total_fees, h.running_pnl, h.currency FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol WHERE h.symbol=? AND h.broker=?", (symbol, broker))
                             row = cur.fetchone()
                             if row:
-                                c_qty, c_avg, c_mkt, c_fees, c_pnl = map(lambda x: float(x or 0.0), row)
+                                c_qty, c_avg, c_mkt, c_fees, c_pnl = map(lambda x: float(x or 0.0), row[:5])
+                                cur_currency = row[5] or "INR"
                         else:
-                            cur.execute("SELECT SUM(h.qty), SUM(h.qty*h.avg_price), MAX(m.current_price), SUM(h.total_fees), SUM(h.running_pnl) FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol WHERE h.symbol=?", (symbol,))
+                            cur.execute("SELECT SUM(h.qty), SUM(h.qty*h.avg_price), MAX(m.current_price), SUM(h.total_fees), SUM(h.running_pnl), MAX(h.currency) FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol WHERE h.symbol=?", (symbol,))
                             row = cur.fetchone()
                             if row and row[0] is not None:
                                 c_qty = float(row[0])
@@ -966,6 +993,8 @@ class HoldingsView(BaseView):
                                 c_mkt = float(row[2] or 0.0)
                                 c_fees = float(row[3] or 0.0)
                                 c_pnl = float(row[4] or 0.0)
+                                cur_currency = row[5] or "INR"
+                    self.after(0, lambda: _update_chips_ui(c_qty, c_avg, c_mkt, c_fees, c_pnl, cur_currency))
                 except Exception as e:
                     pass
 
@@ -996,11 +1025,12 @@ class HoldingsView(BaseView):
                             return
                     except Exception:
                         return
-                    _update_chips_ui(c_qty, c_avg, c_mkt, c_fees, c_pnl)
+                    _update_chips_ui(c_qty, c_avg, c_mkt, c_fees, c_pnl, cur_currency)
                     for it in tv.get_children():
                         tv.delete(it)
                     if df is None or df.empty:
                         return
+                    from ui_utils import format_money
                     for i, r in enumerate(df.itertuples(index=False)):
                         rtype = str(getattr(r, "type", "")).upper()
                         qty_v = float(getattr(r, "qty", 0.0) or 0.0)
@@ -1009,7 +1039,8 @@ class HoldingsView(BaseView):
                         run_qty_v = float(getattr(r, "run_qty", 0.0) or 0.0)
                         avg_cost_v = float(getattr(r, "avg_cost", 0.0) or 0.0)
                         rpnl_v = float(getattr(r, "running_pnl", 0.0) or 0.0)
-                        rpnl_disp = f"₹{rpnl_v:,.2f}" if rtype in {"SELL", "S"} else "—"
+                        row_currency = str(getattr(r, "currency", cur_currency) or cur_currency)
+                        rpnl_disp = format_money(rpnl_v, row_currency) if rtype in {"SELL", "S"} else "—"
                         type_disp = rtype
                         type_tag = ""
                         if rtype in {"BUY", "B"}:
@@ -1030,10 +1061,10 @@ class HoldingsView(BaseView):
                             str(getattr(r, "trade_id", "")),
                             type_disp,
                             f"{qty_v:g}",
-                            f"₹{price_v:,.2f}",
-                            f"₹{fee_v:,.2f}",
+                            format_money(price_v, row_currency),
+                            format_money(fee_v, row_currency),
                             f"{run_qty_v:g}",
-                            f"₹{avg_cost_v:,.2f}",
+                            format_money(avg_cost_v, row_currency),
                             rpnl_disp,
                             str(getattr(r, "broker", "")),
                         )
@@ -1094,7 +1125,11 @@ class HoldingsView(BaseView):
         style.configure("Drilldown.Treeview", font=ModernStyle.FONT_TABLE, rowheight=32)
         style.configure("Drilldown.Treeview.Heading", font=ModernStyle.FONT_TABLE_BOLD)
         
-        cols = ("#", "Date", "Trade ID", "Type", "Qty", "Price ₹", "Fees ₹", "Run Qty", "AvgCost ₹", "Running PnL ₹", "Broker")
+        # Determine symbol for headers
+        _sym_map = {"INR": "₹", "JPY": "¥", "USD": "$", "GBP": "£", "CNY": "¥"}
+        sym_disp = _sym_map.get(str(meta.get("currency", "INR")).upper(), "₹")
+
+        cols = ("#", "Date", "Trade ID", "Type", "Qty", f"Price {sym_disp}", f"Fees {sym_disp}", "Running Qty", f"AvgCost {sym_disp}", f"Running PnL {sym_disp}", "Broker")
         trade_tv = ttk.Treeview(table, columns=cols, show="headings", height=16, style="Drilldown.Treeview")
         _dd_trade_tv_ref[0] = trade_tv  # expose to reload callback
         widths = [40, 90, 90, 60, 70, 90, 80, 80, 95, 100, 100]
@@ -1147,6 +1182,7 @@ class HoldingsView(BaseView):
                 if df is None or df.empty:
                     return
                 running_tpnl = 0.0
+                from ui_utils import format_money
                 for i, r in enumerate(df.itertuples(index=False)):
                     rtype = str(getattr(r, "type", "")).upper()
                     qty = float(getattr(r, "qty", 0.0) or 0.0)
@@ -1156,8 +1192,8 @@ class HoldingsView(BaseView):
                     avg_cost = float(getattr(r, "avg_cost", 0.0) or 0.0)
                     tpnl = float(getattr(r, "trade_pnl", 0.0) or 0.0)
                     running_tpnl += tpnl
-                    # Show Running PnL only for SELL trades
-                    rpnl_disp = f"₹{running_tpnl:,.2f}" if rtype in {"SELL", "S"} else "—"
+                    row_cur = str(getattr(r, "currency", meta.get("currency", "INR")) or "INR")
+                    rpnl_disp = format_money(running_tpnl, row_cur) if rtype in {"SELL", "S"} else "—"
                     type_disp = rtype
                     type_tag = ""
                     if rtype in {"BUY", "B"}:
@@ -1179,10 +1215,10 @@ class HoldingsView(BaseView):
                         str(getattr(r, "trade_id", "")),
                         type_disp,
                         f"{qty:g}",
-                        f"₹{price:,.2f}",
-                        f"₹{fee:,.2f}",
+                        format_money(price, row_cur),
+                        format_money(fee, row_cur),
                         f"{run_qty:g}",
-                        f"₹{avg_cost:,.2f}",
+                        format_money(avg_cost, row_cur),
                         rpnl_disp,
                         str(getattr(r, "broker", "")),
                     )
@@ -1290,11 +1326,12 @@ class HoldingsView(BaseView):
         try:
             with db_session() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT symbol, date, type, qty, price, fee FROM trades WHERE broker=? AND trade_id=?", (broker, trade_id))
+                cur.execute("SELECT symbol, date, type, qty, price, fee, currency FROM trades WHERE broker=? AND trade_id=?", (broker, trade_id))
                 row = cur.fetchone()
                 if not row:
                     return
                 symbol, date, ttype, qty, price, fee = row[0], row[1], row[2], str(row[3]), str(row[4]), str(row[5])
+                currency = str(row[6] or 'INR').strip().upper()
         except Exception:
             return
 
@@ -1306,7 +1343,7 @@ class HoldingsView(BaseView):
             # with a fresh DB connection, avoiding stale WAL reads on the main thread
             self.on_filter_change()
             
-        open_edit_trade_modal(self, _on_edit_complete, broker, trade_id, date, symbol, ttype, qty, price, fee, getattr(self, "app_state", None))
+        open_edit_trade_modal(self, _on_edit_complete, broker, trade_id, date, symbol, ttype, qty, price, fee, currency, getattr(self, "app_state", None))
 
     def _show_drilldown_context_menu(self, event, trade_tv, reload_cb) -> None:
         try:
@@ -1318,7 +1355,7 @@ class HoldingsView(BaseView):
             def _copy_row():
                 try:
                     vals = trade_tv.item(iid, "values")
-                    text = "\t".join(str(v).replace("₹", "").replace(",", "").replace("%", "").strip() for v in vals)
+                    text = "\t".join(str(v).replace("₹", "").replace("¥", "").replace("$", "").replace(",", "").replace("%", "").strip() for v in vals)
                     self.clipboard_clear()
                     self.clipboard_append(text)
                 except Exception: pass
@@ -1329,7 +1366,7 @@ class HoldingsView(BaseView):
                     lines = ["\t".join(cols)]
                     for it in trade_tv.get_children():
                         vals = trade_tv.item(it, "values")
-                        lines.append("\t".join(str(v).replace("₹", "").replace(",", "").replace("%", "").strip() for v in vals))
+                        lines.append("\t".join(str(v).replace("₹", "").replace("¥", "").replace("$", "").replace(",", "").replace("%", "").strip() for v in vals))
                     self.clipboard_clear()
                     self.clipboard_append("\n".join(lines))
                 except Exception: pass
@@ -1416,7 +1453,15 @@ class HoldingsView(BaseView):
             # Get filter values
             broker = self.broker_var.get() if hasattr(self, 'broker_var') else "All"
             symbol = self.symbol_entry.get_value() if hasattr(self, 'symbol_entry') else ""
-            signal = self.signal_var.get() if hasattr(self, 'signal_var') else "All"
+            signal_label = self.signal_var.get() if hasattr(self, 'signal_var') else "All"
+            # Map display labels → actual DB values
+            _signal_map = {
+                "Accumulate": "ACCUMULATE",
+                "Reduce":     "REDUCE",
+                "None":       "N/A",
+                "All":        "All",
+            }
+            signal = _signal_map.get(signal_label, signal_label)
             # Parse Segmented Control
             h_state = self.holding_state_var.get() if hasattr(self, 'holding_state_var') else "Active"
             exclude_zero = (h_state == "Active")
@@ -1464,8 +1509,10 @@ class HoldingsView(BaseView):
             except Exception:
                 pass
         
-        # Update stats
+        # Update stats — these are cross-currency aggregates, so label as "Value"
         self.stats_labels["count"].config(text=f"{len(df)}")
+        # Invested and current values are the INR-equivalent aggregates stored in the summary
+        from ui_utils import format_money
         self.stats_labels["invested"].config(text=f"₹ {float(summary.get('invested', 0)):,.0f}")
         self.stats_labels["current"].config(text=f"₹ {float(summary.get('current', 0)):,.0f}")
         
@@ -1525,24 +1572,27 @@ class HoldingsView(BaseView):
             else:
                 daily_disp = "—"
 
+            from ui_utils import format_money
+            currency = str(getattr(row, 'currency', 'INR')).strip().upper()
+            
             # Flash PnL — arrow prefix for sign clarity
             if mkt_price > 0:
                 flash_pnl = (mkt_price - avg_price) * qty
                 arrow = "🌲" if flash_pnl >= 0 else "🔻"
-                flash_disp = f"{arrow} ₹{flash_pnl:,.0f}"
+                flash_disp = f"{arrow} {format_money(flash_pnl, currency).split('.')[0]}" # no decimals for PnL
             else:
                 flash_disp = "—"
 
             # Real PnL — arrow prefix
             rpnl_arrow = "🌲" if running_pnl >= 0 else "🔻"
-            rpnl_disp = f"{rpnl_arrow} ₹{running_pnl:,.0f}"
+            rpnl_disp = f"{rpnl_arrow} {format_money(running_pnl, currency).split('.')[0]}"
             
             # Realized PnL
             if realized_pnl == 0:
                 realized_disp = "—"
             else:
                 realized_arrow = "🌲" if realized_pnl > 0 else "🔻"
-                realized_disp = f"{realized_arrow} ₹{realized_pnl:,.0f}"
+                realized_disp = f"{realized_arrow} {format_money(realized_pnl, currency).split('.')[0]}"
 
             # Weight% with Pro-Gradient 5-Block Scale (4% per block, 20% max)
             if total_val > 0:
@@ -1593,8 +1643,8 @@ class HoldingsView(BaseView):
                 getattr(row, 'symbol', '—'),
                 stock_name[:28],
                 f"{qty:,.0f}",
-                f"₹{avg_price:,.2f}",
-                f"₹{mkt_price:,.2f}" if mkt_price > 0 else "—",
+                format_money(avg_price, currency),
+                format_money(mkt_price, currency) if mkt_price > 0 else "—",
                 pe_disp,
                 daily_disp,
                 flash_disp,
@@ -1603,7 +1653,7 @@ class HoldingsView(BaseView):
                 cagr_disp,
                 realized_disp,
                 rpnl_disp,
-                f"₹{total_fees:,.2f}",
+                format_money(total_fees, currency),
                 signal_disp,
             )
 

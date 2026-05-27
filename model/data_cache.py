@@ -58,6 +58,7 @@ class DataCache:
                 SELECT
                     h.broker,
                     h.symbol,
+                    h.currency,
                     h.qty,
                     h.avg_price,
                     h.realized_pnl,
@@ -80,7 +81,7 @@ class DataCache:
 
             trades_query = """
                 SELECT
-                    t.trade_id, t.date, t.symbol, t.type, t.qty, t.price, t.fee, t.broker,
+                    t.trade_id, t.date, t.symbol, t.type, t.qty, t.price, t.fee, t.broker, t.currency,
                     COALESCE(c.run_qty, 0.0) AS run_qty,
                     COALESCE(c.avg_cost, 0.0) AS avg_cost,
                     COALESCE(c.running_pnl, 0.0) AS running_pnl,
@@ -88,7 +89,7 @@ class DataCache:
                 FROM trades t
                 LEFT JOIN trade_calcs c
                     ON c.broker = t.broker AND c.trade_id = t.trade_id
-                ORDER BY t.date ASC
+                ORDER BY t.date ASC, t.type ASC, t.trade_id ASC
             """
             trades_df = pd.read_sql_query(trades_query, conn)
 
@@ -215,13 +216,8 @@ class DataCache:
         fee_buy = float(df.loc[type_u == "BUY", "fee"].sum())
         fee_sell = float(df.loc[type_u == "SELL", "fee"].sum())
 
-        # last running_pnl per symbol
-        try:
-            df_sorted = df.sort_values(["symbol", "date", "trade_id"], ascending=[True, True, True])
-            last = df_sorted.groupby("symbol", as_index=False).tail(1)
-            total_pnl = float(last["running_pnl"].sum())
-        except Exception:
-            total_pnl = float(df["running_pnl"].iloc[-1]) if len(df) else 0.0
+        # Total P&L of the filtered view (matches the cumulative 'Running PnL' column in the table)
+        total_pnl = float(df["trade_pnl"].sum()) if not df.empty else 0.0
 
         return df.reset_index(drop=True), {
             "qty_buy": qty_buy,

@@ -10,6 +10,7 @@ import concurrent.futures
 _trade_calcs_lock = threading.Lock()
 _trade_calcs_built_this_session = False
 _trade_calcs_rebuild_inflight = False
+_db_write_lock = threading.RLock()
 
 
 def rebuild_trade_calcs():
@@ -22,16 +23,17 @@ def rebuild_trade_calcs():
     global _trade_calcs_built_this_session
 
     # Pull all trades once
-    with db_session() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT broker, trade_id, date, symbol, type, qty, price, fee FROM trades ORDER BY date ASC"
-        )
-        rows = cur.fetchall()
+    with _db_write_lock:
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT broker, trade_id, date, symbol, type, qty, price, fee FROM trades ORDER BY date ASC, type ASC, trade_id ASC"
+            )
+            rows = cur.fetchall()
 
-        # Map current prices (DB only; no network)
-        cur.execute("SELECT symbol, current_price FROM marketdata")
-        prices = {r[0]: float(r[1] or 0.0) for r in cur.fetchall()}
+            # Map current prices (DB only; no network)
+            cur.execute("SELECT symbol, current_price FROM marketdata")
+            prices = {r[0]: float(r[1] or 0.0) for r in cur.fetchall()}
 
     if not rows:
         with db_session() as conn:
@@ -63,18 +65,20 @@ def rebuild_trade_calcs():
         if ttype_u == "BUY":
             new_qty = rq + q
             if new_qty != 0:
-                ac = ((rq * ac) + (q * p) + f) / new_qty
+                ac = ((rq * ac) + (q * p)) / new_qty
             else:
                 ac = 0.0
             rq = new_qty
         else:  # SELL
-            # Realized PnL based on current avg cost
+            # Realized PnL based on current avg cost (fee deducted for net per-trade P&L)
             if ac > 0 and q > 0:
                 trade_pnl = (p - ac) * q - f
                 rz += trade_pnl
-            rq = max(0.0, rq - q)
-            if rq == 0:
+            rq = rq - q
+            if rq <= 0:
                 ac = 0.0
+                if rq < 0:
+                    rq = 0.0  # No short positions in delivery equity
 
         running_qty[key] = rq
         avg_cost[key] = ac
@@ -202,6 +206,24 @@ def get_stored_dashboard_metrics() -> dict | None:
         if not rows: return None
         return {row[0]: row[1] for row in rows}
 
+def get_exchange_rate(currency: str) -> float:
+    """Gets the latest exchange rate to INR from marketdata table."""
+    if currency == "INR":
+        return 1.0
+    
+    ticker = f"{currency}INR=X"
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT current_price, previous_close FROM marketdata WHERE symbol = ?", (ticker,))
+        row = cursor.fetchone()
+        if row:
+            # Fallback to previous close if current price is 0
+            return float(row[0]) if row[0] > 0 else float(row[1])
+            
+    # Fallback hardcoded values if not yet fetched
+    fallbacks = {"JPY": 0.55, "USD": 83.5, "GBP": 105.0, "CNY": 11.5}
+    return fallbacks.get(currency, 1.0)
+
 def calculate_intrinsic_value(eps: float, growth_rate: float = 0.12, discount_rate: float = 0.10, terminal_multiple: float = 15.0) -> float:
     """Calculates Intrinsic Value using a 5-year DCF snapshot."""
     if eps is None or (isinstance(eps, float) and math.isnan(eps)) or eps <= 0:
@@ -327,6 +349,9 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
     """
     try:
         import yfinance as yf
+        import logging
+        logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+
         ticker = yf.Ticker(yf_sym)
         full_info = ticker.info
 
@@ -407,6 +432,11 @@ def fetch_and_update_market_data(symbols: list):
     """
     if not symbols: return
 
+    # Ensure exchange rates are fetched whenever market data is fetched
+    for currency_ticker in ["JPYINR=X", "USDINR=X", "GBPINR=X", "CNYINR=X"]:
+        if currency_ticker not in symbols:
+            symbols.append(currency_ticker)
+
     # Schema guard: ensure all target columns exist before we attempt to persist.
     # This does NOT fetch anything; it only allows refreshed data to be stored.
     try:
@@ -416,7 +446,7 @@ def fetch_and_update_market_data(symbols: list):
         pass
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    yf_symbols = [s + ".NS" if not s.endswith(('.NS', '.BO')) else s for s in symbols]
+    yf_symbols = [s + ".NS" if not ('.' in s or '=' in s) else s for s in symbols]
 
     marketdata_records = []
     assets_records = []
@@ -504,44 +534,45 @@ def rebuild_holdings(*, sync_trade_calcs: bool = True):
         sync_trade_calcs: If True, rebuild trade_calcs synchronously (for trade edits).
                           If False, run in background (for startup speed).
     """
-    with db_session() as conn:
-        cursor = conn.cursor()
+    with _db_write_lock:
+        with db_session() as conn:
+            cursor = conn.cursor()
 
-        # Fetch market prices as a simple dict — no pandas needed
-        cursor.execute("SELECT symbol, current_price FROM marketdata")
-        prices = {row[0]: row[1] for row in cursor.fetchall()}
+            # Fetch market prices as a simple dict — no pandas needed
+            cursor.execute("SELECT symbol, current_price, previous_close FROM marketdata")
+            prices = {row[0]: (float(row[1] or 0.0), float(row[2] or 0.0)) for row in cursor.fetchall()}
 
-        cursor.execute("SELECT broker, trade_id, date, symbol, type, qty, price, fee FROM trades ORDER BY date ASC")
+            cursor.execute("SELECT broker, trade_id, date, symbol, type, qty, price, fee, currency FROM trades ORDER BY date ASC, type ASC, trade_id ASC")
 
-        holdings_dict = {}
+            holdings_dict = {}
 
-        for broker, trade_id, date_str, symbol, t_type, qty, price, fee in cursor.fetchall():
-            key = (broker, symbol)
-            qty = float(qty)
-            price = float(price)
-            fee = float(fee or 0.0)
+            for broker, trade_id, date_str, symbol, t_type, qty, price, fee, currency in cursor.fetchall():
+                key = (broker, symbol)
+                qty = float(qty)
+                price = float(price)
+                fee = float(fee or 0.0)
 
-            if key not in holdings_dict:
-                holdings_dict[key] = {'qty': 0.0, 'cost': 0.0, 'realized_pnl': 0.0, 'cfs': [], 'earliest_date': date_str, 'total_fees': 0.0}
+                if key not in holdings_dict:
+                    holdings_dict[key] = {'qty': 0.0, 'cost': 0.0, 'realized_pnl': 0.0, 'cfs': [], 'earliest_date': date_str, 'total_fees': 0.0, 'currency': currency or 'INR'}
 
-            h = holdings_dict[key]
+                h = holdings_dict[key]
 
-            trade_date = datetime.strptime(date_str, '%Y-%m-%d')
-            if date_str < h['earliest_date']:
-                h['earliest_date'] = date_str
+                trade_date = datetime.strptime(date_str, '%Y-%m-%d')
+                if date_str < h['earliest_date']:
+                    h['earliest_date'] = date_str
 
-            h['total_fees'] += fee
+                h['total_fees'] += fee
 
-            if t_type == 'BUY':
-                h['qty'] += qty
-                h['cost'] += (qty * price)
-                h['cfs'].append((trade_date, -((qty * price) + fee)))
-            elif t_type == 'SELL':
-                avg_price = h['cost'] / h['qty'] if h['qty'] > 0 else 0
-                h['qty'] -= qty
-                h['cost'] -= (qty * avg_price)
-                h['realized_pnl'] += ((price - avg_price) * qty)
-                h['cfs'].append((trade_date, ((qty * price) - fee)))
+                if t_type == 'BUY':
+                    h['qty'] += qty
+                    h['cost'] += (qty * price)
+                    h['cfs'].append((trade_date, -((qty * price) + fee)))
+                elif t_type == 'SELL':
+                    avg_price = h['cost'] / h['qty'] if h['qty'] > 0 else 0
+                    h['qty'] -= qty
+                    h['cost'] -= (qty * avg_price)
+                    h['realized_pnl'] += ((price - avg_price) * qty)
+                    h['cfs'].append((trade_date, ((qty * price) - fee)))
 
         now = datetime.now()
         records_to_insert = []
@@ -556,10 +587,13 @@ def rebuild_holdings(*, sync_trade_calcs: bool = True):
                 avg_price = data['cost'] / data['qty'] if data['qty'] > 0 else 0.0
 
                 if data['qty'] > 0 and len(data['cfs']) > 0:
-                    current_price = prices.get(symbol) or prices.get(symbol + ".NS") or prices.get(symbol + ".BO") or 0.0
+                    p_tuple = prices.get(symbol) or prices.get(symbol + ".NS") or prices.get(symbol + ".BO") or (0.0, 0.0)
+                    current_price = p_tuple[0]
                     
-                    # Core Fix: If the API failed and price is literally 0.0, fallback to cost basis
-                    # so we don't artificially wipe out the entire value of the holdings.
+                    # Core Fix: If the API failed and price is 0.0, fallback to previous_close
+                    if current_price == 0.0:
+                        current_price = p_tuple[1]
+                    # If still 0.0, fallback to cost basis so we don't artificially wipe out the entire value
                     if current_price == 0.0:
                         current_price = avg_price
                         
@@ -592,15 +626,15 @@ def rebuild_holdings(*, sync_trade_calcs: bool = True):
                 else:
                     running_pnl = data['realized_pnl']
 
-            records_to_insert.append((broker, symbol, data['qty'], avg_price, data['realized_pnl'], running_pnl, xirr_val, cagr_val, data['earliest_date'], data['total_fees']))
+            records_to_insert.append((broker, symbol, data['qty'], avg_price, data['realized_pnl'], running_pnl, xirr_val, cagr_val, data['earliest_date'], data['total_fees'], data['currency']))
 
 
         # Rebuild holdings table
         cursor2 = conn.cursor()
         cursor2.execute("DELETE FROM holdings")
         cursor2.executemany('''
-            INSERT INTO holdings (broker, symbol, qty, avg_price, realized_pnl, running_pnl, xirr, cagr, earliest_date, total_fees)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO holdings (broker, symbol, qty, avg_price, realized_pnl, running_pnl, xirr, cagr, earliest_date, total_fees, currency)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', records_to_insert)
 
     # After rebuilding holdings, also update and save dashboard metrics
@@ -786,24 +820,47 @@ def get_dashboard_metrics(force_refresh: bool = False) -> dict:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT
-                SUM(h.qty * h.avg_price),
-                SUM(h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)),
-                SUM(h.running_pnl),
-                SUM(CASE WHEN h.realized_pnl < 0 THEN h.realized_pnl ELSE 0 END),
-                SUM(CASE WHEN ((h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) - (h.qty * h.avg_price)) < 0 
-                         THEN ((h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) - (h.qty * h.avg_price)) ELSE 0 END),
-                MIN(h.earliest_date)
+                h.qty,
+                h.avg_price,
+                COALESCE(NULLIF(m.current_price, 0.0), h.avg_price),
+                h.running_pnl,
+                h.realized_pnl,
+                h.earliest_date,
+                h.currency
             FROM holdings h
             LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE h.qty > 0 OR h.running_pnl != 0
         ''')
-        row = cursor.fetchone()
-
-        invested, current_val = row[0] or 0.0, row[1] or 0.0
-        overall_pnl = row[2] or 0.0
-        overall_loss = row[3] or 0.0
-        unrealized_loss = row[4] or 0.0
-        earliest_date = row[5]
+        
+        invested = current_val = overall_pnl = overall_loss = unrealized_loss = 0.0
+        earliest_date = None
+        
+        for row in cursor.fetchall():
+            qty = float(row[0] or 0.0)
+            avg_price = float(row[1] or 0.0)
+            mkt_price = float(row[2] or 0.0)
+            running_pnl = float(row[3] or 0.0)
+            real_pnl = float(row[4] or 0.0)
+            date_str = row[5]
+            currency = str(row[6] or 'INR').strip().upper()
+            
+            rate = get_exchange_rate(currency)
+            
+            row_inv = (qty * avg_price) * rate
+            row_cur = (qty * mkt_price) * rate
+            row_unrealized = row_cur - row_inv
+            
+            invested += row_inv
+            current_val += row_cur
+            overall_pnl += running_pnl * rate
+            
+            if real_pnl < 0:
+                overall_loss += real_pnl * rate
+            if row_unrealized < 0:
+                unrealized_loss += row_unrealized
+                
+            if earliest_date is None or (date_str and date_str < earliest_date):
+                earliest_date = date_str
 
         unrealized_pnl = current_val - invested
         realized_pnl = overall_pnl - unrealized_pnl
@@ -842,25 +899,63 @@ def get_metrics_by_broker() -> dict:
     with db_session() as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT h.broker, SUM(h.qty * h.avg_price), SUM(h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)),
-                   SUM(h.running_pnl), SUM(CASE WHEN h.realized_pnl < 0 THEN h.realized_pnl ELSE 0 END),
-                   SUM(CASE WHEN ((h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) - (h.qty * h.avg_price)) < 0 
-                            THEN ((h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) - (h.qty * h.avg_price)) ELSE 0 END),
-                   MIN(h.earliest_date)
+            SELECT
+                h.broker,
+                h.qty,
+                h.avg_price,
+                COALESCE(NULLIF(m.current_price, 0.0), h.avg_price),
+                h.running_pnl,
+                h.realized_pnl,
+                h.earliest_date,
+                h.currency
             FROM holdings h
             LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE h.qty > 0 OR h.running_pnl != 0
-            GROUP BY h.broker
         ''')
         rows = cursor.fetchall()
 
         broker_metrics = {}
         for row in rows:
             broker = row[0]
-            invested, current_val = row[1] or 0.0, row[2] or 0.0
-            overall_pnl, overall_loss = row[3] or 0.0, row[4] or 0.0
-            unrealized_loss = row[5] or 0.0
-            earliest_date = row[6]
+            if broker not in broker_metrics:
+                broker_metrics[broker] = {
+                    "invested": 0.0, "current_val": 0.0, "overall_pnl": 0.0,
+                    "overall_loss": 0.0, "unrealized_loss": 0.0, "earliest_date": None
+                }
+                
+            metrics = broker_metrics[broker]
+            qty = float(row[1] or 0.0)
+            avg_price = float(row[2] or 0.0)
+            mkt_price = float(row[3] or 0.0)
+            running_pnl = float(row[4] or 0.0)
+            real_pnl = float(row[5] or 0.0)
+            date_str = row[6]
+            currency = str(row[7] or 'INR').strip().upper()
+            
+            rate = get_exchange_rate(currency)
+            
+            row_inv = (qty * avg_price) * rate
+            row_cur = (qty * mkt_price) * rate
+            row_unrealized = row_cur - row_inv
+            
+            metrics["invested"] += row_inv
+            metrics["current_val"] += row_cur
+            metrics["overall_pnl"] += running_pnl * rate
+            
+            if real_pnl < 0:
+                metrics["overall_loss"] += real_pnl * rate
+            if row_unrealized < 0:
+                metrics["unrealized_loss"] += row_unrealized
+                
+            if metrics["earliest_date"] is None or (date_str and date_str < metrics["earliest_date"]):
+                metrics["earliest_date"] = date_str
+
+        final_broker_metrics = {}
+        for broker, metrics in broker_metrics.items():
+            invested, current_val = metrics["invested"], metrics["current_val"]
+            overall_pnl, overall_loss = metrics["overall_pnl"], metrics["overall_loss"]
+            unrealized_loss = metrics["unrealized_loss"]
+            earliest_date = metrics["earliest_date"]
 
             unrealized_pnl = current_val - invested
             realized_pnl = overall_pnl - unrealized_pnl
@@ -878,7 +973,7 @@ def get_metrics_by_broker() -> dict:
                 except Exception:
                     pass
 
-            broker_metrics[broker] = {
+            final_broker_metrics[broker] = {
                 "total_invested": invested, "total_value": current_val,
                 "overall_pnl": overall_pnl, "unrealized_pnl": unrealized_pnl,
                 "realized_pnl": realized_pnl, "realized_loss": overall_loss, "unrealized_loss": unrealized_loss,
@@ -886,8 +981,8 @@ def get_metrics_by_broker() -> dict:
             }
 
     with _cache_lock:
-        _broker_metrics_cache["data"], _broker_metrics_cache["ts"] = broker_metrics, time.time()
-    return broker_metrics
+        _broker_metrics_cache["data"], _broker_metrics_cache["ts"] = final_broker_metrics, time.time()
+    return final_broker_metrics
 
 def get_top_worst_performers(limit: int = 3) -> dict:
     with _cache_lock:
@@ -945,20 +1040,102 @@ def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0) -> list:
         if (_harvesting_cache["data"] is not None and cache_key == min_loss_amount):
             return _harvesting_cache["data"]
 
+    opportunities = []
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT h.symbol, h.broker, h.qty, h.avg_price, m.current_price,
-                   (h.qty * h.avg_price) - (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) as unrealized_loss
-            FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol
-            WHERE h.qty > 0 AND (h.qty * h.avg_price) - (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) >= ?
-            ORDER BY unrealized_loss DESC
-        ''', (min_loss_amount,))
-        result = [{"symbol": r[0], "broker": r[1], "qty": r[2], "avg_price": r[3], "current_price": r[4], "unrealized_loss": r[5]} for r in cursor.fetchall()]
+        # Fetch current prices (with fallback to previous_close)
+        cursor.execute("SELECT symbol, COALESCE(NULLIF(current_price, 0.0), previous_close) FROM marketdata")
+        prices = {r[0]: float(r[1] or 0.0) for r in cursor.fetchall()}
+
+        # ── Ground-truth net positions from the database ──────────────
+        # This catches ghost holdings caused by unmatched sells (intraday
+        # sells before buys, cross-broker transfers, import gaps, etc.)
+        cursor.execute(
+            "SELECT broker, symbol, "
+            "  SUM(CASE WHEN type='BUY' THEN qty ELSE 0 END) - "
+            "  SUM(CASE WHEN type='SELL' THEN qty ELSE 0 END) "
+            "FROM trades GROUP BY broker, symbol"
+        )
+        net_positions = {}
+        for broker, symbol, net_qty in cursor.fetchall():
+            net_positions[(broker, symbol)] = float(net_qty or 0.0)
+
+        # Fetch all trades for active holdings to build true FIFO lots
+        cursor.execute("SELECT broker, symbol, type, qty, price FROM trades ORDER BY date ASC, type ASC, trade_id ASC")
+        
+        lots = {} # (broker, symbol) -> list of {'qty', 'price'}
+        for broker, symbol, t_type, qty, price in cursor.fetchall():
+            qty = float(qty)
+            price = float(price)
+            key = (broker, symbol)
+            
+            if key not in lots:
+                lots[key] = []
+            
+            if t_type == 'BUY':
+                lots[key].append({'qty': qty, 'price': price})
+            elif t_type == 'SELL':
+                rem = qty
+                while rem > 0 and lots[key]:
+                    consume = min(rem, lots[key][0]['qty'])
+                    lots[key][0]['qty'] -= consume
+                    rem -= consume
+                    if lots[key][0]['qty'] <= 1e-6:
+                        lots[key].pop(0)
+        
+        # Analyze remaining FIFO lots for unrealized losses
+        for (broker, symbol), remaining_lots in lots.items():
+            if not remaining_lots:
+                continue
+
+            # ── Skip closed / oversold positions ──────────────────────
+            # The FIFO tracker can leave "ghost" lots when sell records
+            # appear before their matching buys (intraday trade ordering,
+            # cross-broker transfers, missing import data).  The net
+            # position from the DB is the single source of truth.
+            true_net = net_positions.get((broker, symbol), 0.0)
+            if true_net <= 0.5:  # effectively zero or negative
+                continue
+                
+            current_price = prices.get(symbol)
+            if not current_price:
+                # Fallback to simple average if no market price at all
+                cursor.execute("SELECT avg_price FROM holdings WHERE broker=? AND symbol=?", (broker, symbol))
+                row = cursor.fetchone()
+                current_price = float(row[0]) if row else 0.0
+                
+            if current_price == 0.0:
+                continue
+                
+            loss = 0.0
+            loss_qty = 0.0
+            cost = 0.0
+            
+            for lot in remaining_lots:
+                if lot['qty'] <= 1e-6:
+                    continue
+                if lot['price'] > current_price:
+                    loss += (lot['price'] - current_price) * lot['qty']
+                    loss_qty += lot['qty']
+                    cost += lot['price'] * lot['qty']
+                    
+            if loss >= min_loss_amount:
+                avg_loss_price = cost / loss_qty if loss_qty > 0 else 0.0
+                opportunities.append({
+                    "symbol": symbol,
+                    "broker": broker,
+                    "qty": loss_qty,
+                    "avg_price": avg_loss_price,
+                    "current_price": current_price,
+                    "unrealized_loss": loss
+                })
+
+    # Sort highest loss first
+    opportunities.sort(key=lambda x: x["unrealized_loss"], reverse=True)
 
     with _cache_lock:
-        _harvesting_cache["data"], _harvesting_cache["ts"] = result, time.time()
+        _harvesting_cache["data"], _harvesting_cache["ts"] = opportunities, time.time()
         _harvesting_cache["_key"] = min_loss_amount
-    return result
+    return opportunities
 
 

@@ -8,6 +8,20 @@ from __future__ import annotations
 
 import tkinter as tk
 
+def format_money(val: float, currency: str = "INR") -> str:
+    """Format currency string based on ISO code."""
+    symbols = {
+        "INR": "₹",
+        "JPY": "¥",
+        "USD": "$",
+        "GBP": "£",
+        "CNY": "¥"
+    }
+    symbol = symbols.get(currency.upper(), "₹")
+    try:
+        return f"{symbol}{float(val or 0.0):,.2f}"
+    except Exception:
+        return f"{symbol}0.00"
 
 def center_window(win: tk.Misc, *, parent: tk.Misc | None = None) -> None:
     """Center a Tk/Toplevel window.
@@ -87,8 +101,9 @@ def add_treeview_copy_menu(tv) -> None:
             try:
                 selected_item = tv.selection()[0]
                 values = tv.item(selected_item, "values")
+                import re
                 if values:
-                    text = "\t".join(str(v).replace("₹", "").replace(",", "").replace("%", "").strip() for v in values)
+                    text = "\t".join(re.sub(r'[₹¥$£,%]', '', str(v)).strip() for v in values)
                     app.clipboard_clear()
                     app.clipboard_append(text)
             except IndexError:
@@ -96,11 +111,12 @@ def add_treeview_copy_menu(tv) -> None:
                 
         def _copy_all():
             try:
+                import re
                 cols = list(tv["columns"])
                 lines = ["\t".join(cols)]
                 for iid in tv.get_children():
                     vals = tv.item(iid, "values")
-                    lines.append("\t".join(str(v).replace("₹", "").replace(",", "").replace("%", "").strip() for v in vals))
+                    lines.append("\t".join(re.sub(r'[₹¥$£,%]', '', str(v)).strip() for v in vals))
                 text = "\n".join(lines)
                 app.clipboard_clear()
                 app.clipboard_append(text)
@@ -135,8 +151,9 @@ def treeview_sort_column(tv, col: str, reverse: bool) -> None:
         def convert(val):
             # Try parsing as float for numeric sorting
             try:
+                import re
                 # Remove currency, percentage, commas, and other non-numeric symbols
-                v = str(val).replace('₹', '').replace('%', '').replace(',', '').strip()
+                v = re.sub(r'[₹¥$£,%]', '', str(val)).strip()
                 if not v or v in ("—", "-", "N/A"):
                     return float('-inf') if not reverse else float('inf')
                 return float(v)

@@ -60,7 +60,7 @@ class ModernStyle:
     # ──────────────────────────────────────────────────────────────
 
     # View / Page level — used once per view for the main header label
-    FONT_PAGE_TITLE  = (FONT_FAMILY, 32, "bold")   # Dashboard, Holdings, Trade History headers
+    FONT_PAGE_TITLE  = (FONT_FAMILY, 30, "bold")   # Dashboard, Holdings, Trade History headers
 
     # Section / card level — used for card titles, section headings
     FONT_TITLE       = (FONT_FAMILY, 18, "bold")   # Modal titles, drilldown headers
@@ -68,7 +68,7 @@ class ModernStyle:
     FONT_SUBHEADING  = (FONT_FAMILY, 12, "bold")   # Card sub-labels, tooltip headers
 
     # Body — default readable text throughout the app
-    FONT_BODY        = (FONT_FAMILY, 11)            # Descriptions, subtitles, sidebar subtitles
+    FONT_BODY        = (FONT_FAMILY, 13)            # Descriptions, subtitles, sidebar subtitles
     FONT_BODY_BOLD   = (FONT_FAMILY, 11, "bold")   # Emphasized body text, inline values in cards
     FONT_SMALL       = (FONT_FAMILY, 10)            # Timestamps, hints, metadata below labels
     FONT_SMALL_BOLD  = (FONT_FAMILY, 10, "bold")   # Small but emphatic: breakdown labels, badge-like text
@@ -81,24 +81,24 @@ class ModernStyle:
     FONT_DRILLDOWN_SYM = (FONT_FAMILY, 24, "bold")  # Valuation modal symbol / top holding name
     FONT_SECTION_LABEL = (FONT_FAMILY, 20, "bold")  # Section headers inside cards / drilldown panels
     FONT_MODAL_TITLE   = (FONT_FAMILY, 16, "bold")  # Modal window titles (Broker Mgmt, Watchlist detail)
-    FONT_EMPTY_STATE   = (FONT_FAMILY, 36)           # Large emoji in empty-state overlays
+    FONT_EMPTY_STATE   = (FONT_FAMILY, 30)           # Large emoji in empty-state overlays
 
     # Sidebar-specific (dark background, larger for readability)
-    FONT_SIDEBAR_TITLE = (FONT_FAMILY, 21, "bold")  # "PTracker" brand title in sidebar header
-    FONT_SIDEBAR_BADGE = (FONT_FAMILY,  8, "bold")  # PRO badge text in sidebar header
+    FONT_SIDEBAR_TITLE = (FONT_FAMILY, 24, "bold")  # "PTracker" brand title in sidebar header
+    FONT_SIDEBAR_BADGE = (FONT_FAMILY, 9, "bold")  # PRO badge text in sidebar header
 
     # Italic / muted hints
-    FONT_ITALIC        = (FONT_FAMILY, 10, "italic") # Italicised helper text / placeholder hints
+    FONT_ITALIC        = (FONT_FAMILY, 12, "italic") # Italicised helper text / placeholder hints
     FONT_ITALIC_MD     = (FONT_FAMILY, 14, "italic") # Medium italic — LoadingOverlay message text
-    FONT_TINY_BOLD     = (FONT_FAMILY,  9, "bold")  # Tiny emphasized labels (calendar day names, row counts)
+    FONT_TINY_BOLD     = (FONT_FAMILY, 11, "bold")  # Tiny emphasized labels (calendar day names, row counts)
 
     # Loading overlay / modal icon
     FONT_LOADING_ICON  = (FONT_FAMILY, 32)           # ⏳ spinner / loading icon in overlay
     FONT_MODAL_ICON    = (FONT_FAMILY, 26)           # Large icon label in PremiumModal header
 
     # KPI Stats Cards — used in Dashboard, Holdings, Trade History, Tax Report summary bars
-    FONT_KPI_VALUE   = (FONT_FAMILY, 22, "bold")   # Large number display (portfolio value, P&L)
-    FONT_KPI_LABEL   = (FONT_FAMILY, 11, "bold")   # Small label above/below the KPI value
+    FONT_KPI_VALUE   = (FONT_FAMILY, 26, "bold")   # Large number display (portfolio value, P&L)
+    FONT_KPI_LABEL   = (FONT_FAMILY, 14, "bold")   # Small label above/below the KPI value
 
     # Input Widgets — search boxes in Holdings and Trade History
     FONT_INPUT       = (FONT_FAMILY, 15, "bold")   # Symbol search entry text (blue, high visibility)
@@ -111,7 +111,7 @@ class ModernStyle:
     FONT_NAV_SECTION = (FONT_FAMILY, 10, "bold")   # "N A V I G A T I O N" section label
 
     # Miscellaneous small UI elements
-    FONT_BADGE       = (FONT_FAMILY,  8, "bold")   # PRO badge, pill labels
+    FONT_BADGE       = (FONT_FAMILY, 10, "bold")   # PRO badge, pill labels
     FONT_ICON        = (FONT_FAMILY, 15)            # Emoji icons inside cards (no bold needed)
 
     # Alias for convenience — HEADER_COLOR is always the primary accent

@@ -3,9 +3,9 @@ from model.database import db_session, db_transaction
 
 # Database operations now use the db_session() context manager for clean connections.
 
-def add_trade(broker: str, date: str, symbol: str, trade_type: str, qty: float, price: float, fee: float, trade_id: str):
-    sql = 'INSERT INTO trades (trade_id, broker, date, symbol, type, qty, price, fee) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    params = (trade_id, broker, date, symbol, trade_type, qty, price, fee)
+def add_trade(broker: str, date: str, symbol: str, trade_type: str, qty: float, price: float, fee: float, trade_id: str, currency: str = "INR"):
+    sql = 'INSERT INTO trades (trade_id, broker, date, symbol, type, qty, price, fee, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    params = (trade_id, broker, date, symbol, trade_type, qty, price, fee, currency)
     with db_session() as conn:
         cursor = conn.cursor()
         cursor.execute(sql, params)
@@ -15,23 +15,36 @@ def add_trades_batch(trades: list):
     """Insert multiple trades in a single transaction for much better throughput.
 
     Each item in `trades` should be a tuple:
-        (trade_id, broker, date, symbol, trade_type, qty, price, fee)
+    If 8 items: (trade_id, broker, date, symbol, trade_type, qty, price, fee) [defaults to INR]
+    If 9 items: (trade_id, broker, date, symbol, trade_type, qty, price, fee, currency)
     """
     if not trades:
         return
-    sql = 'INSERT INTO trades (trade_id, broker, date, symbol, type, qty, price, fee) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     with db_transaction() as conn:
         cursor = conn.cursor()
-        cursor.executemany(sql, trades)
+        for t in trades:
+            if len(t) == 8:
+                sql = 'INSERT INTO trades (trade_id, broker, date, symbol, type, qty, price, fee, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "INR")'
+                cursor.execute(sql, t)
+            else:
+                sql = 'INSERT INTO trades (trade_id, broker, date, symbol, type, qty, price, fee, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                cursor.execute(sql, t)
 
-def update_trade(broker: str, trade_id: str, date: str, symbol: str, trade_type: str, qty: float, price: float, fee: float):
+def update_trade(broker: str, trade_id: str, date: str, symbol: str, trade_type: str, qty: float, price: float, fee: float, currency: str = None):
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE trades
-            SET date = ?, symbol = ?, type = ?, qty = ?, price = ?, fee = ?
-            WHERE broker = ? AND trade_id = ?
-        ''', (date, symbol, trade_type, qty, price, fee, broker, trade_id))
+        if currency is not None:
+            cursor.execute('''
+                UPDATE trades
+                SET date = ?, symbol = ?, type = ?, qty = ?, price = ?, fee = ?, currency = ?
+                WHERE broker = ? AND trade_id = ?
+            ''', (date, symbol, trade_type, qty, price, fee, currency, broker, trade_id))
+        else:
+            cursor.execute('''
+                UPDATE trades
+                SET date = ?, symbol = ?, type = ?, qty = ?, price = ?, fee = ?
+                WHERE broker = ? AND trade_id = ?
+            ''', (date, symbol, trade_type, qty, price, fee, broker, trade_id))
 
 def update_holding_quantity_and_price(broker: str, symbol: str, new_qty: float, new_price: float):
     """Update holding quantity and average price for a broker/symbol pair."""
@@ -162,5 +175,5 @@ def get_all_trades_for_export() -> list:
     """Returns all trades formatted for CSV export (matching import format)."""
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT broker, trade_id, date, symbol, type, qty, price, fee FROM trades ORDER BY date DESC")
+        cursor.execute("SELECT broker, trade_id, date, symbol, type, qty, price, fee, currency FROM trades ORDER BY date DESC")
         return cursor.fetchall()

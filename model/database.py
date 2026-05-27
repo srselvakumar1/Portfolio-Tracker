@@ -8,7 +8,14 @@ import shutil
 
 # Project-local assets directory
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOCAL_ASSETS_DIR = os.path.join(project_root, "assets")
+
+# Prioritize the specified development assets path if it exists
+DEV_ASSETS_DIR = "/Users/selvakumar/Downloads/PROJECTS/assets"
+if os.path.exists(DEV_ASSETS_DIR):
+    LOCAL_ASSETS_DIR = DEV_ASSETS_DIR
+else:
+    LOCAL_ASSETS_DIR = os.path.join(project_root, "assets")
+
 DB_PATH = None
 
 # 1. Prioritize local assets folder (standard dev/portable mode)
@@ -126,7 +133,7 @@ def close_all_connections(optimize: bool = False):
         _local.conn = None
 
 
-_SCHEMA_VERSION = 5  # Bump when schema changes
+_SCHEMA_VERSION = 6  # Bump when schema changes
 
 
 def _ensure_columns(conn: sqlite3.Connection, table: str, columns: list[tuple[str, str]]):
@@ -232,6 +239,7 @@ def initialize_database(reset=False):
                 qty REAL NOT NULL,
                 price REAL NOT NULL,
                 fee REAL DEFAULT 0.0,
+                currency TEXT DEFAULT 'INR',
                 PRIMARY KEY (broker, trade_id),
                 FOREIGN KEY(broker) REFERENCES brokers(name)
             )
@@ -294,6 +302,7 @@ def initialize_database(reset=False):
                 cagr REAL DEFAULT 0.0,
                 earliest_date TEXT,
                 total_fees REAL DEFAULT 0.0,
+                currency TEXT DEFAULT 'INR',
                 PRIMARY KEY (broker, symbol),
                 FOREIGN KEY(broker) REFERENCES brokers(name)
             )
@@ -394,6 +403,10 @@ def initialize_database(reset=False):
                 cursor.execute("DELETE FROM trade_calcs") # Force rebuild on next startup
         except Exception:
             pass
+
+        # Multi-currency support
+        _ensure_columns(conn, "trades", [("currency", "TEXT DEFAULT 'INR'")])
+        _ensure_columns(conn, "holdings", [("currency", "TEXT DEFAULT 'INR'")])
 
         # Only create indexes on first run or after schema change
         if current_version < _SCHEMA_VERSION:

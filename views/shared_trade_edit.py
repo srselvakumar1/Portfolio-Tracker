@@ -7,7 +7,7 @@ from ui_widgets import ModernButton
 from ui_utils import center_window
 from views.base_view import _create_date_input
 
-def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: str, date: str, symbol: str, trade_type: str, qty: str, price: str, fee: str, app_state=None) -> None:
+def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: str, date: str, symbol: str, trade_type: str, qty: str, price: str, fee: str, currency: str = "INR", app_state=None) -> None:
     if not broker or not trade_id:
         messagebox.showerror("Edit Trade", "Missing broker/trade id for this row.")
         return
@@ -82,6 +82,7 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
     _edit_qty_var    = tk.StringVar(value=str(qty).replace(",", "").replace("₹", "").strip())
     _edit_price_var  = tk.StringVar(value=str(price).replace(",", "").replace("₹", "").strip())
     _edit_fee_var    = tk.StringVar(value=str(fee).replace(",", "").replace("₹", "").strip())
+    _edit_currency_var = tk.StringVar(value=(currency or "INR").strip().upper())
 
     _label("👑  Broker", 0, 0)
     broker_wrap = tk.Frame(form, bg=BORDER, padx=1, pady=1)
@@ -109,15 +110,24 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
     _label("💸  Fees (₹)", 2, 1)
     _entry_widget(2, 1, _edit_fee_var)
 
-    type_lbl_frame = tk.Frame(form, bg=BG)
-    type_lbl_frame.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 4))
-    tk.Label(type_lbl_frame, text="🌲  Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+    lbl_frame = tk.Frame(form, bg=BG)
+    lbl_frame.grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 4))
+    tk.Label(lbl_frame, text="🌲  Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+    tk.Frame(lbl_frame, width=16, bg=BG).pack(side="left")
+    tk.Label(lbl_frame, text="💱  Currency", bg=BG, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
 
-    type_row = tk.Frame(form, bg=BG)
-    type_row.grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
+    btn_row = tk.Frame(form, bg=BG)
+    btn_row.grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
     for val, color in [("BUY", "#059669"), ("SELL", "#DC2626")]:
-        tk.Radiobutton(type_row, text=val, variable=_edit_type_var, value=val, bg=BG, fg=color, font=ModernStyle.FONT_TABLE_BOLD, selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+        tk.Radiobutton(btn_row, text=val, variable=_edit_type_var, value=val, bg=BG, fg=color, font=ModernStyle.FONT_TABLE_BOLD, selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+
+    tk.Frame(btn_row, bg=ModernStyle.DIVIDER_COLOR, width=2, height=20).pack(side="left", padx=16)
+
+    for val in ["INR", "JPY"]:
+        tk.Radiobutton(btn_row, text=val, variable=_edit_currency_var, value=val, bg=BG, fg=ModernStyle.ACCENT_PRIMARY, font=ModernStyle.FONT_TABLE_BOLD, selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+
+
 
     tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=24, pady=(4, 0))
     status = tk.Label(win, text="", bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_ITALIC, anchor="w")
@@ -137,6 +147,7 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
             q = float((_edit_qty_var.get() or "0").replace(",", ""))
             p = float((_edit_price_var.get() or "0").replace(",", ""))
             f = float((_edit_fee_var.get() or "0").replace(",", ""))
+            cur = (_edit_currency_var.get() or "INR").strip().upper()
             if q <= 0: raise ValueError("Qty must be > 0")
             if p <= 0: raise ValueError("Price must be > 0")
         except Exception as e:
@@ -162,9 +173,9 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
 
                 if b != broker:
                     crud.delete_trade(broker, trade_id)
-                    crud.add_trade(b, d, sym, tt, q, p, f, trade_id)
+                    crud.add_trade(b, d, sym, tt, q, p, f, trade_id, currency=cur)
                 else:
-                    crud.update_trade(b, trade_id, d, sym, tt, q, p, f)
+                    crud.update_trade(b, trade_id, d, sym, tt, q, p, f, currency=cur)
                 
                 try: rebuild_holdings()
                 except Exception: pass

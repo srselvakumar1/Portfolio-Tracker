@@ -17,13 +17,11 @@ class TradeHistoryView(BaseView):
     
     def build(self):
         self._th_edit_popup = None
-        header_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY, height=60)
-        header_frame.pack(fill="x", padx=15, pady=(10, 5))
-        tk.Label(header_frame, text="🔷 Trade History", fg=ModernStyle.ACCENT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_PAGE_TITLE).pack(anchor="w")
-        tk.Label(header_frame, text="All trades with running stats", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
-
-        # Accent divider
-        tk.Frame(self, bg="#D4AF37", height=1).pack(fill="x", padx=15, pady=(10, 10))
+        self.add_gradient_header(
+            self,
+            "🔷 Trade History",
+            "All trades with running stats"
+        )
 
         # Filters card (enhanced with quick date filters and better styling)
         filters = ModernCard(self, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1, radius=10)
@@ -231,7 +229,8 @@ class TradeHistoryView(BaseView):
             ("Trades", "trades", ModernStyle.ACCENT_PRIMARY, "#DBEAFE"),        # Blue
             ("Net Buy Qty", "buy_qty", ModernStyle.SUCCESS, "#DCFCE7"),         # Green
             ("Net Sell Qty", "sell_qty", ModernStyle.ERROR, "#FEF2F2"),         # Red
-            ("Fees", "fees", ModernStyle.ACCENT_TERTIARY, "#FEF3C7"),           # Amber
+            ("Live Qty", "live_qty", ModernStyle.ACCENT_PURPLE, "#E9D5FF"),     # Purple
+            ("Net Fees", "fees", ModernStyle.ACCENT_TERTIARY, "#FEF3C7"),           # Amber
             ("Running PnL", "pnl", "#0891B2", "#CFFAFE"),                       # Cyan
         ]
         
@@ -296,17 +295,21 @@ class TradeHistoryView(BaseView):
             "Date",
             "Trade ID",
             "Symbol",
+            "Broker",
             "Type",
             "Qty",
             "Price ₹",
+            "Trade Value ₹",
             "Running Qty",
             "AvgCost ₹",
+            "Trade P&L ₹",
             "Running PnL ₹",
             "Fees ₹",
+            "Cum. Fees ₹",
         )
         self.trade_table = ttk.Treeview(table_frame, columns=columns, show="headings", height=18, selectmode="extended")
 
-        widths = [40, 100, 95, 80, 60, 70, 90, 80, 90, 120, 80]
+        widths = [40, 100, 85, 80, 80, 60, 55, 85, 95, 70, 85, 100, 110, 70, 90]
         sortable_cols = ("Symbol", "Date", "Type")
         for col, w in zip(columns, widths):
             if col in sortable_cols:
@@ -324,11 +327,13 @@ class TradeHistoryView(BaseView):
             
             add_treeview_copy_menu(self.trade_table)
 
-            # Zebra striping — group-based backgrounds for readability
-            self.trade_table.tag_configure("odd",  background="#FFFFFF")  # pure white
-            self.trade_table.tag_configure("even", background="#F0FDF4")  # mild green shade
-            # Trade-type semantic colouring (applies alongside even/odd)
-            # Removed foreground tinting to reduce visual noise; using Emoji badges instead.
+            # Semantic BUY/SELL row tinting with alternating shades
+            self.trade_table.tag_configure("buy_odd",   background="#F0FDF4", foreground="#15803D")  # green-50 bg, green-700 fg
+            self.trade_table.tag_configure("buy_even",  background="#DCFCE7", foreground="#15803D")  # green-100 bg
+            self.trade_table.tag_configure("sell_odd",  background="#FFF1F2", foreground="#B91C1C")  # rose-50 bg, red-700 fg
+            self.trade_table.tag_configure("sell_even", background="#FEE2E2", foreground="#B91C1C")  # red-100 bg
+            # Date-group first-row accent (subtle left-border effect via slightly bolder bg)
+            self.trade_table.tag_configure("date_start", font=ModernStyle.FONT_TABLE_BOLD)
         except Exception:
             pass
 
@@ -422,7 +427,7 @@ class TradeHistoryView(BaseView):
 
         broker, trade_id = self._split_trade_iid(iid)
         vals = self.trade_table.item(iid, "values") or ()
-        if len(vals) < 11:
+        if len(vals) < 15:
             return
 
         # Fetch ALL editable fields from the DB directly — never use display-formatted
@@ -431,11 +436,11 @@ class TradeHistoryView(BaseView):
             from model.database import db_session
             with db_session() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT date, symbol, type, qty, price, fee FROM trades WHERE broker=? AND trade_id=?", (broker, trade_id))
+                cur.execute("SELECT date, symbol, type, qty, price, fee, currency FROM trades WHERE broker=? AND trade_id=?", (broker, trade_id))
                 row = cur.fetchone()
                 if not row:
                     return
-                date, symbol, t_type, qty, price, fee = row[0], row[1], row[2], str(row[3]), str(row[4]), str(row[5])
+                date, symbol, t_type, qty, price, fee, currency = row[0], row[1], row[2], str(row[3]), str(row[4]), str(row[5]), str(row[6] or 'INR')
         except Exception:
             return
 
@@ -448,6 +453,7 @@ class TradeHistoryView(BaseView):
             qty=qty,
             price=price,
             fee=fee,
+            currency=currency,
         )
 
     def _open_edit_trade_dialog(
@@ -461,6 +467,7 @@ class TradeHistoryView(BaseView):
         qty: str,
         price: str,
         fee: str,
+        currency: str = "INR",
     ) -> None:
         if not broker or not trade_id:
             messagebox.showerror("Edit Trade", "Missing broker/trade id for this row.")
@@ -561,6 +568,7 @@ class TradeHistoryView(BaseView):
         self._edit_qty_var    = tk.StringVar(value=str(qty).replace(",", "").replace("₹", "").strip())
         self._edit_price_var  = tk.StringVar(value=str(price).replace(",", "").replace("₹", "").strip())
         self._edit_fee_var    = tk.StringVar(value=str(fee).replace(",", "").replace("₹", "").strip())
+        self._edit_currency_var = tk.StringVar(value=(currency or "INR").strip().upper())
 
         # Row 0: Broker dropdown + Date
         _label("👑  Broker", 0, 0)
@@ -594,19 +602,29 @@ class TradeHistoryView(BaseView):
         _label("💸  Fees (₹)", 2, 1)
         _entry_widget(2, 1, self._edit_fee_var)
 
-        # Row 3: Trade Type radio buttons
-        type_lbl_frame = tk.Frame(form, bg=BG)
-        type_lbl_frame.grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 4))
-        tk.Label(type_lbl_frame, text="🌲  Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
-                 font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+        lbl_frame = tk.Frame(form, bg=BG)
+        lbl_frame.grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        tk.Label(lbl_frame, text="🌲  Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+        tk.Frame(lbl_frame, width=16, bg=BG).pack(side="left")
+        tk.Label(lbl_frame, text="💱  Currency", bg=BG, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
 
-        type_row = tk.Frame(form, bg=BG)
-        type_row.grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        btn_row = tk.Frame(form, bg=BG)
+        btn_row.grid(row=9, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
         for val, color in [("BUY", "#059669"), ("SELL", "#DC2626")]:
-            tk.Radiobutton(type_row, text=val, variable=self._edit_type_var, value=val,
+            tk.Radiobutton(btn_row, text=val, variable=self._edit_type_var, value=val,
                            bg=BG, fg=color, font=ModernStyle.FONT_TABLE_BOLD,
                            selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+
+        tk.Frame(btn_row, bg=ModernStyle.DIVIDER_COLOR, width=2, height=20).pack(side="left", padx=16)
+
+        for val in ["INR", "JPY"]:
+            tk.Radiobutton(btn_row, text=val, variable=self._edit_currency_var, value=val,
+                           bg=BG, fg=ModernStyle.ACCENT_PRIMARY, font=ModernStyle.FONT_TABLE_BOLD,
+                           selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+
+        # Row 3: Trade Type radio buttons
+
 
         # ── Status + actions ──────────────────────────────────────────────────
         tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=24, pady=(4, 0))
@@ -655,6 +673,7 @@ class TradeHistoryView(BaseView):
             qty = self._parse_float(self._edit_qty_var.get())
             price = self._parse_float(self._edit_price_var.get())
             fee = self._parse_float(self._edit_fee_var.get())
+            cur = (self._edit_currency_var.get() or "INR").strip().upper()
             if qty <= 0:
                 raise ValueError("Qty must be > 0")
             if price <= 0:
@@ -688,10 +707,10 @@ class TradeHistoryView(BaseView):
                 # If broker changed, delete old trade and add new one
                 if broker != broker_old:
                     crud.delete_trade(broker_old, trade_id)
-                    crud.add_trade(broker, date, symbol, t_type, float(qty), float(price), float(fee), trade_id)
+                    crud.add_trade(broker, date, symbol, t_type, float(qty), float(price), float(fee), trade_id, currency=cur)
                 else:
                     # Just update the specific trade being actively edited (overwrites any partial rename if necessary)
-                    crud.update_trade(broker, trade_id, date, symbol, t_type, float(qty), float(price), float(fee))
+                    crud.update_trade(broker, trade_id, date, symbol, t_type, float(qty), float(price), float(fee), currency=cur)
                 
                 try:
                     rebuild_holdings()
@@ -1097,7 +1116,7 @@ class TradeHistoryView(BaseView):
             menu = tk.Menu(self.trade_table, tearoff=False)
             
             # Only enable Edit if we have enough values
-            if len(vals) >= 11:
+            if len(vals) >= 15:
                 menu.add_command(label="Edit", command=lambda: self._edit_from_context(iid))
             
             menu.add_command(label="Copy", command=self._copy_selected)
@@ -1114,17 +1133,17 @@ class TradeHistoryView(BaseView):
         try:
             broker, trade_id = self._split_trade_iid(iid)
             vals = self.trade_table.item(iid, "values") or ()
-            if len(vals) < 11:
+            if len(vals) < 15:
                 messagebox.showerror("Edit Trade", "Invalid row data.")
                 return
 
             date = str(vals[1])
             symbol = str(vals[3])
-            t_type_raw = str(vals[4]).upper()
+            t_type_raw = str(vals[5]).upper()
             t_type = "BUY" if "BUY" in t_type_raw else "SELL"
-            qty = str(vals[5])
-            price = str(vals[6])
-            fee = str(vals[10])
+            qty = str(vals[6])
+            price = str(vals[7])
+            fee = str(vals[13])
 
             self._open_edit_trade_dialog(
                 broker=broker,
@@ -1293,6 +1312,7 @@ class TradeHistoryView(BaseView):
         try:
             qty_buy = float(summary.get("qty_buy", 0.0) or 0.0)
             qty_sell = float(summary.get("qty_sell", 0.0) or 0.0)
+            live_qty = qty_buy - qty_sell
             fee_buy = float(summary.get("fee_buy", 0.0) or 0.0)
             fee_sell = float(summary.get("fee_sell", 0.0) or 0.0)
             total_pnl = float(summary.get("total_pnl", 0.0) or 0.0)
@@ -1300,6 +1320,7 @@ class TradeHistoryView(BaseView):
             self.sum_trades.config(text=f"{trades}")
             self.sum_buy_qty.config(text=f"{qty_buy:g}")
             self.sum_sell_qty.config(text=f"{qty_sell:g}")
+            self.sum_live_qty.config(text=f"{live_qty:g}")
             self.sum_fees.config(text=f"₹{(fee_buy + fee_sell):,.2f}")
             self.sum_pnl.config(text=f"₹{total_pnl:,.2f}", fg=ModernStyle.SUCCESS if total_pnl >= 0 else ModernStyle.ERROR)
         except Exception:
@@ -1320,8 +1341,10 @@ class TradeHistoryView(BaseView):
             pass
 
         current_date = None
-        current_stripe = "odd"
+        buy_count = 0
+        sell_count = 0
         running_tpnl = 0.0
+        cum_fees: dict[tuple[str, str], float] = {}  # (broker, symbol) → cumulative fees
 
         for idx, row in enumerate(df.itertuples(index=False)):
             row_date = str(getattr(row, "date", ""))
@@ -1331,9 +1354,11 @@ class TradeHistoryView(BaseView):
             except Exception:
                 disp_date = row_date
 
-            if row_date != current_date:
+            is_new_date = row_date != current_date
+            if is_new_date:
                 current_date = row_date
-                current_stripe = "even" if current_stripe == "odd" else "odd"
+                buy_count = 0
+                sell_count = 0
 
             row_type = str(getattr(row, "type", "")).upper()
             qty = float(getattr(row, "qty", 0.0) or 0.0)
@@ -1342,40 +1367,75 @@ class TradeHistoryView(BaseView):
             run_qty = float(getattr(row, "run_qty", 0.0) or 0.0)
             avg_cost = float(getattr(row, "avg_cost", 0.0) or 0.0)
             trade_pnl = float(getattr(row, "trade_pnl", 0.0) or 0.0)
+
+            # Trade Value = Qty × Price
+            trade_value = qty * price
+
+            # Cumulative fees per (broker, symbol)
+            broker = str(getattr(row, "broker", "") or "").strip()
+            symbol_val = str(getattr(row, "symbol", "") or "").strip()
+            fee_key = (broker, symbol_val)
+            cum_fees[fee_key] = cum_fees.get(fee_key, 0.0) + fee
+            cum_fee_disp = cum_fees[fee_key]
+
+            from ui_utils import format_money
+            currency = str(getattr(row, 'currency', 'INR')).strip().upper()
+
+            # Running PnL (cumulative trade_pnl)
             running_tpnl += trade_pnl
             if row_type == "SELL":
                 arrow = "🌲" if running_tpnl >= 0 else "🔻"
-                pnl_disp = f"{arrow} ₹{abs(running_tpnl):,.2f}"
+                pnl_disp = f"{arrow} {format_money(abs(running_tpnl), currency)}"
             else:
                 pnl_disp = "—"
 
-            broker = str(getattr(row, "broker", "") or "").strip()
+            # Per-trade P&L (only meaningful for SELL)
+            if row_type == "SELL" and trade_pnl != 0.0:
+                tp_arrow = "▲" if trade_pnl >= 0 else "▼"
+                tp_disp = f"{tp_arrow} {format_money(abs(trade_pnl), currency)}"
+            else:
+                tp_disp = "—"
+
             trade_id = str(getattr(row, "trade_id", "") or "").strip()
             iid = self._make_trade_iid(broker, trade_id)
 
             type_disp = row_type
             if row_type == "BUY":
                 type_disp = "🌲 Buy"
+                buy_count += 1
+                stripe = "buy_odd" if buy_count % 2 == 1 else "buy_even"
             elif row_type == "SELL":
-                type_disp = "🔻 Sell" # 🔴
+                type_disp = "🔻 Sell"
+                sell_count += 1
+                stripe = "sell_odd" if sell_count % 2 == 1 else "sell_even"
+            else:
+                stripe = "buy_odd"
+
+            # Build tag list — add date_start for first row of each date group
+            tags = [stripe]
+            if is_new_date:
+                tags.append("date_start")
 
             values = (
                 str(idx + 1),
                 disp_date,
                 trade_id,
-                str(getattr(row, "symbol", "")),
+                symbol_val,
+                broker,
                 type_disp,
                 f"{qty:g}",
-                f"₹{price:,.2f}",
+                format_money(price, currency),
+                format_money(trade_value, currency),
                 f"{run_qty:g}",
-                f"₹{avg_cost:,.2f}",
+                format_money(avg_cost, currency),
+                tp_disp,
                 pnl_disp,
-                f"₹{fee:,.2f}",
+                format_money(fee, currency),
+                format_money(cum_fee_disp, currency),
             )
-            type_tag = "buy" if row_type == "BUY" else "sell"
             try:
-                self.trade_table.insert("", "end", iid=iid, values=values, tags=(current_stripe, type_tag))
+                self.trade_table.insert("", "end", iid=iid, values=values, tags=tuple(tags))
             except Exception:
                 # Fallback if iid collides (should be rare)
-                self.trade_table.insert("", "end", values=values, tags=(current_stripe, type_tag))
+                self.trade_table.insert("", "end", values=values, tags=tuple(tags))
 

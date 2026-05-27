@@ -562,7 +562,7 @@ class ModernButton(tk.Canvas):
                 for i in ids: self.itemconfig(i, fill=fill, outline=fill)
         
         if "text" in self._canvas_ids:
-            self.itemconfig(self._canvas_ids["text"], fill=text_fill)
+            self.itemconfig(self._canvas_ids["text"], fill=text_fill, text=self._text)
 
     @staticmethod
     def _try_load_icon(icon_path: str | None, icon_subsample: int) -> tk.PhotoImage | None:
@@ -1422,71 +1422,80 @@ class ModernSegmentedControl(tk.Frame):
     """
     A segmented control (button group) for mutually exclusive options.
     Replaces radio buttons with a modern pill-like horizontal layout.
+
+    per_option_colors: optional dict mapping option name -> (active_bg, active_fg)
+    to allow each segment to have its own highlight color when selected.
     """
-    def __init__(self, parent, options, variable=None, command=None, 
-                 bg=ModernStyle.BG_SECONDARY, 
+    def __init__(self, parent, options, variable=None, command=None,
+                 bg=ModernStyle.BG_SECONDARY,
                  fg=ModernStyle.TEXT_SECONDARY,
                  active_bg=ModernStyle.ACCENT_PRIMARY,
                  active_fg=ModernStyle.TEXT_ON_ACCENT,
                  font=ModernStyle.FONT_BODY,
                  container_bg=ModernStyle.BG_PRIMARY,
+                 per_option_colors=None,
                  height=32, **kwargs):
         super().__init__(parent, bg=container_bg, **kwargs)
-        
+
         self.options = options
         self.variable = variable if variable else tk.StringVar(value=options[0])
         self.command = command
-        
+
         self._bg = bg
         self._fg = fg
         self._active_bg = active_bg
         self._active_fg = active_fg
-        
+        self._per_option_colors = per_option_colors or {}  # {opt: (bg, fg)}
+
         self._buttons = {}
-        
+
         # Inner frame to hold buttons
         self.inner = tk.Frame(self, bg=container_bg)
         self.inner.pack(fill=tk.BOTH, expand=True)
-        
+
         for i, opt in enumerate(options):
             # Create a frame for each button
             btn_frame = tk.Frame(self.inner, bg=bg, height=height)
             # Apply padding on the right, except for the last item
             pad_right = 4 if i < len(options) - 1 else 0
             btn_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, pad_right))
-            
+
             # The actual clickable label
             lbl = tk.Label(
-                btn_frame, text=opt, font=font, 
+                btn_frame, text=opt, font=font,
                 bg=bg, fg=fg, cursor="hand2", padx=16
             )
             lbl.pack(fill=tk.BOTH, expand=True)
-            
+
             # Bindings
             lbl.bind("<Button-1>", lambda e, v=opt: self._select(v))
-            
+
             self._buttons[opt] = (btn_frame, lbl)
-            
+
         # Initial state setup
         if self.variable:
             self.variable.trace_add("write", self._on_var_changed)
             self._update_ui()
-            
+
     def _select(self, value):
         if self.variable:
             self.variable.set(value)
-            
+
     def _on_var_changed(self, *args):
         self._update_ui()
         if self.command:
             self.command()
-            
+
     def _update_ui(self):
         selected = self.variable.get()
         for opt, (frame, lbl) in self._buttons.items():
             if opt == selected:
-                frame.config(bg=self._active_bg)
-                lbl.config(bg=self._active_bg, fg=self._active_fg)
+                # Use per-option color if defined, otherwise fall back to active_bg
+                opt_bg, opt_fg = self._per_option_colors.get(
+                    opt, (self._active_bg, self._active_fg)
+                )
+                frame.config(bg=opt_bg)
+                lbl.config(bg=opt_bg, fg=opt_fg)
             else:
                 frame.config(bg=self._bg)
                 lbl.config(bg=self._bg, fg=self._fg)

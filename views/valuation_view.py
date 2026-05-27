@@ -18,29 +18,11 @@ class ValuationView(BaseView):
     """View to analyze a single stock's valuation metrics."""
 
     def build(self):
-        # ── Header ─────────────────────────────────────────────────────────────
-        hdr = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        hdr.pack(fill="x", padx=20, pady=(20, 4))
-
-        left = tk.Frame(hdr, bg=ModernStyle.BG_PRIMARY)
-        left.pack(side="left")
-        tk.Label(
-            left,
-            text="🔬 Valuation Analysis",
-            fg=ModernStyle.ACCENT_PRIMARY,
-            bg=ModernStyle.BG_PRIMARY,
-            font=ModernStyle.FONT_PAGE_TITLE,
-        ).pack(anchor="w")
-        tk.Label(
-            left,
-            text="Enter a symbol to fetch parameters and determine if it is undervalued.",
-            fg=ModernStyle.TEXT_TERTIARY,
-            bg=ModernStyle.BG_PRIMARY,
-            font=ModernStyle.FONT_BODY,
-        ).pack(anchor="w", pady=(2, 0))
-
-        # Accent divider
-        tk.Frame(self, bg="#D4AF37", height=1).pack(fill="x", padx=20, pady=(10, 10))
+        self.add_gradient_header(
+            self,
+            "🔬 Valuation Analysis",
+            "Enter a symbol to fetch parameters and determine if it is undervalued."
+        )
 
         self.main_scroll_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
         self.main_scroll_frame.pack(fill="both", expand=True)
@@ -376,12 +358,15 @@ class ValuationView(BaseView):
                 info = ticker.info
 
                 if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info and 'previousClose' not in info):
+                    print(f"[ValuationView] No price data for {yf_symbol}. Keys: {list(info.keys())[:10]}")
                     self.after(0, lambda: self._flash_status(f"⚠ Could not find data for {yf_symbol}.", error=True))
                     return
+                print(f"[ValuationView] Got info with {len(info)} keys for {yf_symbol}")
 
                 # ── Detect currency symbol from exchange ──────────────────────
                 currency = (info.get("currency") or "USD").upper()
-                cy = "₹" if currency in ("INR",) else ("¥" if currency in ("JPY", "CNY") else ("£" if currency == "GBP" else "$"))
+                _cy_map = {"INR": "₹", "JPY": "¥", "CNY": "¥", "GBP": "£", "USD": "$", "EUR": "€"}
+                cy = _cy_map.get(currency, "$")
                 extract_meta = {"cy": cy, "currency": currency}
 
                 # ── Historical data (RSI, MACD, Sharpe, Support/Resistance) ──
@@ -434,7 +419,10 @@ class ValuationView(BaseView):
                         ma50_hist = None
                         ma200_hist = None
 
+                print(f"[ValuationView] Computed technicals: RSI={rsi_val}, MACD={macd_val}, Sharpe={sharpe_val}")
+
                 scr_data = self._fetch_screener_fallback(yf_symbol) if yf_symbol.endswith('.NS') or yf_symbol.endswith('.BO') else {}
+                print(f"[ValuationView] Screener data: {scr_data}")
 
                 def extract(key, val):
                     self._raw_data[key] = val
@@ -545,10 +533,15 @@ class ValuationView(BaseView):
                 extract("institution_count", None)
                 try:
                     maj_holders = ticker.major_holders
-                    if maj_holders is not None and not maj_holders.empty and 1 in maj_holders.columns:
-                        count_row = maj_holders[maj_holders[1].str.contains("Number of Institutions", na=False)]
-                        if not count_row.empty:
-                            extract("institution_count", int(count_row[0].values[0]))
+                    if maj_holders is not None and not maj_holders.empty:
+                        # New yfinance format: index=Breakdown names, column='Value'
+                        if 'Value' in maj_holders.columns and 'institutionsCount' in maj_holders.index:
+                            extract("institution_count", int(maj_holders.loc['institutionsCount', 'Value']))
+                        # Legacy format: columns 0, 1
+                        elif 1 in maj_holders.columns:
+                            count_row = maj_holders[maj_holders[1].str.contains("Number of Institutions", na=False)]
+                            if not count_row.empty:
+                                extract("institution_count", int(count_row[0].values[0]))
                 except Exception:
                     pass
 
@@ -631,6 +624,7 @@ class ValuationView(BaseView):
                 except Exception:
                     pass
 
+                print(f"[ValuationView] All data extracted. Calling _process_and_display...")
                 self.after(0, self._process_and_display)
 
             except Exception as e:
@@ -647,6 +641,7 @@ class ValuationView(BaseView):
 
     def _process_and_display(self):
         """Format the raw data into UI elements and run the logic engine."""
+        print(f"[ValuationView] _process_and_display called. raw_data keys: {len(self._raw_data)}")
         self._flash_status("Analysis complete.")
 
         cy = self._raw_data.get("currency_symbol", "$")

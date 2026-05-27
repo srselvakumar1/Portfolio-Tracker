@@ -29,41 +29,22 @@ class WatchlistView(BaseView):
         self._selected_id: int | None = None   # id of row being edited
         self._data: list[dict] = []
 
-        # Header
-        hdr = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        hdr.pack(fill="x", padx=20, pady=(20, 4))
+        def _build_right(parent):
+            self._btn_refresh_all = ModernButton(
+                parent, text="🔄 Refresh All",
+                command=self._bulk_refresh_metrics,
+                bg=ModernStyle.ACCENT_SECONDARY, fg=ModernStyle.TEXT_ON_ACCENT,
+                canvas_bg="#0D9488", width=140, height=36, radius=8,
+                font=ModernStyle.FONT_BODY_BOLD
+            )
+            self._btn_refresh_all.pack(anchor="e", pady=(0, 4))
 
-        left = tk.Frame(hdr, bg=ModernStyle.BG_PRIMARY)
-        left.pack(side="left")
-        tk.Label(
-            left,
-            text="👁  Watchlist",
-            fg=ModernStyle.ACCENT_PRIMARY,
-            bg=ModernStyle.BG_PRIMARY,
-            font=ModernStyle.FONT_PAGE_TITLE,
-        ).pack(anchor="w")
-        tk.Label(
-            left,
-            text="Track symbols you're watching — double-click a row to pre-fill the form.",
-            fg=ModernStyle.TEXT_TERTIARY,
-            bg=ModernStyle.BG_PRIMARY,
-            font=ModernStyle.FONT_BODY,
-        ).pack(anchor="w", pady=(2, 0))
-
-        right = tk.Frame(hdr, bg=ModernStyle.BG_PRIMARY)
-        right.pack(side="right", fill="y", pady=(10, 0))
-
-        self._btn_refresh_all = ModernButton(
-            right, text="🔄 Refresh All",
-            command=self._bulk_refresh_metrics,
-            bg=ModernStyle.ACCENT_SECONDARY, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_PRIMARY, width=140, height=36, radius=8,
-            font=ModernStyle.FONT_BODY_BOLD
+        self.add_gradient_header(
+            self,
+            "👁  Watchlist",
+            "Track symbols you're watching — double-click a row to pre-fill the form.",
+            right_widget_func=_build_right
         )
-        self._btn_refresh_all.pack(anchor="e")
-
-        # Accent divider
-        tk.Frame(self, bg="#D4AF37", height=1).pack(fill="x", padx=20, pady=(10, 0))
 
         # ── Inline form ───────────────────────────────────────────────────────
         form_card = ModernCard(self,

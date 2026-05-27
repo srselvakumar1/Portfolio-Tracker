@@ -147,6 +147,113 @@ class BaseView(tk.Frame, ABC):
         """Build the view UI. Override in subclasses."""
         pass
     
+    def add_gradient_header(self, container, title: str, subtitle: str, right_widget_func=None, show_divider: bool = True):
+        """Add a dynamic gradient header banner to the view.
+        
+        Args:
+            container: The parent frame/canvas to pack the header into.
+            title: The main title text.
+            subtitle: The subtitle text.
+            right_widget_func: A callable that takes a parent frame and returns a widget to place on the right.
+        """
+        header_canvas = tk.Canvas(
+            container, bg=ModernStyle.BG_PRIMARY, highlightthickness=0, height=75
+        )
+        header_canvas.pack(fill="x", padx=20, pady=(6, 4))
+
+        # Gradient colors: deep blue → teal
+        grad_start = (30, 58, 138)   # #1E3A8A
+        grad_end   = (13, 148, 136)  # #0D9488
+
+        right_frame = None
+        def _draw_header_gradient(event=None):
+            w = event.width if event else header_canvas.winfo_width()
+            h = event.height if event else header_canvas.winfo_height()
+            if w < 10:
+                return
+            header_canvas.delete("gradient")
+            steps = max(1, w // 4)  # ~1 rect per 4px for performance
+            for i in range(steps):
+                t = i / max(1, steps - 1)
+                r = int(grad_start[0] + (grad_end[0] - grad_start[0]) * t)
+                g = int(grad_start[1] + (grad_end[1] - grad_start[1]) * t)
+                b = int(grad_start[2] + (grad_end[2] - grad_start[2]) * t)
+                color = f"#{r:02x}{g:02x}{b:02x}"
+                x0 = int(i * w / steps)
+                x1 = int((i + 1) * w / steps) + 1
+                header_canvas.create_rectangle(x0, 0, x1, h, fill=color, outline="", tags="gradient")
+                
+            if right_frame:
+                t_right = max(0, min(1, (w - 70) / max(1, w)))
+                r = int(grad_start[0] + (grad_end[0] - grad_start[0]) * t_right)
+                g = int(grad_start[1] + (grad_end[1] - grad_start[1]) * t_right)
+                b = int(grad_start[2] + (grad_end[2] - grad_start[2]) * t_right)
+                right_color = f"#{r:02x}{g:02x}{b:02x}"
+                try:
+                    right_frame.config(bg=right_color)
+                    for child in right_frame.winfo_children():
+                        try:
+                            child.config(bg=right_color)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            header_canvas.tag_raise("header_content")
+
+        header_canvas.bind("<Configure>", lambda e: None) # handled later
+
+        # Title
+        lbl_title = tk.Label(
+            header_canvas,
+            text=title,
+            fg="#FFFFFF",
+            bg="#1E3A8A",
+            font=ModernStyle.FONT_PAGE_TITLE,
+        )
+        header_canvas.create_window(
+            20, 20, window=lbl_title, anchor="w", tags="header_content"
+        )
+
+        # Subtitle
+        lbl_subtitle = tk.Label(
+            header_canvas,
+            text=subtitle,
+            fg="#94A3B8",
+            bg="#1E3A8A",
+            font=ModernStyle.FONT_BODY,
+        )
+        header_canvas.create_window(
+            20, 45, window=lbl_subtitle, anchor="w", tags="header_content"
+        )
+
+        if right_widget_func:
+            right_frame = tk.Frame(header_canvas, bg="#0D9488")
+            right_widget_func(right_frame)
+            header_canvas.create_window(
+                0, 37, window=right_frame, anchor="e", tags=("header_content", "right_hdr")
+            )
+
+        def _reposition_right(event=None):
+            w = event.width if event else header_canvas.winfo_width()
+            if w > 10 and right_frame:
+                header_canvas.coords("right_hdr", w - 20, 37)
+                
+        header_canvas.bind("<Configure>", lambda e: (_draw_header_gradient(e), _reposition_right(e)), add="+")
+        
+        # Thin accent divider under header
+        if show_divider:
+            tk.Frame(container, bg=ModernStyle.BRAND_GOLD, height=2).pack(
+                fill="x", padx=20, pady=(4, 0)
+            )
+        return header_canvas
+
+    def show(self) -> None:
+        """Called when view becomes visible. Override to refresh data."""
+        self._is_active = True
+        if not self._data_loaded:
+            self.load_data()
+    
     def on_show(self):
         """Called when view becomes visible. Override to refresh data."""
         self._is_active = True

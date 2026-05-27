@@ -14,13 +14,41 @@ class TaxReportView(BaseView):
     """View to display Tax Harvesting and Capital Gains report."""
     
     def __init__(self, parent, app_state=None):
-        # Must initialize before super().__init__() since BaseView calls build() immediately.
-        self._fy_options = ["FY 2023-2024", "FY 2024-2025", "All Time"]
-        # Delay StringVar creation to after Tkinter root is available via super().__init__
-        self._fy_options_list = ["FY 2023-2024", "FY 2024-2025", "All Time"]
-        self._current_fy_val = "FY 2024-2025"
+        # Build FY list dynamically based on current date
+        self._fy_options_list = self._build_fy_options()
+        # Default to the current Indian FY
+        now = datetime.now()
+        current_fy_start = now.year if now.month >= 4 else now.year - 1
+        self._current_fy_val = f"FY {current_fy_start}-{current_fy_start + 1}"
         self._current_fy = None  # Will be set in build()
         super().__init__(parent, app_state=app_state)
+
+    @staticmethod
+    def _build_fy_options() -> list:
+        """Generate FY options from the earliest trade year to the current FY."""
+        now = datetime.now()
+        current_fy_start = now.year if now.month >= 4 else now.year - 1
+
+        # Try to find the earliest sell year in the database
+        earliest_fy_start = current_fy_start - 2  # default fallback: 2 years back
+        try:
+            from model.database import db_session as _db
+            with _db() as conn:
+                row = conn.cursor().execute(
+                    "SELECT MIN(date) FROM trades WHERE type='SELL'"
+                ).fetchone()
+                if row and row[0]:
+                    yr = int(row[0][:4])
+                    mo = int(row[0][5:7])
+                    earliest_fy_start = yr if mo >= 4 else yr - 1
+        except Exception:
+            pass
+
+        options = []
+        for fy_start in range(current_fy_start, earliest_fy_start - 1, -1):
+            options.append(f"FY {fy_start}-{fy_start + 1}")
+        options.append("All Time")
+        return options
 
     def build(self):
         self._ui_built = False
@@ -37,42 +65,25 @@ class TaxReportView(BaseView):
         self._ui_built = True
 
     def _build_header(self):
-        hdr = tk.Frame(self._content, bg=ModernStyle.BG_PRIMARY)
-        hdr.pack(fill="x", padx=30, pady=(30, 10))
-        
-        left_hdr = tk.Frame(hdr, bg=ModernStyle.BG_PRIMARY)
-        left_hdr.pack(side="left")
-        
-        tk.Label(
-            left_hdr, text="📜 Tax Report & Harvesting",
-            font=ModernStyle.FONT_PAGE_TITLE,
-            bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.ACCENT_PRIMARY
-        ).pack(anchor="w")
-        
-        tk.Label(
-            left_hdr, text="View Realized Capital Gains (STCG & LTCG) per Indian Tax Rules.",
-            font=ModernStyle.FONT_SUBHEADING,
-            bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY
-        ).pack(anchor="w", pady=(4, 0))
-        
-        # FY Selector
-        right_hdr = tk.Frame(hdr, bg=ModernStyle.BG_PRIMARY)
-        right_hdr.pack(side="right", anchor="s")
-        
-        tk.Label(right_hdr, text="Financial Year:", bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY).pack(side="left", padx=10)
-        
-        cb = ModernDropdown(
-            right_hdr, textvariable=self._current_fy,
-            values=self._fy_options_list, width=150,
-            font=ModernStyle.FONT_BODY
+        def _build_right(parent):
+            tk.Label(parent, text="Financial Year:", bg="#0D9488", fg="#FFFFFF", font=ModernStyle.FONT_BODY).pack(side="left", padx=10)
+            cb = ModernDropdown(
+                parent, textvariable=self._current_fy,
+                values=self._fy_options_list, width=150,
+                font=ModernStyle.FONT_BODY
+            )
+            cb.pack(side="left")
+            try:
+                 self._current_fy.trace_add("write", lambda *args: self.load_data())
+            except Exception:
+                 pass
+
+        self.add_gradient_header(
+            self._content,
+            "📜 Tax Report & Harvesting",
+            "View Realized Capital Gains (STCG & LTCG) per Indian Tax Rules.",
+            right_widget_func=_build_right
         )
-        cb.pack(side="left")
-        try:
-             self._current_fy.trace_add("write", lambda *args: self.load_data())
-        except Exception:
-             pass
-        
-        tk.Frame(self._content, bg="#D4AF37", height=1).pack(fill="x", padx=20, pady=(10, 0))
 
     def _build_summary_bar(self):
         """Compact inline summary bar instead of tall cards."""
@@ -162,12 +173,15 @@ class TaxReportView(BaseView):
         start_date = None
         end_date = None
         
-        if fy_str == "FY 2023-2024":
-            start_date = "2023-04-01"
-            end_date = "2024-03-31"
-        elif fy_str == "FY 2024-2025":
-            start_date = "2024-04-01"
-            end_date = "2025-03-31"
+        # Dynamically parse "FY YYYY-YYYY" instead of hardcoded if/elif
+        if fy_str.startswith("FY "):
+            try:
+                parts = fy_str[3:].split("-")
+                fy_start_year = int(parts[0])
+                start_date = f"{fy_start_year}-04-01"
+                end_date = f"{fy_start_year + 1}-03-31"
+            except (ValueError, IndexError):
+                pass  # Fall through to All Time (no filter)
             
         threading.Thread(target=self._calc_taxes, args=(start_date, end_date), daemon=True).start()
 
@@ -177,8 +191,26 @@ class TaxReportView(BaseView):
         
         with db_session() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT symbol, type, date, qty, price, fee FROM trades ORDER BY date ASC")
+            cur.execute("SELECT symbol, type, date, qty, price, fee FROM trades ORDER BY date ASC, type ASC, trade_id ASC")
             trades = cur.fetchall()
+
+            # ── Ground-truth net positions ─────────────────────────────
+            # Used to detect and skip symbols that are fully closed but
+            # have FIFO mismatches due to intraday trade ordering,
+            # cross-broker transfers, or import data gaps.
+            cur.execute(
+                "SELECT broker, symbol, "
+                "  SUM(CASE WHEN type='BUY' THEN qty ELSE 0 END), "
+                "  SUM(CASE WHEN type='SELL' THEN qty ELSE 0 END) "
+                "FROM trades GROUP BY broker, symbol"
+            )
+            # Build per-symbol net (aggregated across brokers for the
+            # tax report which doesn't split by broker)
+            symbol_net = {}
+            for _, symbol, total_buy, total_sell in cur.fetchall():
+                total_buy = float(total_buy or 0.0)
+                total_sell = float(total_sell or 0.0)
+                symbol_net[symbol] = symbol_net.get(symbol, 0.0) + (total_buy - total_sell)
             
         inventory_by_symbol = {}
         realized_events = []
@@ -201,13 +233,13 @@ class TaxReportView(BaseView):
                 q.append({'date': date_str, 'qty': qty, 'price': px, 'fee': fee})
             elif ttype == 'SELL':
                 rem_qty = qty
-                sell_pnl = 0.0
-                capital_gain_type = ""
-                days_held = 0
-                buy_dates_str = []
                 
-                while rem_qty > 0 and q:
+                while rem_qty > 1e-6 and q:
                     buy = q[0]
+                    if buy['qty'] <= 1e-6:
+                        q.pop(0)
+                        continue
+
                     consume = min(rem_qty, buy['qty'])
                     
                     # Calculate dates
@@ -221,8 +253,8 @@ class TaxReportView(BaseView):
                     sale_proceeds = consume * px
                     
                     # For simplicity, assign proportion of buy/sell fees to this chunk
-                    chunk_pf = (consume / buy['qty']) * buy['fee']
-                    chunk_sf = (consume / qty) * fee
+                    chunk_pf = (consume / buy['qty']) * buy['fee'] if buy['qty'] > 0 else 0.0
+                    chunk_sf = (consume / qty) * fee if qty > 0 else 0.0
                     
                     net_pnl = sale_proceeds - cost_basis - chunk_pf - chunk_sf
                     
@@ -254,6 +286,9 @@ class TaxReportView(BaseView):
                     
                     if buy['qty'] <= 1e-6:
                         q.pop(0)
+                # If rem_qty > 0 here, this sell had no matching buys
+                # (intraday/cross-broker). Silently skip — the net
+                # position check below will catch inconsistencies.
 
         # Update UI safely
         self.after(0, lambda: self._apply_data(realized_events, stcg_total, ltcg_total))

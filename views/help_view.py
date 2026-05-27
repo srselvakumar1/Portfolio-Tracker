@@ -18,26 +18,21 @@ class HelpView(BaseView):
         self._help_font_scale = 2
         self._section_map = {}  # Tracks section_id -> widget for navigation
 
-        header_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY, height=60)
-        header_frame.pack(fill="x", padx=15, pady=(15, 10))
+        def _build_right(parent):
+            tk.Label(parent, text="Text Size", fg="#FFFFFF", bg="#0D9488", font=ModernStyle.FONT_SMALL).pack(side="left", padx=(0, 8))
+            ModernButton(parent, text="-", command=lambda: self._help_adjust_font(-1), bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY, canvas_bg="#0D9488", width=42, height=34).pack(side="left", padx=(0, 6))
+            ModernButton(parent, text="+", command=lambda: self._help_adjust_font(1), bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY, canvas_bg="#0D9488", width=42, height=34).pack(side="left")
 
-        left = tk.Frame(header_frame, bg=ModernStyle.BG_PRIMARY)
-        left.pack(side="left", fill="x", expand=True)
-        tk.Label(left, text="❓ Help & Documentation", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_TITLE).pack(anchor="w")
-        tk.Label(left, text="Comprehensive documentation and formulas used in PTracker.", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_BODY).pack(anchor="w")
-
-        right = tk.Frame(header_frame, bg=ModernStyle.BG_PRIMARY)
-        right.pack(side="right")
-        tk.Label(right, text="Text Size", fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_PRIMARY, font=ModernStyle.FONT_SMALL).pack(side="left", padx=(0, 8))
-        ModernButton(right, text="-", command=lambda: self._help_adjust_font(-1), bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY, canvas_bg=ModernStyle.BG_PRIMARY, width=42, height=34).pack(side="left", padx=(0, 6))
-        ModernButton(right, text="+", command=lambda: self._help_adjust_font(1), bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY, canvas_bg=ModernStyle.BG_PRIMARY, width=42, height=34).pack(side="left")
+        self.add_gradient_header(
+            self,
+            "❓ Help & Documentation",
+            "Comprehensive documentation and formulas used in PTracker.",
+            right_widget_func=_build_right
+        )
 
         # Stationary navigation bar for quick links
         self._nav_bar = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
         self._nav_bar.pack(fill="x", padx=15, pady=(0, 10))
-
-        # Accent divider
-        tk.Frame(self, bg="#D4AF37", height=1).pack(fill="x", padx=15, pady=(0, 10))
 
         # Scrollable container
         self.canvas = tk.Canvas(self, bg=ModernStyle.BG_PRIMARY, highlightthickness=0)

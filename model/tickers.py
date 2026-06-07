@@ -23,22 +23,25 @@ def refresh_mini_tickers(callback=None):
         
         try:
             import yfinance as yf
-            tickers = yf.Tickers(" ".join(symbols))
+            # Use threads=False to avoid ThreadPoolExecutor deadlocks inside daemon threads!
+            data = yf.download(symbols, period="2d", progress=False, threads=False)
+            
             for sym, name in zip(symbols, names):
                 try:
-                    info = tickers.tickers[sym].info
-                    cp = float(info.get('regularMarketPrice') or info.get('currentPrice') or 0.0)
-                    pc = float(info.get('regularMarketPreviousClose') or info.get('previousClose') or cp)
-                    
-                    if cp > 0:
-                        chg = cp - pc
-                        pct = (chg / pc * 100) if pc > 0 else 0.0
+                    series = data['Close'][sym].dropna()
+                    if len(series) >= 2:
+                        cp = float(series.iloc[-1])
+                        pc = float(series.iloc[-2])
                         
-                        if sym == 'JPYINR=X':
-                            cp *= 100
-                            chg *= 100
+                        if cp > 0:
+                            chg = cp - pc
+                            pct = (chg / pc * 100) if pc > 0 else 0.0
                             
-                        results[name] = {"price": cp, "change": chg, "pct": pct}
+                            if sym == 'JPYINR=X':
+                                cp *= 100
+                                chg *= 100
+                                
+                            results[name] = {"price": cp, "change": chg, "pct": pct}
                 except Exception:
                     pass
         except Exception:

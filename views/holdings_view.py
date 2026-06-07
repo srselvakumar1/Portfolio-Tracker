@@ -70,9 +70,12 @@ class HoldingsView(BaseView):
         )
         self.broker_combo.pack(side=tk.LEFT, padx=(0, 6), pady=6, anchor=tk.CENTER)
         try:
-            self.broker_var.trace_add("write", lambda *args: self.on_filter_change())
+            self.broker_var.trace_add("write", lambda *args: self._on_broker_selected())
         except Exception:
             pass
+
+        # Currency variable (no UI toggle — auto-detected from broker/data)
+        self.currency_var = tk.StringVar(value="INR")
 
         # Thin inner divider
         tk.Frame(grp1, bg=ModernStyle.ACCENT_PRIMARY, width=1).pack(
@@ -720,7 +723,7 @@ class HoldingsView(BaseView):
             avg_cost = str(values[4] if len(values) > 4 else "0").replace("₹", "").replace("¥", "").replace("$", "").replace("£", "").replace(",", "").strip()
             total_fees = str(meta.get("total_fees") or "0").replace("₹", "").replace("¥", "").replace("$", "").replace("£", "").replace(",", "").strip()
             row_currency = str(meta.get("currency") or "INR").upper()
-            cur_sym = "¥" if row_currency == "JPY" else ("USD" if row_currency == "USD" else "₹")
+            cur_sym = {"JPY": "¥", "USD": "$"}.get(row_currency, "₹")
             
             if not symbol or not broker:
                 messagebox.showerror("Edit Holding", "Could not determine symbol/broker for selected row.")
@@ -1290,6 +1293,22 @@ class HoldingsView(BaseView):
 
         threading.Thread(target=_bg, daemon=True).start()
     
+    def _on_broker_selected(self):
+        """Auto-select currency based on selected broker."""
+        broker = self.broker_var.get()
+        if broker != "All":
+            try:
+                df = self.data_cache._holdings_df
+                if df is not None and not df.empty and "currency" in df.columns:
+                    b_df = df[df["broker"] == broker]
+                    if not b_df.empty:
+                        currency = str(b_df["currency"].iloc[0]).strip().upper()
+                        if currency in ["INR", "JPY"]:
+                            self.currency_var.set(currency)
+            except Exception as e:
+                print(f"Error auto-selecting currency: {e}")
+        self.on_filter_change()
+
     def _load_brokers(self):
         """Load broker list in background."""
         try:
@@ -1511,36 +1530,70 @@ class HoldingsView(BaseView):
         
         # Update stats — these are cross-currency aggregates, so label as "Value"
         self.stats_labels["count"].config(text=f"{len(df)}")
-        # Invested and current values are the INR-equivalent aggregates stored in the summary
+        
+        currency_val = getattr(self, "currency_var", None)
+        c_val = currency_val.get() if currency_val else "All"
+        sym = {"JPY": "¥", "USD": "$"}.get(c_val, "₹")
+        
+        # Invested and current values are the aggregates stored in the summary
         from ui_utils import format_money
-        self.stats_labels["invested"].config(text=f"₹ {float(summary.get('invested', 0)):,.0f}")
-        self.stats_labels["current"].config(text=f"₹ {float(summary.get('current', 0)):,.0f}")
+        self.stats_labels["invested"].config(text=f"{sym} {float(summary.get('invested', 0)):,.0f}")
+        self.stats_labels["current"].config(text=f"{sym} {float(summary.get('current', 0)):,.0f}")
         
         pnl = float(summary.get('pnl', 0))
         
+        from model.engine import get_exchange_rate
+        if not df.empty:
+            unique_currencies = [str(c).strip().upper() for c in df["currency"].dropna().unique()] if "currency" in df.columns else []
+            rates = {c: get_exchange_rate(c) for c in unique_currencies}
+            
+            def _get_rate(c):
+                if pd.isna(c):
+                    return 1.0
+                if c_val != "All":
+                    return 1.0
+                return rates.get(str(c).strip().upper(), 1.0)
+            
+            rates_series = df["currency"].apply(_get_rate) if "currency" in df.columns else pd.Series(1.0, index=df.index)
+        else:
+            rates_series = pd.Series(dtype=float)
+        
         try:
-            total_real = float(df.get("realized_pnl", pd.Series(dtype=float)).sum()) if not df.empty else 0.0
+            if not df.empty and "realized_pnl" in df.columns:
+                total_real = float((df["realized_pnl"] * rates_series).sum())
+            else:
+                total_real = 0.0
+                
             total_unreal = pnl - total_real
             
             real_color = ModernStyle.SUCCESS if total_real >= 0 else ModernStyle.ERROR
             unreal_color = ModernStyle.SUCCESS if total_unreal >= 0 else ModernStyle.ERROR
             
             if "realized_pnl" in self.stats_labels:
-                self.stats_labels["realized_pnl"].config(text=f"₹ {total_real:,.0f}", fg=real_color)
+                self.stats_labels["realized_pnl"].config(text=f"{sym} {total_real:,.0f}", fg=real_color)
             if "unrealized_pnl" in self.stats_labels:
-                self.stats_labels["unrealized_pnl"].config(text=f"₹ {total_unreal:,.0f}", fg=unreal_color)
+                self.stats_labels["unrealized_pnl"].config(text=f"{sym} {total_unreal:,.0f}", fg=unreal_color)
         except Exception:
             pass
         
         try:
-            total_fees = float(df.get("total_fees", pd.Series(dtype=float)).sum()) if not df.empty else 0.0
-            self.stats_labels["fees"].config(text=f"₹ {total_fees:,.0f}")
+            if not df.empty and "total_fees" in df.columns:
+                total_fees = float((df["total_fees"] * rates_series).sum())
+            else:
+                total_fees = 0.0
+            self.stats_labels["fees"].config(text=f"{sym} {total_fees:,.0f}")
         except Exception:
-            self.stats_labels["fees"].config(text="₹ 0")
+            self.stats_labels["fees"].config(text=f"{sym} 0")
         
         # Precompute total current value for Weight% 
         # (Use total_portfolio_val passed from load_data to keep weight accurate during filtering)
-        total_val = total_portfolio_val if total_portfolio_val > 0 else (float(df["current_value"].sum()) if not df.empty else 0.0)
+        if total_portfolio_val > 0:
+            total_val = total_portfolio_val
+        else:
+            if not df.empty:
+                total_val = float((df["current_value"] * rates_series).sum())
+            else:
+                total_val = 0.0
 
         # Sort DataFrame alphabetically by symbol
         if not df.empty and 'symbol' in df.columns:
@@ -1596,7 +1649,9 @@ class HoldingsView(BaseView):
 
             # Weight% with Pro-Gradient 5-Block Scale (4% per block, 20% max)
             if total_val > 0:
-                weight_pct = (current_value / total_val) * 100.0
+                rate = get_exchange_rate(currency)
+                current_value_inr = current_value * rate
+                weight_pct = (current_value_inr / total_val) * 100.0
                 # Scale: each block is 4% (5 blocks = 20% max)
                 num_blocks = 5
                 filled = min(num_blocks, int(max(1, weight_pct / 4.0)) if weight_pct > 0.5 else 0)

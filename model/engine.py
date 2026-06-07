@@ -206,20 +206,67 @@ def get_stored_dashboard_metrics() -> dict | None:
         if not rows: return None
         return {row[0]: row[1] for row in rows}
 
+# ── Exchange rate in-memory cache ─────────────────────────────────────────────
+_fx_cache: dict[str, float] = {}
+_fx_cache_ts: float = 0.0
+_FX_CACHE_TTL = 60.0  # seconds
+
+def _warm_fx_cache() -> None:
+    """Pre-load all exchange rates in a single DB query."""
+    global _fx_cache, _fx_cache_ts
+    try:
+        with db_session() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT symbol, current_price, previous_close FROM marketdata WHERE symbol LIKE '%=X'")
+            for sym, cp, pc in cur.fetchall():
+                rate = float(cp) if cp and float(cp) > 0 else float(pc or 0)
+                if rate > 0:
+                    # Extract currency code from e.g. "JPYINR=X" → "JPY"
+                    code = sym.replace("INR=X", "").strip()
+                    if code:
+                        _fx_cache[code] = rate
+        _fx_cache["INR"] = 1.0
+        _fx_cache_ts = time.time()
+    except Exception:
+        pass
+
 def get_exchange_rate(currency: str) -> float:
-    """Gets the latest exchange rate to INR from marketdata table."""
+    """Gets the latest exchange rate to INR from marketdata table.
+
+    Uses an in-memory cache (60s TTL) to avoid per-row DB round-trips
+    in hot loops like dashboard metrics and data cache summaries.
+    """
+    global _fx_cache, _fx_cache_ts
+
     if currency == "INR":
         return 1.0
-    
+
+    # Return cached value if fresh
+    now = time.time()
+    if now - _fx_cache_ts < _FX_CACHE_TTL and currency in _fx_cache:
+        return _fx_cache[currency]
+
+    # Cache is stale or miss — warm it from DB in one query
+    if now - _fx_cache_ts >= _FX_CACHE_TTL:
+        _warm_fx_cache()
+        if currency in _fx_cache:
+            return _fx_cache[currency]
+
+    # Single-currency fallback (cache was just warmed but this currency wasn't found)
     ticker = f"{currency}INR=X"
-    with db_session() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT current_price, previous_close FROM marketdata WHERE symbol = ?", (ticker,))
-        row = cursor.fetchone()
-        if row:
-            # Fallback to previous close if current price is 0
-            return float(row[0]) if row[0] > 0 else float(row[1])
-            
+    try:
+        with db_session() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT current_price, previous_close FROM marketdata WHERE symbol = ?", (ticker,))
+            row = cursor.fetchone()
+            if row:
+                rate = float(row[0]) if row[0] and float(row[0]) > 0 else float(row[1] or 0)
+                if rate > 0:
+                    _fx_cache[currency] = rate
+                    return rate
+    except Exception:
+        pass
+
     # Fallback hardcoded values if not yet fetched
     fallbacks = {"JPY": 0.55, "USD": 83.5, "GBP": 105.0, "CNY": 11.5}
     return fallbacks.get(currency, 1.0)
@@ -721,7 +768,7 @@ def rebuild_trade_calcs_on_startup():
 
 # ── Metric Retrievers ────────────────────────────────────────────────────────
 
-def calculate_overall_xirr(conn=None, broker_filter: str | None = None) -> float:
+def calculate_overall_xirr(conn=None, broker_filter: str | None = None, currency_filter: str = "All") -> float:
     """Calculate true XIRR for overall portfolio or specific broker from all trades.
     
     Collects all cash flows (BUY = negative, SELL = positive) and adds terminal 
@@ -729,17 +776,22 @@ def calculate_overall_xirr(conn=None, broker_filter: str | None = None) -> float
     """
     if conn is None:
         with db_session() as conn:
-            return calculate_overall_xirr(conn=conn, broker_filter=broker_filter)
+            return calculate_overall_xirr(conn=conn, broker_filter=broker_filter, currency_filter=currency_filter)
     
     try:
         cursor = conn.cursor()
         
-        # Build WHERE clause for broker filter if provided
-        where_clause = ""
+        # Build WHERE clause for filters
+        conditions = []
         params = []
         if broker_filter:
-            where_clause = "WHERE broker = ?"
-            params = [broker_filter]
+            conditions.append("broker = ?")
+            params.append(broker_filter)
+        if currency_filter != "All":
+            conditions.append("currency = ?")
+            params.append(currency_filter.upper())
+            
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
         
         # Get all trades for XIRR calculation
         query = f'''
@@ -757,13 +809,17 @@ def calculate_overall_xirr(conn=None, broker_filter: str | None = None) -> float
                 SUM(h.qty * h.avg_price) as invested
             FROM holdings h
             LEFT JOIN marketdata m ON h.symbol = m.symbol
-            WHERE h.qty > 0 OR h.running_pnl != 0
+            WHERE (h.qty > 0 OR h.running_pnl != 0)
         '''
+        h_params = []
         if broker_filter:
             query_holdings += " AND h.broker = ?"
-            cursor.execute(query_holdings, [broker_filter])
-        else:
-            cursor.execute(query_holdings)
+            h_params.append(broker_filter)
+        if currency_filter != "All":
+            query_holdings += " AND h.currency = ?"
+            h_params.append(currency_filter.upper())
+            
+        cursor.execute(query_holdings, h_params)
         
         holdings_row = cursor.fetchone()
         current_val = holdings_row[0] or 0.0 if holdings_row else 0.0
@@ -799,21 +855,22 @@ def calculate_overall_xirr(conn=None, broker_filter: str | None = None) -> float
         return 0.0
 
 
-def get_dashboard_metrics(force_refresh: bool = False) -> dict:
+def get_dashboard_metrics(force_refresh: bool = False, currency_filter: str = "All") -> dict:
     """Retrieve dashboard metrics (cached unless force_refresh=True)."""
     # 1. Check in-memory cache (thread-safe read)
     with _cache_lock:
         # "Calculate once" policy: keep cached metrics until explicitly invalidated
         # (e.g., after rebuild_holdings or manual market refresh).
-        if not force_refresh and _metrics_cache["data"] is not None:
+        if not force_refresh and _metrics_cache["data"] is not None and _metrics_cache.get("currency") == currency_filter:
             return _metrics_cache["data"]
 
     # 2. Check DB stored metrics if not forcing a recalc
-    if not force_refresh:
+    if not force_refresh and currency_filter == "All":
         stored = get_stored_dashboard_metrics()
         if stored:
             with _cache_lock:
                 _metrics_cache["data"], _metrics_cache["ts"] = stored, time.time()
+                _metrics_cache["currency"] = currency_filter
             return stored
 
     with db_session() as conn:
@@ -844,7 +901,10 @@ def get_dashboard_metrics(force_refresh: bool = False) -> dict:
             date_str = row[5]
             currency = str(row[6] or 'INR').strip().upper()
             
-            rate = get_exchange_rate(currency)
+            if currency_filter != "All" and currency != currency_filter.upper():
+                continue
+                
+            rate = 1.0 if currency_filter != "All" else get_exchange_rate(currency)
             
             row_inv = (qty * avg_price) * rate
             row_cur = (qty * mkt_price) * rate
@@ -867,7 +927,7 @@ def get_dashboard_metrics(force_refresh: bool = False) -> dict:
         realized_loss = overall_loss
 
         # Calculate true XIRR from all trades (not simple ROI)
-        overall_xirr = calculate_overall_xirr(conn)
+        overall_xirr = calculate_overall_xirr(conn, currency_filter=currency_filter)
 
         overall_cagr = 0.0
         if invested > 0 and earliest_date:
@@ -888,17 +948,18 @@ def get_dashboard_metrics(force_refresh: bool = False) -> dict:
     }
     with _cache_lock:
         _metrics_cache["data"], _metrics_cache["ts"] = result, time.time()
+        _metrics_cache["currency"] = currency_filter
     return result
 
-def get_metrics_by_broker() -> dict:
+def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = False) -> dict:
     # "Calculate once" policy: keep cached broker metrics until explicitly invalidated.
     with _cache_lock:
-        if _broker_metrics_cache["data"] is not None:
+        if not force_refresh and _broker_metrics_cache["data"] is not None and _broker_metrics_cache.get("currency") == currency_filter:
             return _broker_metrics_cache["data"]
 
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
+        query = '''
             SELECT
                 h.broker,
                 h.qty,
@@ -910,8 +971,14 @@ def get_metrics_by_broker() -> dict:
                 h.currency
             FROM holdings h
             LEFT JOIN marketdata m ON h.symbol = m.symbol
-            WHERE h.qty > 0 OR h.running_pnl != 0
-        ''')
+            WHERE (h.qty > 0 OR h.running_pnl != 0)
+        '''
+        params = []
+        if currency_filter != "All":
+            query += " AND h.currency = ?"
+            params.append(currency_filter.upper())
+            
+        cursor.execute(query, params)
         rows = cursor.fetchall()
 
         broker_metrics = {}
@@ -932,7 +999,7 @@ def get_metrics_by_broker() -> dict:
             date_str = row[6]
             currency = str(row[7] or 'INR').strip().upper()
             
-            rate = get_exchange_rate(currency)
+            rate = 1.0 # Broker metrics are kept in their native currency
             
             row_inv = (qty * avg_price) * rate
             row_cur = (qty * mkt_price) * rate
@@ -949,6 +1016,7 @@ def get_metrics_by_broker() -> dict:
                 
             if metrics["earliest_date"] is None or (date_str and date_str < metrics["earliest_date"]):
                 metrics["earliest_date"] = date_str
+            metrics["currency"] = currency
 
         final_broker_metrics = {}
         for broker, metrics in broker_metrics.items():
@@ -956,11 +1024,12 @@ def get_metrics_by_broker() -> dict:
             overall_pnl, overall_loss = metrics["overall_pnl"], metrics["overall_loss"]
             unrealized_loss = metrics["unrealized_loss"]
             earliest_date = metrics["earliest_date"]
+            currency = metrics.get("currency", "INR")
 
             unrealized_pnl = current_val - invested
             realized_pnl = overall_pnl - unrealized_pnl
             # Calculate true XIRR per broker based on all trades for that broker
-            overall_xirr = calculate_overall_xirr(conn, broker_filter=broker)
+            overall_xirr = calculate_overall_xirr(conn, broker_filter=broker, currency_filter=currency)
 
             overall_cagr = 0.0
             if invested > 0 and earliest_date:
@@ -977,67 +1046,112 @@ def get_metrics_by_broker() -> dict:
                 "total_invested": invested, "total_value": current_val,
                 "overall_pnl": overall_pnl, "unrealized_pnl": unrealized_pnl,
                 "realized_pnl": realized_pnl, "realized_loss": overall_loss, "unrealized_loss": unrealized_loss,
-                "overall_xirr": overall_xirr, "overall_cagr": overall_cagr
+                "overall_xirr": overall_xirr, "overall_cagr": overall_cagr,
+                "currency": currency
             }
 
     with _cache_lock:
         _broker_metrics_cache["data"], _broker_metrics_cache["ts"] = final_broker_metrics, time.time()
+        _broker_metrics_cache["currency"] = currency_filter
+    return final_broker_metrics
     return final_broker_metrics
 
-def get_top_worst_performers(limit: int = 3) -> dict:
+def get_top_worst_performers(limit: int = 3, currency_filter: str = "All") -> dict:
     with _cache_lock:
-        if _performers_cache["data"] is not None:
+        if _performers_cache["data"] is not None and _performers_cache.get("currency") == currency_filter:
             return _performers_cache["data"]
 
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
+        query = '''
             SELECT h.symbol, SUM(h.qty), SUM(h.qty * h.avg_price), SUM(h.realized_pnl),
                    MAX(COALESCE(NULLIF(m.current_price, 0.0), h.avg_price))
             FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol
-            WHERE h.qty > 0 GROUP BY h.symbol
-        ''')
+            WHERE h.qty > 0
+        '''
+        params = []
+        if currency_filter != "All":
+            query += " AND h.currency = ?"
+            params.append(currency_filter.upper())
+        query += " GROUP BY h.symbol"
+        cursor.execute(query, params)
         rows = cursor.fetchall()
 
     performers = []
     for row in rows:
         cost, total_pnl = row[2], (row[1] * row[4] - row[2]) + row[3]
-        performers.append({"symbol": row[0], "pnl": total_pnl, "pnl_pct": (total_pnl / cost * 100) if cost > 0 else 0})
+        qty, cp = row[1], row[4]
+        avg_price = cost / qty if qty > 0 else 0
+        performers.append({
+            "symbol": row[0],
+            "pnl": total_pnl,
+            "pnl_pct": (total_pnl / cost * 100) if cost > 0 else 0,
+            "avg_price": avg_price,
+            "current_price": cp,
+            "invested": cost
+        })
 
     performers.sort(key=lambda x: x["pnl"], reverse=True)
+    if len(performers) >= 2 * limit:
+        top = performers[:limit]
+        worst = list(reversed(performers[-limit:]))
+    else:
+        split_idx = (len(performers) + 1) // 2
+        top = performers[:split_idx]
+        worst = list(reversed(performers[split_idx:]))
+
     result = {
-        "top": performers[:limit],
-        "worst": list(reversed(performers[-limit:])) if performers else []
+        "top": top,
+        "worst": worst
     }
     with _cache_lock:
         _performers_cache["data"], _performers_cache["ts"] = result, time.time()
+        _performers_cache["currency"] = currency_filter
     return result
 
-def get_actionable_insights(limit: int = 10) -> list:
+def get_actionable_insights(limit: int = 10, currency_filter: str = "All") -> list:
     with _cache_lock:
-        if _insights_cache["data"] is not None:
+        if _insights_cache["data"] is not None and _insights_cache.get("currency") == currency_filter:
             return _insights_cache["data"]
 
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT DISTINCT h.symbol, a.action_signal, a.intrinsic_value, m.current_price
+        query = '''
+            SELECT DISTINCT h.symbol, a.action_signal, a.intrinsic_value, m.current_price, h.currency
             FROM holdings h JOIN assets a ON h.symbol = a.symbol
             LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE h.qty > 0 AND a.action_signal IN ('ACCUMULATE', 'REDUCE')
-            ORDER BY ABS(a.intrinsic_value - m.current_price) / m.current_price DESC LIMIT ?
-        ''', (limit,))
-        result = [{"symbol": r[0], "signal": r[1], "iv": r[2], "current_price": r[3]} for r in cursor.fetchall()]
+        '''
+        params = []
+        if currency_filter != "All":
+            query += " AND h.currency = ?"
+            params.append(currency_filter.upper())
+            
+        query += " ORDER BY ABS(a.intrinsic_value - m.current_price) / m.current_price DESC LIMIT ?"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        result = [
+            {
+                "symbol": r[0],
+                "signal": r[1],
+                "iv": r[2],
+                "current_price": r[3],
+                "currency": r[4]
+            }
+            for r in cursor.fetchall()
+        ]
 
     with _cache_lock:
         _insights_cache["data"], _insights_cache["ts"] = result, time.time()
+        _insights_cache["currency"] = currency_filter
     return result
 
-def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0) -> list:
+def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0, currency_filter: str = "All") -> list:
     # Use parameter-keyed cache so different thresholds don't return wrong data
     with _cache_lock:
         cache_key = _harvesting_cache.get("_key")
-        if (_harvesting_cache["data"] is not None and cache_key == min_loss_amount):
+        if (_harvesting_cache["data"] is not None and cache_key == min_loss_amount and _harvesting_cache.get("currency") == currency_filter):
             return _harvesting_cache["data"]
 
     opportunities = []
@@ -1050,24 +1164,39 @@ def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0) -> list:
         # ── Ground-truth net positions from the database ──────────────
         # This catches ghost holdings caused by unmatched sells (intraday
         # sells before buys, cross-broker transfers, import gaps, etc.)
-        cursor.execute(
-            "SELECT broker, symbol, "
-            "  SUM(CASE WHEN type='BUY' THEN qty ELSE 0 END) - "
-            "  SUM(CASE WHEN type='SELL' THEN qty ELSE 0 END) "
-            "FROM trades GROUP BY broker, symbol"
-        )
+        query_net = '''
+            SELECT broker, symbol,
+              SUM(CASE WHEN type='BUY' THEN qty ELSE 0 END) -
+              SUM(CASE WHEN type='SELL' THEN qty ELSE 0 END)
+            FROM trades
+        '''
+        params_net = []
+        if currency_filter != "All":
+            query_net += " WHERE currency = ? "
+            params_net.append(currency_filter.upper())
+        query_net += " GROUP BY broker, symbol"
+        cursor.execute(query_net, params_net)
         net_positions = {}
         for broker, symbol, net_qty in cursor.fetchall():
             net_positions[(broker, symbol)] = float(net_qty or 0.0)
 
         # Fetch all trades for active holdings to build true FIFO lots
-        cursor.execute("SELECT broker, symbol, type, qty, price FROM trades ORDER BY date ASC, type ASC, trade_id ASC")
+        query = "SELECT broker, symbol, type, qty, price, currency FROM trades "
+        params = []
+        if currency_filter != "All":
+            query += "WHERE currency = ? "
+            params.append(currency_filter.upper())
+        query += "ORDER BY date ASC, type ASC, trade_id ASC"
+        
+        cursor.execute(query, params)
         
         lots = {} # (broker, symbol) -> list of {'qty', 'price'}
-        for broker, symbol, t_type, qty, price in cursor.fetchall():
+        currencies = {} # (broker, symbol) -> currency
+        for broker, symbol, t_type, qty, price, currency in cursor.fetchall():
             qty = float(qty)
             price = float(price)
             key = (broker, symbol)
+            currencies[key] = str(currency or "INR").upper()
             
             if key not in lots:
                 lots[key] = []
@@ -1127,7 +1256,8 @@ def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0) -> list:
                     "qty": loss_qty,
                     "avg_price": avg_loss_price,
                     "current_price": current_price,
-                    "unrealized_loss": loss
+                    "unrealized_loss": loss,
+                    "currency": currencies.get((broker, symbol), "INR")
                 })
 
     # Sort highest loss first
@@ -1136,6 +1266,7 @@ def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0) -> list:
     with _cache_lock:
         _harvesting_cache["data"], _harvesting_cache["ts"] = opportunities, time.time()
         _harvesting_cache["_key"] = min_loss_amount
+        _harvesting_cache["currency"] = currency_filter
     return opportunities
 
 

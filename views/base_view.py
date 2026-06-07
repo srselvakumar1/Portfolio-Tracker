@@ -166,6 +166,24 @@ class BaseView(tk.Frame, ABC):
         grad_end   = (13, 148, 136)  # #0D9488
 
         right_frame = None
+        # Draw Title & Subtitle directly on the canvas for true 100% transparent background
+        header_canvas.create_text(
+            20, 22,
+            text=title,
+            fill="#FFFFFF",
+            font=ModernStyle.FONT_PAGE_TITLE,
+            anchor="w",
+            tags="header_content"
+        )
+        header_canvas.create_text(
+            20, 48,
+            text=subtitle,
+            fill="#94A3B8",
+            font=ModernStyle.FONT_BODY,
+            anchor="w",
+            tags="header_content"
+        )
+
         def _draw_header_gradient(event=None):
             w = event.width if event else header_canvas.winfo_width()
             h = event.height if event else header_canvas.winfo_height()
@@ -182,7 +200,7 @@ class BaseView(tk.Frame, ABC):
                 x0 = int(i * w / steps)
                 x1 = int((i + 1) * w / steps) + 1
                 header_canvas.create_rectangle(x0, 0, x1, h, fill=color, outline="", tags="gradient")
-                
+
             if right_frame:
                 t_right = max(0, min(1, (w - 70) / max(1, w)))
                 r = int(grad_start[0] + (grad_end[0] - grad_start[0]) * t_right)
@@ -200,32 +218,6 @@ class BaseView(tk.Frame, ABC):
                     pass
 
             header_canvas.tag_raise("header_content")
-
-        header_canvas.bind("<Configure>", lambda e: None) # handled later
-
-        # Title
-        lbl_title = tk.Label(
-            header_canvas,
-            text=title,
-            fg="#FFFFFF",
-            bg="#1E3A8A",
-            font=ModernStyle.FONT_PAGE_TITLE,
-        )
-        header_canvas.create_window(
-            20, 20, window=lbl_title, anchor="w", tags="header_content"
-        )
-
-        # Subtitle
-        lbl_subtitle = tk.Label(
-            header_canvas,
-            text=subtitle,
-            fg="#94A3B8",
-            bg="#1E3A8A",
-            font=ModernStyle.FONT_BODY,
-        )
-        header_canvas.create_window(
-            20, 45, window=lbl_subtitle, anchor="w", tags="header_content"
-        )
 
         if right_widget_func:
             right_frame = tk.Frame(header_canvas, bg="#0D9488")

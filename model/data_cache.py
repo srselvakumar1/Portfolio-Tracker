@@ -1,8 +1,6 @@
 import threading
 from dataclasses import dataclass
-
 import pandas as pd
-
 from model.database import db_session
 
 
@@ -15,7 +13,7 @@ class HoldingsFilters:
     zero_qty_only: bool = False
     start_date: str | None = None  # YYYY-MM-DD (optional date filter)
     end_date: str | None = None    # YYYY-MM-DD (optional date filter)
-
+    currency: str = "All"
 
 @dataclass(frozen=True)
 class TradeHistoryFilters:
@@ -24,6 +22,7 @@ class TradeHistoryFilters:
     trade_type: str = "All"
     start_date: str | None = None  # YYYY-MM-DD
     end_date: str | None = None    # YYYY-MM-DD
+    currency: str = "All"
 
 
 class DataCache:
@@ -142,6 +141,9 @@ class DataCache:
         if filters.broker and filters.broker != "All":
             df = df[df["broker"] == filters.broker]
 
+        if filters.currency and filters.currency != "All":
+            df = df[df["currency"].astype(str).str.upper() == filters.currency.upper()]
+
         if filters.symbol_like:
             sym = filters.symbol_like.strip().upper()
             if sym:
@@ -158,10 +160,29 @@ class DataCache:
         elif filters.exclude_zero_qty:
             df = df[df["qty"] > 0]
 
-        # Summary in-memory
-        invested = float((df["qty"] * df["avg_price"]).sum()) if not df.empty else 0.0
-        pnl = float(df["running_pnl"].sum()) if not df.empty else 0.0
-        current = float(df["current_value"].sum()) if not df.empty else 0.0
+        # Summary in-memory (INR-equivalent aggregates using current exchange rates, or native if filtered)
+        if not df.empty:
+            from model.engine import get_exchange_rate
+            unique_currencies = [str(c).strip().upper() for c in df["currency"].dropna().unique()] if "currency" in df.columns else []
+            rates = {c: get_exchange_rate(c) for c in unique_currencies}
+            
+            def _get_rate(c):
+                if pd.isna(c):
+                    return 1.0
+                if filters.currency and filters.currency != "All":
+                    return 1.0
+                return rates.get(str(c).strip().upper(), 1.0)
+                
+            rates_series = df["currency"].apply(_get_rate) if "currency" in df.columns else pd.Series(1.0, index=df.index)
+            
+            invested = float((df["qty"] * df["avg_price"] * rates_series).sum())
+            pnl = float((df["running_pnl"] * rates_series).sum())
+            current = float((df["current_value"] * rates_series).sum())
+        else:
+            invested = 0.0
+            pnl = 0.0
+            current = 0.0
+
         summary = {"cnt": int(len(df)), "invested": invested, "pnl": pnl, "current": current}
         return df.reset_index(drop=True), summary
 
@@ -183,6 +204,9 @@ class DataCache:
 
         if filters.broker and filters.broker != "All":
             df = df[df["broker"] == filters.broker]
+
+        if filters.currency and filters.currency != "All":
+            df = df[df["currency"].astype(str).str.upper() == filters.currency.upper()]
 
         if filters.symbol_like:
             sym = filters.symbol_like.strip().upper()
@@ -213,11 +237,29 @@ class DataCache:
         type_u = df["type"].astype(str).str.upper()
         qty_buy = float(df.loc[type_u == "BUY", "qty"].sum())
         qty_sell = float(df.loc[type_u == "SELL", "qty"].sum())
-        fee_buy = float(df.loc[type_u == "BUY", "fee"].sum())
-        fee_sell = float(df.loc[type_u == "SELL", "fee"].sum())
 
-        # Total P&L of the filtered view (matches the cumulative 'Running PnL' column in the table)
-        total_pnl = float(df["trade_pnl"].sum()) if not df.empty else 0.0
+        # Convert fees and PnL to INR for summary metrics if "All" is selected
+        if not df.empty:
+            from model.engine import get_exchange_rate
+            unique_currencies = [str(c).strip().upper() for c in df["currency"].dropna().unique()] if "currency" in df.columns else []
+            rates = {c: get_exchange_rate(c) for c in unique_currencies}
+            
+            def _get_rate(c):
+                if pd.isna(c):
+                    return 1.0
+                if filters.currency and filters.currency != "All":
+                    return 1.0
+                return rates.get(str(c).strip().upper(), 1.0)
+                
+            rates_series = df["currency"].apply(_get_rate) if "currency" in df.columns else pd.Series(1.0, index=df.index)
+            
+            fee_buy = float((df.loc[type_u == "BUY", "fee"] * rates_series.loc[type_u == "BUY"]).sum())
+            fee_sell = float((df.loc[type_u == "SELL", "fee"] * rates_series.loc[type_u == "SELL"]).sum())
+            total_pnl = float((df["trade_pnl"] * rates_series).sum())
+        else:
+            fee_buy = 0.0
+            fee_sell = 0.0
+            total_pnl = 0.0
 
         return df.reset_index(drop=True), {
             "qty_buy": qty_buy,

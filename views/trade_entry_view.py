@@ -37,23 +37,18 @@ class TradeEntryView(BaseView):
         body.pack(fill="both", expand=True, padx=20, pady=14)
         body.grid_columnconfigure(0, weight=3, uniform="te")
         body.grid_columnconfigure(1, weight=2, uniform="te")
-        body.grid_rowconfigure(0, weight=0)
-        body.grid_rowconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
 
         left = tk.Frame(body, bg=ModernStyle.BG_PRIMARY)
-        left_bottom = tk.Frame(body, bg=ModernStyle.BG_PRIMARY)
         right = tk.Frame(body, bg=ModernStyle.BG_PRIMARY)
-        right_bottom = tk.Frame(body, bg=ModernStyle.BG_PRIMARY)
 
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12), pady=(0, 14))
-        right.grid(row=0, column=1, sticky="nsew", pady=(0, 14))
-        left_bottom.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
-        right_bottom.grid(row=1, column=1, sticky="nsew")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        right.grid(row=0, column=1, sticky="nsew")
 
         # Numeric-only validation command
         vcmd = (self.register(self._validate_number), "%P")
 
-        def _card(parent, title: str, icon: str = "", accent: str = ModernStyle.ACCENT_PRIMARY):
+        def _card(parent, title: str, icon: str = "", accent: str = ModernStyle.ACCENT_PRIMARY, expand_height=False):
             """Premium section card with accent bar."""
             frame = ModernCard(
                 parent,
@@ -61,15 +56,16 @@ class TradeEntryView(BaseView):
                 highlight_color=ModernStyle.BORDER_COLOR,
                 highlight_thickness=1,
                 radius=10,
-                canvas_bg=ModernStyle.BG_PRIMARY
+                canvas_bg=ModernStyle.BG_PRIMARY,
+                expand_height=expand_height
             )
             tk.Frame(frame.content, bg=accent, height=1).pack(fill="x")
             hdr = tk.Frame(frame.content, bg=ModernStyle.BG_SECONDARY)
             hdr.pack(fill="x", padx=14, pady=(10, 6))
             if icon:
-                tk.Label(hdr, text=icon, fg=accent, bg=ModernStyle.BG_SECONDARY,
+                tk.Label(hdr, text=icon, fg=ModernStyle.ACCENT_RED, bg=ModernStyle.BG_SECONDARY,
                          font=ModernStyle.FONT_TITLE).pack(side="left", padx=(0, 6))
-            tk.Label(hdr, text=title, fg=ModernStyle.TEXT_PRIMARY,
+            tk.Label(hdr, text=title, fg=ModernStyle.ACCENT_RED,
                      bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_TITLE).pack(side="left")
             tk.Frame(frame.content, bg=ModernStyle.DIVIDER_COLOR, height=1).pack(fill="x", padx=12)
             inner = tk.Frame(frame.content, bg=ModernStyle.BG_SECONDARY)
@@ -124,13 +120,7 @@ class TradeEntryView(BaseView):
 
         # ===== Manual Entry Card =====
         manual_card, manual = _card(left, "Manual Trade Entry", "✍️", ModernStyle.ACCENT_PRIMARY)
-        manual_card.pack(fill="x", pady=(0, 14))
-
-        self.te_status = tk.Label(
-            manual, text="", fg=ModernStyle.TEXT_TERTIARY,
-            bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL
-        )
-        self.te_status.pack(anchor="w", pady=(0, 8))
+        manual_card.pack(fill="x", pady=(0, 10))
 
         # Row 1: Broker + Date
         r1 = tk.Frame(manual, bg=ModernStyle.BG_SECONDARY)
@@ -165,6 +155,19 @@ class TradeEntryView(BaseView):
         self.te_symbol_var = tk.StringVar(value="")
         self.te_type_var   = tk.StringVar(value="BUY")
         self.te_currency_var = tk.StringVar(value="INR")
+        
+        def _on_broker_change(*args):
+            b = self.te_broker_var.get()
+            if b != "NOMURA":
+                self.te_currency_var.set("INR")
+                
+        def _on_currency_change(*args):
+            c = self.te_currency_var.get()
+            if c == "JPY":
+                self.te_broker_var.set("NOMURA")
+                
+        self.te_broker_var.trace_add("write", _on_broker_change)
+        self.te_currency_var.trace_add("write", _on_currency_change)
 
         sym_col = tk.Frame(r2, bg=ModernStyle.BG_SECONDARY)
         sym_col.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
@@ -176,38 +179,49 @@ class TradeEntryView(BaseView):
         tc_col = tk.Frame(r2, bg=ModernStyle.BG_SECONDARY)
         tc_col.grid(row=0, column=1, sticky="nsew")
 
-        tc_hdr = tk.Frame(tc_col, bg=ModernStyle.BG_SECONDARY)
-        tc_hdr.pack(anchor="w")
-        tk.Label(tc_hdr, text="🚦 Type", fg=ModernStyle.TEXT_SECONDARY,
-                 bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_HEADING).pack(side="left")
-        tk.Frame(tc_hdr, width=10, bg=ModernStyle.BG_SECONDARY).pack(side="left")
-        tk.Label(tc_hdr, text="💱 Currency", fg=ModernStyle.TEXT_SECONDARY,
-                 bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_HEADING).pack(side="left")
-
         BG_SEC = ModernStyle.BG_SECONDARY
-        tc_btn_row = tk.Frame(tc_col, bg=BG_SEC)
-        tc_btn_row.pack(anchor="w", pady=(4, 0))
+        
+        # 1. Labels row
+        tk.Label(tc_col, text="🚦 Type", fg=ModernStyle.TEXT_SECONDARY,
+                 bg=BG_SEC, font=ModernStyle.FONT_HEADING).grid(row=0, column=0, sticky="w", pady=(0, 4))
+                 
+        tk.Label(tc_col, text="💱 Currency", fg=ModernStyle.TEXT_SECONDARY,
+                 bg=BG_SEC, font=ModernStyle.FONT_HEADING).grid(row=0, column=2, sticky="w", pady=(0, 4))
+
+        # 2. Type Buttons Row
+        type_btn_frame = tk.Frame(tc_col, bg=BG_SEC)
+        type_btn_frame.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        
         tk.Radiobutton(
-            tc_btn_row, text="BUY", variable=self.te_type_var, value="BUY",
+            type_btn_frame, text="BUY", variable=self.te_type_var, value="BUY",
             bg=BG_SEC, fg="#059669", font=ModernStyle.FONT_TABLE_BOLD,
             selectcolor=BG_SEC, activebackground=BG_SEC,
             command=self._update_summary,
         ).pack(side="left", padx=(0, 12))
+        
         tk.Radiobutton(
-            tc_btn_row, text="SELL", variable=self.te_type_var, value="SELL",
+            type_btn_frame, text="SELL", variable=self.te_type_var, value="SELL",
             bg=BG_SEC, fg="#DC2626", font=ModernStyle.FONT_TABLE_BOLD,
             selectcolor=BG_SEC, activebackground=BG_SEC,
             command=self._update_summary,
-        ).pack(side="left", padx=(0, 16))
-        tk.Frame(tc_btn_row, bg=ModernStyle.DIVIDER_COLOR, width=2, height=18).pack(side="left", padx=(0, 12))
+        ).pack(side="left")
+
+        # 3. Divider
+        tk.Frame(tc_col, bg=ModernStyle.DIVIDER_COLOR, width=2, height=18).grid(row=1, column=1, padx=16, sticky="ns")
+
+        # 4. Currency Buttons Row
+        currency_btn_frame = tk.Frame(tc_col, bg=BG_SEC)
+        currency_btn_frame.grid(row=1, column=2, sticky="w", pady=(2, 0))
+        
         tk.Radiobutton(
-            tc_btn_row, text="INR", variable=self.te_currency_var, value="INR",
+            currency_btn_frame, text="INR", variable=self.te_currency_var, value="INR",
             bg=BG_SEC, fg=ModernStyle.ACCENT_PRIMARY, font=ModernStyle.FONT_TABLE_BOLD,
             selectcolor=BG_SEC, activebackground=BG_SEC,
             command=self._update_summary,
         ).pack(side="left", padx=(0, 12))
+        
         tk.Radiobutton(
-            tc_btn_row, text="JPY", variable=self.te_currency_var, value="JPY",
+            currency_btn_frame, text="JPY", variable=self.te_currency_var, value="JPY",
             bg=BG_SEC, fg=ModernStyle.ACCENT_PRIMARY, font=ModernStyle.FONT_TABLE_BOLD,
             selectcolor=BG_SEC, activebackground=BG_SEC,
             command=self._update_summary,
@@ -270,10 +284,9 @@ class TradeEntryView(BaseView):
             manual, text="", fg=ModernStyle.SUCCESS,
             bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD
         )
-        self.recent_trades_label.pack(anchor="w", pady=(10, 0))
 
         # ===== Bulk Import Card =====
-        import_card, import_inner = _card(left_bottom, "Bulk Import (CSV)", "📥", ModernStyle.ACCENT_TERTIARY)
+        import_card, import_inner = _card(left, "Bulk Import (CSV)", "📥", ModernStyle.ACCENT_TERTIARY)
         import_card.pack(fill="x", pady=(0, 10))
 
         tk.Label(
@@ -335,8 +348,8 @@ class TradeEntryView(BaseView):
         self.import_status.pack(anchor="w", pady=(2, 0))
 
         # ===== Paste Import Card =====
-        paste_card, paste_inner = _card(left_bottom, "Paste Import", "📋", ModernStyle.ACCENT_PRIMARY)
-        paste_card.pack(fill="x", pady=(0, 5))
+        paste_card, paste_inner = _card(left, "Paste Import", "📋", ModernStyle.ACCENT_PRIMARY, expand_height=True)
+        paste_card.pack(fill="both", expand=True, pady=(0, 5))
 
         tk.Label(
             paste_inner,
@@ -347,7 +360,7 @@ class TradeEntryView(BaseView):
 
         # Textarea with scrollbar
         ta_frame = tk.Frame(paste_inner, bg=ModernStyle.SLATE_300, padx=1, pady=1)
-        ta_frame.pack(fill="x", pady=(0, 10))
+        ta_frame.pack(fill="both", expand=True, pady=(0, 10))
         ta_scroll = ttk.Scrollbar(ta_frame, orient="vertical")
         self._paste_area = tk.Text(
             ta_frame,
@@ -407,8 +420,8 @@ class TradeEntryView(BaseView):
         self._paste_status.pack(anchor="w", pady=(8, 0))
 
         # ===== Skipped Duplicates Card =====
-        self.dupe_card, dupe_inner = _card(left_bottom, "Skipped Duplicates", "⚠️", ModernStyle.WARNING)
-        self.dupe_card.pack(fill="x")
+        self.dupe_card, dupe_inner = _card(left, "Skipped Duplicates", "⚠️", ModernStyle.WARNING)
+        self.dupe_card.pack(fill="x", pady=(0, 10))
         dupe_cols = ("Date", "Sym", "Qty")
         self.dupe_table = ttk.Treeview(dupe_inner, columns=dupe_cols, show="headings", height=6)
         for c in dupe_cols:
@@ -425,7 +438,7 @@ class TradeEntryView(BaseView):
 
         # ===== Transaction Summary Card (right column) =====
         self.sum_card, sum_inner = _card(right, "Transaction Summary", "", ModernStyle.ACCENT_PRIMARY)
-        self.sum_card.pack(fill="x")
+        self.sum_card.pack(fill="x", pady=(0, 14))
 
         def _sum_row(lbl: str, init: str, key: str, color=None):
             row = tk.Frame(sum_inner, bg=ModernStyle.BG_SECONDARY)
@@ -456,7 +469,7 @@ class TradeEntryView(BaseView):
         self.sum_total_label.pack(side="right")
 
         # ===== Portfolio Snapshot Card (right column, below summary) =====
-        snap_card, snap_inner = _card(right_bottom, "Portfolio Snapshot", "📊", ModernStyle.INFO)
+        snap_card, snap_inner = _card(right, "Portfolio Snapshot", "📊", ModernStyle.INFO)
         snap_card.pack(fill="x")
 
         # 2x2 grid of mini KPI tiles
@@ -836,7 +849,6 @@ class TradeEntryView(BaseView):
         self.te_qty_var.set("")
         self.te_price_var.set("")
         self.te_type_var.set("BUY")
-        self.te_status.config(text="")
         self._update_summary()
 
     def _save_trade(self) -> None:
@@ -907,7 +919,10 @@ class TradeEntryView(BaseView):
 
         try:
             import model.crud as crud
-            crud.add_trade(broker, date, symbol, t_type, qty, price, fee, manual_id, currency=self.te_currency_var.get())
+            save_cur = self.te_currency_var.get()
+            if broker.upper() == "NOMURA":
+                save_cur = "JPY"
+            crud.add_trade(broker, date, symbol, t_type, qty, price, fee, manual_id, currency=save_cur)
         except Exception as e:
             show_toast(self.winfo_toplevel(), f"Save failed: {e}", type="error")
             return
@@ -920,8 +935,8 @@ class TradeEntryView(BaseView):
         cur = (self.te_currency_var.get() or "INR").upper()
         msg = f"✓ {timestamp} - Saved {t_type} {qty:g} {symbol} @ {format_money(price, cur)}"
         self.recent_trades_label.config(text=msg)
+        self.recent_trades_label.pack(anchor="w", pady=(10, 0))
         
-        self.te_status.config(text="")
         self._clear_form()
 
         def _bg_refresh():
@@ -1149,9 +1164,12 @@ class TradeEntryView(BaseView):
                         continue
 
                     fee = float(calculate_trade_fees(t_type, qty, price, is_delivery=True) or 0.0)
-                    row_cur = str(getattr(r, "currency", "") or "").strip().upper()
-                    if not row_cur or row_cur not in ("INR", "JPY", "USD"):
-                        row_cur = chosen_currency
+                    if broker.upper() == "NOMURA":
+                        row_cur = "JPY"
+                    else:
+                        row_cur = str(getattr(r, "currency", "") or "").strip().upper()
+                        if not row_cur or row_cur not in ("INR", "JPY", "USD"):
+                            row_cur = "INR"
                     trades_to_insert.append((trade_id, broker, date, symbol, t_type, qty, price, fee, row_cur))
                     existing_by_broker[broker].add(trade_id)
 

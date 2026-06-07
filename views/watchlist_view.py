@@ -18,7 +18,6 @@ from ui_theme import ModernStyle
 from ui_widgets import ModernButton, PremiumModal, ModernEntry, ModernCard
 from ui_utils import add_treeview_copy_menu, treeview_sort_column, fade_color_transition
 import pandas as pd
-import yfinance as yf
 
 class WatchlistView(BaseView):
     """Watchlist view with inline CRUD form and a live Treeview table."""
@@ -186,7 +185,7 @@ class WatchlistView(BaseView):
         table_frame.content.grid_rowconfigure(0, weight=1)
         table_frame.content.grid_columnconfigure(0, weight=1)
 
-        cols = ("#", "Symbol", "Signal", "Sector / Industry", "Current ₹", "IV (DCF)", "MoS %", "Graham No.", "Target ₹", "P/E", "PEG", "Yield(%)", "From 52W H", "Notes", "Added")
+        cols = ("#", "Symbol", "Signal", "Sector / Industry", "Current Px", "IV (DCF)", "MoS %", "Graham No.", "Target Px", "P/E", "PEG", "Yield(%)", "From 52W H", "Notes", "Added")
         
         style = ttk.Style()
         style.configure("Watchlist.Treeview", font=ModernStyle.FONT_TABLE, rowheight=32)
@@ -264,6 +263,8 @@ class WatchlistView(BaseView):
         self._data = data
         self._tv.delete(*self._tv.get_children())
         for i, row in enumerate(data):
+            sym = row.get("symbol", "")
+            cy = "¥" if str(sym).upper().endswith(".T") else "₹"
             analyst_target = str(row.get("analyst_target") or "—").strip()
             target_str = analyst_target if analyst_target and analyst_target != "None" else "—"
             tag = "odd" if i % 2 == 0 else "even"
@@ -276,8 +277,9 @@ class WatchlistView(BaseView):
             # Determine conditional styling tag for the current value cell
             curr_val = row.get("current_value")
             intr_val = row.get("intrinsic_value")
-            cv_str = curr_val if curr_val else "—"
-            iv_str = intr_val if intr_val else "—"
+            cv_str = str(curr_val).replace("₹", cy) if curr_val else "—"
+            iv_str = str(intr_val).replace("₹", cy) if intr_val else "—"
+            target_str = str(target_str).replace("₹", cy)
             
             cv_f = self._parse_num(curr_val)
             iv_f = self._parse_num(intr_val)
@@ -300,7 +302,7 @@ class WatchlistView(BaseView):
                 if eps_f and bv_f and eps_f > 0 and bv_f > 0:
                     import math
                     graham_val = math.sqrt(22.5 * eps_f * bv_f)
-                    graham_str = f"₹{graham_val:.1f}"
+                    graham_str = f"{cy}{graham_val:.1f}"
                     
                 # 3. Distance from 52-Week High
                 range_52 = str(row.get("week52_range") or "")
@@ -370,7 +372,7 @@ class WatchlistView(BaseView):
         """Strip common formatting and return float or None."""
         if not val_str or str(val_str).strip() in ("", "None", "—"):
             return None
-        clean = str(val_str).replace(",", "").replace("%", "").replace("₹","").replace(" Cr","e7").strip()
+        clean = str(val_str).replace(",", "").replace("%", "").replace("₹","").replace("¥","").replace("$","").replace("£","").replace(" Cr","e7").strip()
         # Handle '1.4e7' style if Cr suffix was converted
         clean = clean.replace("Cre7", "e7")
         try:
@@ -451,8 +453,8 @@ class WatchlistView(BaseView):
             cp_str = str(row.get("current_value", ""))
             iv_str = str(row.get("intrinsic_value", ""))
             if cp_str and iv_str and cp_str != "—" and iv_str != "—":
-                cp = float(cp_str.replace("₹", "").replace(",", ""))
-                iv = float(iv_str.replace("₹", "").replace(",", ""))
+                cp = float(cp_str.replace("₹", "").replace("¥", "").replace(",", ""))
+                iv = float(iv_str.replace("₹", "").replace("¥", "").replace(",", ""))
                 
                 if cp > 0 and iv > 0:
                     max_score += 2 # Give higher weight to margin of safety
@@ -470,8 +472,8 @@ class WatchlistView(BaseView):
         gn_str = str(row.get("graham_number", ""))
         try:
             if gn_str and gn_str != "—" and gn_str != "None":
-                cp = float(str(row.get("current_value", "")).replace("₹", "").replace(",", ""))
-                gn = float(gn_str.replace("₹", "").replace(",", ""))
+                cp = float(str(row.get("current_value", "")).replace("₹", "").replace("¥", "").replace(",", ""))
+                gn = float(gn_str.replace("₹", "").replace("¥", "").replace(",", ""))
                 if gn and cp:
                     max_score += 1
                     if cp < gn:
@@ -488,8 +490,8 @@ class WatchlistView(BaseView):
         atpt_str = str(row.get("analyst_target", ""))
         try:
             if atpt_str and atpt_str != "—" and atpt_str != "None":
-                cp = float(str(row.get("current_value", "")).replace("₹", "").replace(",", ""))
-                at = float(atpt_str.replace("₹", "").replace(",", ""))
+                cp = float(str(row.get("current_value", "")).replace("₹", "").replace("¥", "").replace(",", ""))
+                at = float(atpt_str.replace("₹", "").replace("¥", "").replace(",", ""))
                 if cp and at:
                     max_score += 1
                     if cp < at * 0.9:
@@ -507,7 +509,7 @@ class WatchlistView(BaseView):
                 if len(parts) == 2:
                     l52 = float(parts[0].replace(",", "").strip())
                     h52 = float(parts[1].replace(",", "").strip())
-                    cp = float(str(row.get("current_value", "")).replace("₹", "").replace(",", ""))
+                    cp = float(str(row.get("current_value", "")).replace("₹", "").replace("¥", "").replace(",", ""))
                     if l52 < h52 and cp:
                         max_score += 1
                         pos_pct = (cp - l52) / (h52 - l52)
@@ -599,9 +601,16 @@ class WatchlistView(BaseView):
         self._v_notes.set(row.get("notes", ""))
         self._v_tags.set(row.get("tags", ""))
         target = row.get("target_price") or 0.0
+        
+        sym = row.get("symbol", "")
+        cy = "¥" if str(sym).upper().endswith(".T") else "₹"
+        
         self._v_target.set(str(target) if target else "")
         for k, v in self._metrics_vars.items():
-            v.set(row.get(k, ""))
+            val = row.get(k, "")
+            if isinstance(val, str):
+                val = val.replace("₹", cy)
+            v.set(val)
         self._form_status.config(
             text=f"Editing: {row.get('symbol', '')}",
             fg=ModernStyle.ACCENT_TERTIARY,
@@ -744,6 +753,11 @@ class WatchlistView(BaseView):
                 ticker = yf.Ticker(yf_symbol)
                 info = ticker.info
                 
+                curr = info.get("financialCurrency") or info.get("currency") or ""
+                if str(curr).upper() == "JPY": cy = "¥"
+                elif str(curr).upper() == "USD": cy = "$"
+                else: cy = "¥" if symbol.endswith(".T") else "₹"
+                
                 # Fetch RSI, Sharpe Ratio, MACD, etc using historical data
                 hist = ticker.history(period="3y")
                 rsi_val = ""
@@ -805,13 +819,13 @@ class WatchlistView(BaseView):
                     update_field("pe_ratio", pe, "{:.1f}")
                     
                     update_field("peg_ratio", info.get("pegRatio"), "{:.2f}")
-                    update_field("eps", info.get("trailingEps"), "₹{:.1f}")
+                    update_field("eps", info.get("trailingEps"), f"{cy}{{:.1f}}")
                     
                     debt_eq = info.get("debtToEquity")
                     if debt_eq is not None:
                         update_field("debt_to_equity", debt_eq / 100, "{:.2f}")
                         
-                    update_field("book_value", info.get("bookValue"), "₹{:.1f}")
+                    update_field("book_value", info.get("bookValue"), f"{cy}{{:.1f}}")
                     
                     roe = info.get("returnOnEquity")
                     scr_roe = scr_data.get("roe")
@@ -832,9 +846,9 @@ class WatchlistView(BaseView):
                     if fcf is not None:
                         # Format in Crores if very large
                         if abs(fcf) > 10_000_000:
-                            update_field("free_cash_flow", fcf / 10_000_000, "₹{:.1f} Cr")
+                            update_field("free_cash_flow", fcf / 10_000_000, f"{cy}{{:.1f}}")
                         else:
-                            update_field("free_cash_flow", fcf, "₹{:,}")
+                            update_field("free_cash_flow", fcf, f"{cy}{{:,}}")
                             
                     stock_name = info.get("longName") or info.get("shortName") or ""
                     if stock_name:
@@ -887,7 +901,7 @@ class WatchlistView(BaseView):
                         try:
                             import math
                             graham_num = math.sqrt(22.5 * eps_raw * bvps)
-                            update_field("graham_number", graham_num, "₹{:.2f}")
+                            update_field("graham_number", graham_num, f"{cy}{{:.2f}}")
                         except: pass
                     
                     # Financials (CAGR)
@@ -921,15 +935,15 @@ class WatchlistView(BaseView):
                     mc = info.get("marketCap")
                     if mc is not None:
                         if mc > 1e12:
-                            update_field("market_cap", mc / 1e7, "₹{:.0f} Cr")  # lakhs
+                            update_field("market_cap", mc / 1e7, f"{cy}{{:.0f}}")  # lakhs
                         elif mc > 1e9:
-                            update_field("market_cap", mc / 1e7, "₹{:.0f} Cr")
+                            update_field("market_cap", mc / 1e7, f"{cy}{{:.0f}}")
                         else:
-                            update_field("market_cap", mc / 1e7, "₹{:.1f} Cr")
+                            update_field("market_cap", mc / 1e7, f"{cy}{{:.1f}}")
 
                     atp = info.get("targetMeanPrice")
                     if atp is not None:
-                        update_field("analyst_target", atp, "₹{:.1f}")
+                        update_field("analyst_target", atp, f"{cy}{{:.1f}}")
 
                     h52 = info.get("fiftyTwoWeekHigh")
                     l52 = info.get("fiftyTwoWeekLow")
@@ -946,7 +960,7 @@ class WatchlistView(BaseView):
 
                     cur_price = info.get("currentPrice") or info.get("regularMarketPrice")
                     if cur_price is not None:
-                        update_field("current_value", cur_price, "₹{:.2f}")
+                        update_field("current_value", cur_price, f"{cy}{{:.2f}}")
 
                     # Auto-calculate Intrinsic Value using DCF engine
                     try:
@@ -955,7 +969,7 @@ class WatchlistView(BaseView):
                         if eps_raw and eps_raw > 0:
                             iv_val = _calc_iv(eps_raw)
                             if iv_val > 0:
-                                update_field("intrinsic_value", iv_val, "₹{:.2f}")
+                                update_field("intrinsic_value", iv_val, f"{cy}{{:.2f}}")
                     except Exception:
                         pass
 
@@ -968,9 +982,9 @@ class WatchlistView(BaseView):
                                 # Convert negative capex to positive for display
                                 capex_abs = abs(capex_val)
                                 if capex_abs > 10_000_000:
-                                    update_field("capex", capex_abs / 10_000_000, "₹{:.1f} Cr")
+                                    update_field("capex", capex_abs / 10_000_000, f"{cy}{{:.1f}}")
                                 else:
-                                    update_field("capex", capex_abs, "₹{:,}")
+                                    update_field("capex", capex_abs, f"{cy}{{:,}}")
                     except: pass
 
                     try:
@@ -979,9 +993,9 @@ class WatchlistView(BaseView):
                             op_profit = qf.loc["Operating Income"].iloc[0]
                             if pd.notna(op_profit):
                                 if abs(op_profit) > 10_000_000:
-                                    update_field("qoq_op_profit", op_profit / 10_000_000, "₹{:.1f} Cr")
+                                    update_field("qoq_op_profit", op_profit / 10_000_000, f"{cy}{{:.1f}}")
                                 else:
-                                    update_field("qoq_op_profit", op_profit, "₹{:,}")
+                                    update_field("qoq_op_profit", op_profit, f"{cy}{{:,}}")
                     except: pass
 
                     vol = info.get("volume") or info.get("averageVolume")
@@ -1074,6 +1088,11 @@ class WatchlistView(BaseView):
                         ticker = yf.Ticker(yf_symbol)
                         info = ticker.info
                         
+                        curr = info.get("financialCurrency") or info.get("currency") or ""
+                        if str(curr).upper() == "JPY": cy = "¥"
+                        elif str(curr).upper() == "USD": cy = "$"
+                        else: cy = "¥" if symbol.endswith(".T") else "₹"
+                        
                         # Preserve existing manual metrics
                         metrics = {k: row.get(k, "") for k in self._metrics_keys}
                         
@@ -1087,13 +1106,13 @@ class WatchlistView(BaseView):
                         mset("pe_ratio", pe, "{:.1f}")
                         
                         mset("peg_ratio", info.get("pegRatio"), "{:.2f}")
-                        mset("eps", info.get("trailingEps"), "₹{:.1f}")
+                        mset("eps", info.get("trailingEps"), f"{cy}{{:.1f}}")
                         
                         debt_eq = info.get("debtToEquity")
                         if debt_eq is not None:
                             mset("debt_to_equity", debt_eq / 100, "{:.2f}")
                             
-                        mset("book_value", info.get("bookValue"), "₹{:.1f}")
+                        mset("book_value", info.get("bookValue"), f"{cy}{{:.1f}}")
                         
                         roe = info.get("returnOnEquity")
                         scr_roe = scr_data.get("roe")
@@ -1113,9 +1132,9 @@ class WatchlistView(BaseView):
                         fcf = info.get("freeCashflow")
                         if fcf is not None:
                             if abs(fcf) > 10_000_000:
-                                mset("free_cash_flow", fcf / 10_000_000, "₹{:.1f} Cr")
+                                mset("free_cash_flow", fcf / 10_000_000, f"{cy}{{:.1f}}")
                             else:
-                                mset("free_cash_flow", fcf, "₹{:,}")
+                                mset("free_cash_flow", fcf, f"{cy}{{:,}}")
 
                         rev_gr = info.get("revenueGrowth")
                         if rev_gr is not None:
@@ -1148,9 +1167,9 @@ class WatchlistView(BaseView):
                                 if pd.notna(capex_val):
                                     capex_abs = abs(capex_val)
                                     if capex_abs > 10_000_000:
-                                        mset("capex", capex_abs / 10_000_000, "₹{:.1f} Cr")
+                                        mset("capex", capex_abs / 10_000_000, f"{cy}{{:.1f}}")
                                     else:
-                                        mset("capex", capex_abs, "₹{:,}")
+                                        mset("capex", capex_abs, f"{cy}{{:,}}")
                         except: pass
 
                         try:
@@ -1159,9 +1178,9 @@ class WatchlistView(BaseView):
                                 op_profit = qf.loc["Operating Income"].iloc[0]
                                 if pd.notna(op_profit):
                                     if abs(op_profit) > 10_000_000:
-                                        mset("qoq_op_profit", op_profit / 10_000_000, "₹{:.1f} Cr")
+                                        mset("qoq_op_profit", op_profit / 10_000_000, f"{cy}{{:.1f}}")
                                     else:
-                                        mset("qoq_op_profit", op_profit, "₹{:,}")
+                                        mset("qoq_op_profit", op_profit, f"{cy}{{:,}}")
                         except: pass
 
                         # Additional Risk & Valuation Metrics
@@ -1173,10 +1192,10 @@ class WatchlistView(BaseView):
                             mset("dividend_yield", dy * 100, "{:.2f}%")
                         mc = info.get("marketCap")
                         if mc is not None:
-                            mset("market_cap", mc / 1e7, "₹{:.0f} Cr")
+                            mset("market_cap", mc / 1e7, f"{cy}{{:.0f}}")
                         atp = info.get("targetMeanPrice")
                         if atp is not None:
-                            mset("analyst_target", atp, "₹{:.1f}")
+                            mset("analyst_target", atp, f"{cy}{{:.1f}}")
                         h52 = info.get("fiftyTwoWeekHigh")
                         l52 = info.get("fiftyTwoWeekLow")
                         if h52 and l52:
@@ -1192,7 +1211,7 @@ class WatchlistView(BaseView):
 
                         cur_price = info.get("regularMarketPrice") or info.get("currentPrice") or info.get("previousClose")
                         if cur_price is not None:
-                            mset("current_value", cur_price, "₹{:.2f}")
+                            mset("current_value", cur_price, f"{cy}{{:.2f}}")
                             
                         stock_name = info.get("longName") or info.get("shortName") or ""
                         if stock_name:
@@ -1204,7 +1223,7 @@ class WatchlistView(BaseView):
                             if eps_raw and eps_raw > 0:
                                 iv_val = _calc_iv(eps_raw)
                                 if iv_val > 0:
-                                    mset("intrinsic_value", iv_val, "₹{:.2f}")
+                                    mset("intrinsic_value", iv_val, f"{cy}{{:.2f}}")
                         except Exception:
                             pass
 
@@ -1478,7 +1497,7 @@ class WatchlistView(BaseView):
             if not val_str or val_str in ("-", "None", ""): return None
             
             # Clean string for float conversion
-            clean = val_str.replace(",", "").replace("%", "").replace("₹", "").replace(" ", "")
+            clean = val_str.replace(",", "").replace("%", "").replace("₹", "").replace("¥", "").replace("$", "").replace("£", "").replace(" ", "")
             try:
                 val = float(clean)
             except ValueError:
@@ -1591,6 +1610,9 @@ class WatchlistView(BaseView):
 
             for label_text, key, target_desc in fields:
                 val_str = str(row.get(key, ""))
+                sym = row.get("symbol", "")
+                cy = "¥" if str(sym).upper().endswith(".T") else "₹"
+                val_str = val_str.replace("₹", cy)
                 
                 # Determine text coloring
                 fg_col = ModernStyle.TEXT_PRIMARY

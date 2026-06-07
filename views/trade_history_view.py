@@ -43,6 +43,7 @@ class TradeHistoryView(BaseView):
         # Default range: Last 30 days
 
         self.th_broker_var = tk.StringVar(value="All")
+        self.th_currency_var = tk.StringVar(value="INR")
         self.th_symbol_var = tk.StringVar(value="")
         self.th_type_var = tk.StringVar(value="All")
         self.th_start_var = tk.StringVar(value=start_default)
@@ -60,9 +61,31 @@ class TradeHistoryView(BaseView):
         self.th_broker_cb = ttk.Combobox(broker_pill.content, textvariable=self.th_broker_var, values=["All"], state="readonly", width=13, font=ModernStyle.FONT_TABLE)
         self.th_broker_cb.pack(side=tk.LEFT, padx=3, pady=5)
         try:
-             self.th_broker_var.trace_add("write", lambda *args: self._apply_filters())
+             self.th_broker_var.trace_add("write", lambda *args: self._on_broker_selected())
         except Exception:
              pass
+
+        # Currency filter with background pill
+        currency_pill = ModernCard(filter_row, bg=ModernStyle.BG_SECONDARY, highlight_color="#DBEAFE", highlight_thickness=1, radius=8)
+        currency_pill.pack(side=tk.LEFT, padx=3, pady=3)
+        tk.Label(currency_pill.content, text="💴 Currency:", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING).pack(side=tk.LEFT, padx=3, pady=3)
+        from ui_widgets import ModernSegmentedControl
+        self.th_currency_seg = ModernSegmentedControl(
+            currency_pill.content,
+            options=["INR", "JPY"],
+            variable=self.th_currency_var,
+            command=self._apply_filters,
+            bg=ModernStyle.BG_TERTIARY,
+            fg=ModernStyle.TEXT_SECONDARY,
+            container_bg=ModernStyle.BG_SECONDARY,
+            font=ModernStyle.FONT_HEADING,
+            height=32,
+            per_option_colors={
+                "INR": ("#10B981", "#FFFFFF"),
+                "JPY": ("#EF4444", "#FFFFFF"),
+            },
+        )
+        self.th_currency_seg.pack(side=tk.LEFT, padx=3, pady=5)
         
         # Symbol filter with background pill
         symbol_pill = ModernCard(filter_row, bg=ModernStyle.BG_SECONDARY, highlight_color="#E9D5FF", highlight_thickness=1, radius=8)
@@ -1164,6 +1187,22 @@ class TradeHistoryView(BaseView):
         if not getattr(self, "_data_loaded", False):
             self.load_data()
 
+    def _on_broker_selected(self):
+        """Auto-select currency based on selected broker."""
+        broker = self.th_broker_var.get()
+        if broker != "All":
+            try:
+                df = self.app_state.data_cache._trades_df
+                if df is not None and not df.empty and "currency" in df.columns:
+                    b_df = df[df["broker"] == broker]
+                    if not b_df.empty:
+                        currency = str(b_df["currency"].iloc[0]).strip().upper()
+                        if currency in ["INR", "JPY"]:
+                            self.th_currency_var.set(currency)
+            except Exception as e:
+                print(f"Error auto-selecting currency in TradeHistoryView: {e}")
+        self._apply_filters()
+
     def _load_brokers(self):
         """Load broker list in background to populate dropdown."""
         def _bg():
@@ -1258,6 +1297,7 @@ class TradeHistoryView(BaseView):
                         pass
 
                     broker = (getattr(self, "th_broker_var", None).get() if hasattr(self, "th_broker_var") else "All")
+                    currency = (getattr(self, "th_currency_var", None).get() if hasattr(self, "th_currency_var") else "All")
                     # Use get_value() from ModernEntry to ignore placeholder text
                     symbol_like = (self.th_symbol_entry.get_value() if hasattr(self, "th_symbol_entry") else "")
                     trade_type = (getattr(self, "th_type_var", None).get() if hasattr(self, "th_type_var") else "All")
@@ -1273,6 +1313,7 @@ class TradeHistoryView(BaseView):
                         trade_type=trade_type or "All",
                         start_date=start_date,
                         end_date=end_date,
+                        currency=currency or "All",
                     )
                     df, summary = self.app_state.data_cache.get_tradehistory_filtered(filters)
                     self.after(0, lambda: self._update_trades(df, summary))
@@ -1321,8 +1362,11 @@ class TradeHistoryView(BaseView):
             self.sum_buy_qty.config(text=f"{qty_buy:g}")
             self.sum_sell_qty.config(text=f"{qty_sell:g}")
             self.sum_live_qty.config(text=f"{live_qty:g}")
-            self.sum_fees.config(text=f"₹{(fee_buy + fee_sell):,.2f}")
-            self.sum_pnl.config(text=f"₹{total_pnl:,.2f}", fg=ModernStyle.SUCCESS if total_pnl >= 0 else ModernStyle.ERROR)
+            currency_val = getattr(self, "th_currency_var", None)
+            c_val = currency_val.get() if currency_val else "All"
+            sym = "¥" if c_val == "JPY" else "₹"
+            self.sum_fees.config(text=f"{sym}{(fee_buy + fee_sell):,.2f}")
+            self.sum_pnl.config(text=f"{sym}{total_pnl:,.2f}", fg=ModernStyle.SUCCESS if total_pnl >= 0 else ModernStyle.ERROR)
         except Exception:
             pass
 
@@ -1381,18 +1425,34 @@ class TradeHistoryView(BaseView):
             from ui_utils import format_money
             currency = str(getattr(row, 'currency', 'INR')).strip().upper()
 
+            # Convert to base currency (INR) for P&L columns if "All" is active, to avoid mixed-currency accumulation
+            currency_val = getattr(self, "th_currency_var", None)
+            c_filter = currency_val.get() if currency_val else "All"
+            
+            if c_filter == "All":
+                from model.engine import get_exchange_rate
+                rate = get_exchange_rate(currency)
+                running_tpnl += trade_pnl * rate
+                display_currency = "INR"
+                tp_val = trade_pnl * rate
+                cum_pnl_val = running_tpnl
+            else:
+                running_tpnl += trade_pnl
+                display_currency = currency
+                tp_val = trade_pnl
+                cum_pnl_val = running_tpnl
+
             # Running PnL (cumulative trade_pnl)
-            running_tpnl += trade_pnl
             if row_type == "SELL":
-                arrow = "🌲" if running_tpnl >= 0 else "🔻"
-                pnl_disp = f"{arrow} {format_money(abs(running_tpnl), currency)}"
+                arrow = "🌲" if cum_pnl_val >= 0 else "🔻"
+                pnl_disp = f"{arrow} {format_money(abs(cum_pnl_val), display_currency)}"
             else:
                 pnl_disp = "—"
 
             # Per-trade P&L (only meaningful for SELL)
-            if row_type == "SELL" and trade_pnl != 0.0:
-                tp_arrow = "▲" if trade_pnl >= 0 else "▼"
-                tp_disp = f"{tp_arrow} {format_money(abs(trade_pnl), currency)}"
+            if row_type == "SELL" and tp_val != 0.0:
+                tp_arrow = "▲" if tp_val >= 0 else "▼"
+                tp_disp = f"{tp_arrow} {format_money(abs(tp_val), display_currency)}"
             else:
                 tp_disp = "—"
 

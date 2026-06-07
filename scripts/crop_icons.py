@@ -1,7 +1,7 @@
-from PIL import Image
 import os
+from PIL import Image
 
-grid_path = "/Users/selvakumar/.gemini/antigravity/brain/13c90811-4a1a-4239-8963-c2607854fd67/portfolio_pro_icons_set_1777083146926.png"
+grid_path = "/Volumes/SELVA DATA/USER DATA/srselvakumar/.gemini/antigravity/brain/13c90811-4a1a-4239-8963-c2607854fd67/portfolio_pro_icons_set_1777083146926.png"
 output_dir = "assets/icons"
 
 if not os.path.exists(output_dir):

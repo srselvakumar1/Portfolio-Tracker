@@ -89,3 +89,4 @@ I like these  4
 #3 — Pulsing live dot: A tiny detail that makes the app feel alive and real-time.
 7	Color-coded P&L background tint on KPI cards	
 
+token - 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

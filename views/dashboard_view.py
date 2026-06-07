@@ -55,6 +55,9 @@ class DashboardView(BaseView):
         self._payload_data = None
         self._polling_active = False # Tracks if the robust poller is running
 
+        self.currency_var = tk.StringVar(value="INR")
+        self.currency_var.trace_add("write", lambda *a: self.load_data(force=True))
+
         self._main_canvas = tk.Canvas(self, bg=ModernStyle.BG_PRIMARY, highlightthickness=0)
         self._main_canvas.pack(side="left", fill="both", expand=True)
 
@@ -105,7 +108,14 @@ class DashboardView(BaseView):
                 _right_frame.config(bg=right_color)
                 self.refresh_status.config(bg=right_color)
                 self.refresh_btn.config(bg=right_color)
-            except NameError:
+                self.refresh_btn._canvas_bg = right_color
+                # Recalculate shadow color and update shadow item
+                shadow_alpha = 0.08
+                shadow_color = self.refresh_btn._blend("#000000", right_color, shadow_alpha)
+                if "shadow" in self.refresh_btn._canvas_ids:
+                    for shadow_item in self.refresh_btn._canvas_ids["shadow"]:
+                        self.refresh_btn.itemconfig(shadow_item, fill=shadow_color, outline=shadow_color)
+            except Exception:
                 pass
 
             # Raise text items above gradient
@@ -120,28 +130,23 @@ class DashboardView(BaseView):
         else:
             greeting = "Good Evening 🌙"
 
-        # Place labels as Canvas window items for correct layering
-        # Actually, for Tkinter compatibility, embed frames on the canvas:
-        _greeting_lbl = tk.Label(
-            self._header_canvas,
+        # Draw Greeting directly on the canvas for true 100% transparent background
+        self._header_canvas.create_text(
+            20, 22,
             text=f"⚡ {greeting}, Selvakumar Rajagopalan",
-            fg="#FFFFFF",
-            bg="#1E3A8A",
+            fill="#FFFFFF",
             font=ModernStyle.FONT_PAGE_TITLE,
-        )
-        self._header_canvas.create_window(
-            20, 18, window=_greeting_lbl, anchor="w", tags="header_content"
+            anchor="w",
+            tags="header_content"
         )
 
-        self._header_subtitle = tk.Label(
-            self._header_canvas,
+        self._header_subtitle = self._header_canvas.create_text(
+            20, 48,
             text="Loading portfolio data…",
-            fg="#94A3B8",
-            bg="#1E3A8A",
+            fill="#94A3B8",
             font=ModernStyle.FONT_BODY,
-        )
-        self._header_canvas.create_window(
-            20, 45, window=self._header_subtitle, anchor="w", tags="header_content"
+            anchor="w",
+            tags="header_content"
         )
 
         # Right side: refresh status + button
@@ -212,30 +217,62 @@ class DashboardView(BaseView):
             # Pin the content frame to the card's fixed height so children can expand
             card.content.config(height=ModernStyle.KPI_CARD_HEIGHT - 2)
 
-            # Top accent bar (thin + branded color)
-            tk.Frame(card.content, bg=color, height=3).pack(fill="x")
+            # 1. Left Accent Bar
+            body_wrapper = tk.Frame(card.content, bg=ModernStyle.BG_SECONDARY)
+            body_wrapper.pack(fill="both", expand=True)
+            
+            # Left vertical stripe
+            accent_bar = tk.Frame(body_wrapper, bg=color, width=4)
+            accent_bar.pack(side="left", fill="y")
 
             # Body
-            body = tk.Frame(card.content, bg=ModernStyle.BG_SECONDARY)
-            body.pack(fill="both", expand=True, padx=14, pady=10)
+            body = tk.Frame(body_wrapper, bg=ModernStyle.BG_SECONDARY)
+            body.pack(side="left", fill="both", expand=True, padx=14, pady=10)
 
             # Icon + Title row
             title_row = tk.Frame(body, bg=ModernStyle.BG_SECONDARY)
             title_row.pack(fill="x")
-            tk.Label(
+            
+            icon_lbl = tk.Label(
                 title_row,
                 text=icon,
                 fg=color,
                 bg=ModernStyle.BG_SECONDARY,
                 font=ModernStyle.FONT_ICON,
-            ).pack(side="left", padx=(0, 6))
-            tk.Label(
+            )
+            icon_lbl.pack(side="left", padx=(0, 6))
+            
+            title_lbl = tk.Label(
                 title_row,
                 text=title,
                 fg=ModernStyle.TEXT_SECONDARY,
                 bg=ModernStyle.BG_SECONDARY,
                 font=ModernStyle.FONT_KPI_LABEL,
-            ).pack(side="left", pady=(2, 0))
+            )
+            title_lbl.pack(side="left", pady=(2, 0))
+
+            if key == "total_value":
+                self.switch_frame = tk.Frame(title_row, bg=ModernStyle.BG_SECONDARY)
+                self.switch_frame.pack(side="right")
+                
+                self.curr_buttons = {}
+                currencies = [("INR", "#10B981"), ("JPY", "#EF4444")]
+                
+                for c_name, c_color in currencies:
+                    btn = tk.Label(
+                        self.switch_frame,
+                        text=c_name,
+                        bg=ModernStyle.BG_TERTIARY,
+                        fg=c_color,
+                        font=ModernStyle.FONT_TINY_BOLD,
+                        padx=6,
+                        pady=2,
+                        cursor="hand2",
+                    )
+                    btn.pack(side="left", padx=2)
+                    self.curr_buttons[c_name] = (btn, c_color)
+                    
+                    btn.bind("<Button-1>", lambda e, name=c_name: self.currency_var.set(name))
 
             # Value label (large, bold, colored for typographic contrast)
             val = tk.Label(
@@ -248,15 +285,19 @@ class DashboardView(BaseView):
             val.pack(anchor="w", pady=(6, 0))
             self.kpi_labels[key] = val
 
-            # Trend label (small, below value)
+            # 3. Delta Badge (Trend label)
+            trend_frame = tk.Frame(body, bg=ModernStyle.BG_SECONDARY)
+            trend_frame.pack(anchor="w", pady=(2, 4))
+            
             trend_lbl = tk.Label(
-                body,
+                trend_frame,
                 text="",
-                fg=ModernStyle.TEXT_TERTIARY,
-                bg=ModernStyle.BG_SECONDARY,
-                font=ModernStyle.FONT_TINY,
+                fg=ModernStyle.TEXT_SECONDARY,
+                bg=ModernStyle.BG_TERTIARY,
+                font=ModernStyle.FONT_TINY_BOLD,
+                padx=6, pady=2
             )
-            trend_lbl.pack(anchor="w", pady=(0, 4))
+            trend_lbl.pack(anchor="w")
             
             # Store the card itself for styling
             self._kpi_cards[key] = card
@@ -285,11 +326,13 @@ class DashboardView(BaseView):
                     except Exception:
                          pass
                     card.content.configure(bg=c)
+                    body_wrapper.configure(bg=c)
                     body.configure(bg=c)
                     title_row.configure(bg=c)
                     for child in title_row.winfo_children():
                         child.configure(bg=c)
                     val.configure(bg=c)
+                    trend_frame.configure(bg=c)
                     trend_lbl.configure(bg=c)
                     try:
                         spark_cvs.configure(bg=c)
@@ -299,14 +342,17 @@ class DashboardView(BaseView):
                 def _hover_in(_e=None):
                     card.highlight_color = color
                     card.highlight_thickness = 2
-                    # Re-trigger resize to redraw borders
                     card._on_resize(tk.Event())
+                    try: card.move(card.content_id, 0, -2)
+                    except: pass
                     _set_bg(ModernStyle.BG_TERTIARY)
 
                 def _hover_out(_e=None):
                     card.highlight_color = ModernStyle.BORDER_COLOR
                     card.highlight_thickness = 1
                     card._on_resize(tk.Event())
+                    try: card.move(card.content_id, 0, 2)
+                    except: pass
                     _set_bg(ModernStyle.BG_SECONDARY)
 
                 card.configure(cursor="hand2")
@@ -363,7 +409,7 @@ class DashboardView(BaseView):
         grid.grid_rowconfigure(0, weight=0)
         grid.grid_rowconfigure(1, weight=0)
 
-        def _section_card(parent, title: str, icon: str, accent: str, copy_command=None) -> tuple[ModernCard, tk.Frame]:
+        def _section_card(parent, title: str, icon: str, accent: str, copy_command=None, hdr_bg=None) -> tuple[ModernCard, tk.Frame]:
             """Create a section card with fixed-height scrollable body."""
             card = ModernCard(
                 parent,
@@ -374,34 +420,51 @@ class DashboardView(BaseView):
                 canvas_bg=ModernStyle.BG_PRIMARY
             )
 
-            # Accent bar
-            tk.Frame(card.content, bg=accent, height=2).pack(fill="x")
+            # Accent bar (top) + left accent strip for visual continuity
+            tk.Frame(card.content, bg=accent, height=3).pack(fill="x")
+
+            # Left accent strip wrapper
+            hdr_wrapper = tk.Frame(card.content, bg=ModernStyle.BG_SECONDARY)
+            hdr_wrapper.pack(fill="x")
+            tk.Frame(hdr_wrapper, bg=accent, width=4).pack(side="left", fill="y")
 
             # Header row
-            hdr = tk.Frame(card.content, bg=ModernStyle.BG_SECONDARY)
-            hdr.pack(fill="x", padx=14, pady=(10, 6))
+            hdr = tk.Frame(hdr_wrapper, bg=hdr_bg or ModernStyle.BG_SECONDARY)
+            hdr.pack(fill="x", padx=10, pady=(10, 6))
             tk.Label(
                 hdr,
                 text=icon,
-                fg=ModernStyle.ACCENT_PRIMARY,
-                bg=ModernStyle.BG_SECONDARY,
+                fg=ModernStyle.ACCENT_PRIMARY if not hdr_bg else ModernStyle.BG_PRIMARY,
+                bg=hdr_bg or ModernStyle.BG_SECONDARY,
                 font=ModernStyle.FONT_TITLE,
             ).pack(side="left", padx=(0, 6))
-            tk.Label(
+            title_lbl = tk.Label(
                 hdr,
                 text=title,
-                fg=ModernStyle.SALMON,
-                bg=ModernStyle.BG_SECONDARY,
+                fg=ModernStyle.SALMON if not hdr_bg else ModernStyle.BG_PRIMARY,
+                bg=hdr_bg or ModernStyle.BG_SECONDARY,
                 font=ModernStyle.FONT_TITLE,
-            ).pack(side="left")
+            )
+            title_lbl.pack(side="left")
+
+            # Counter Badge – matches header background
+            count_lbl = tk.Label(
+                hdr,
+                text="[0]",
+                fg=ModernStyle.ACCENT_PRIMARY,
+                bg=hdr_bg or ModernStyle.BG_SECONDARY,
+                font=ModernStyle.FONT_HEADING,
+                padx=4, pady=2,
+            )
+            count_lbl.pack(side="left", padx=(8, 0))
             
             if copy_command:
                 # Add copy clipboard icon aligned to the right
                 copy_lbl = tk.Label(
                     hdr,
                     text="🛍️",
-                    fg=ModernStyle.TEXT_SECONDARY,
-                    bg=ModernStyle.BG_SECONDARY,
+                    fg=ModernStyle.TEXT_SECONDARY if not hdr_bg else ModernStyle.BG_PRIMARY,
+                    bg=hdr_bg or ModernStyle.BG_SECONDARY,
                     font=ModernStyle.FONT_HEADING,
                     cursor="hand2"
                 )
@@ -415,7 +478,7 @@ class DashboardView(BaseView):
                 copy_lbl.bind("<Button-1>", lambda e: copy_command())
 
             # Thin divider
-            tk.Frame(card.content, bg=ModernStyle.DIVIDER_COLOR, height=1).pack(fill="x", padx=12)
+            tk.Frame(card.content, bg=ModernStyle.DIVIDER_COLOR, height=0).pack(fill="x", padx=12)
 
             # Fixed-height scrollable body area
             body_outer = tk.Frame(card.content, bg=ModernStyle.BG_SECONDARY, height=ModernStyle.DASH_SECTION_CARD_HEIGHT)
@@ -432,6 +495,9 @@ class DashboardView(BaseView):
 
             body = tk.Frame(body_canvas, bg=ModernStyle.BG_SECONDARY)
             body_win = body_canvas.create_window((0, 0), window=body, anchor="nw")
+            
+            # Store ref to count_lbl
+            setattr(body, "_count_lbl", count_lbl)
 
             def _on_body_cfg(e):
                 body_canvas.configure(scrollregion=body_canvas.bbox("all"))
@@ -486,26 +552,53 @@ class DashboardView(BaseView):
         except Exception:
             pass
 
-    def load_data(self):
-        """Load dashboard data synchronously. Local SQLite is fast enough to not block UI."""
-        if getattr(self, "_data_loaded", False):
+    def load_data(self, force: bool = False):
+        """Load dashboard data asynchronously to avoid blocking the UI.
+
+        All heavy DB queries (metrics, performers, insights, tax harvesting)
+        run in a background thread.  A lightweight loading skeleton is shown
+        instantly so the user sees immediate visual feedback.
+        """
+        if getattr(self, "_data_loaded", False) and not force:
             return
         self._data_loaded = True
 
+        # Show loading skeleton immediately (main thread — instant)
+        self._show_loading_skeleton()
+
+        c_val = getattr(self, "currency_var", None).get() if hasattr(self, "currency_var") else "INR"
+
+        def _bg():
+            try:
+                from model.engine import (
+                    get_dashboard_metrics, get_top_worst_performers,
+                    get_actionable_insights, get_tax_harvesting_opportunities,
+                )
+                metrics    = get_dashboard_metrics(currency_filter=c_val)
+                performers = get_top_worst_performers(10, currency_filter=c_val)
+                insights   = get_actionable_insights(currency_filter=c_val)
+                harvesting = get_tax_harvesting_opportunities(500.0, currency_filter=c_val)
+
+                # Apply on main thread for thread-safe Tk updates
+                try:
+                    self.after(0, lambda: self._apply_payload(metrics, performers, insights, harvesting))
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Dashboard load error: {e}")
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _show_loading_skeleton(self):
+        """Show brief loading placeholders in the KPI labels."""
         try:
-            from model.engine import (
-                get_dashboard_metrics, get_top_worst_performers,
-                get_actionable_insights, get_tax_harvesting_opportunities,
-            )
-            # These are instant local DB reads. No network calls.
-            metrics    = get_dashboard_metrics()
-            performers = get_top_worst_performers(10)
-            insights   = get_actionable_insights()
-            harvesting = get_tax_harvesting_opportunities(500.0)
-            
-            self._apply_payload(metrics, performers, insights, harvesting)
-        except Exception as e:
-            print(f"Dashboard load error: {e}")
+            for key, lbl in self.kpi_labels.items():
+                lbl.config(text="⏳ Loading…", fg=ModernStyle.TEXT_TERTIARY)
+                trend = getattr(lbl, "_trend_lbl", None)
+                if trend:
+                    trend.config(text="")
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────────────────────────────────
     # Animated KPI counter
@@ -540,8 +633,9 @@ class DashboardView(BaseView):
 
         def _fmt(v: float) -> str:
             if is_currency:
-                # Dashboard KPI totals are always INR-converted aggregates
-                return f"₹{v:,.2f}"
+                c_val = getattr(self, "currency_var", None).get() if hasattr(self, "currency_var") else "INR"
+                c_sym = {"JPY": "¥", "USD": "$"}.get(c_val, "₹")
+                return f"{c_sym}{v:,.2f}"
             else:
                 return f"{v:,.2f}%"
 
@@ -581,14 +675,8 @@ class DashboardView(BaseView):
         if card is None:
             return
 
-        if force_negative or value < 0:
-            tint_bg = "#FEF2F2"   # Very faint red (Red 50)
-            tint_inner = "#FEE2E2"  # Red 100 for inner content
-        elif value > 0:
-            tint_bg = "#F0FDF4"   # Very faint green (Green 50)
-            tint_inner = "#DCFCE7"  # Green 100
-        else:
-            return  # No tint for zero
+        # Dark theme tints removed – no background coloring applied
+        return  # No tint for zero
 
         try:
             # Update the card's content frame background
@@ -731,7 +819,8 @@ class DashboardView(BaseView):
 
             # Update header subtitle
             try:
-                self._header_subtitle.config(
+                self._header_canvas.itemconfig(
+                    self._header_subtitle,
                     text=f"Total Portfolio: {_money(total_v)}  •  P&L: {_money(pnl)} ({pnl_pct:+.2f}%)"
                           f"  •  Updated {datetime.now().strftime('%H:%M')}"
                 )
@@ -746,6 +835,12 @@ class DashboardView(BaseView):
         self._render_performers(self.worst_body, performers.get("worst", []) or [], is_top=False)
         self._render_simple_list(self.insights_body, insights or [],    kind="insight")
         self._render_simple_list(self.harvest_body, harvesting or [],   kind="harvest")
+        # Update counter badge for Tax Harvesting section
+        if hasattr(self.harvest_body, "_count_lbl"):
+            self.harvest_body._count_lbl.config(text=f"[{len(harvesting) if harvesting else 0}]")
+        # Update counter badge for Actionable Insights section
+        if hasattr(self.insights_body, "_count_lbl"):
+            self.insights_body._count_lbl.config(text=f"[{len(insights) if insights else 0}]")
 
         # MacOS Tkinter bug: The native OS event loop will not swap the rendering
         # buffers into view if no physical mouse movement is currently firing, entirely
@@ -784,6 +879,9 @@ class DashboardView(BaseView):
         self._clear_frame(frame)
         data = (data or [])[:10]
 
+        if hasattr(frame, "_count_lbl"):
+            frame._count_lbl.config(text=f"[{len(data)}]")
+
         if not data:
             self._empty_state(frame)
             return
@@ -791,85 +889,138 @@ class DashboardView(BaseView):
         # Compute max |pnl| for bar scaling
         max_abs = max((abs(float(d.get("pnl", 0.0) or 0.0)) for d in data), default=1) or 1
 
+        c_val = getattr(self, "currency_var", None).get() if hasattr(self, "currency_var") else "INR"
+        c_sym = {"JPY": "¥", "USD": "$"}.get(c_val, "₹")
+
         for i, item in enumerate(data):
             sym       = str(item.get("symbol", ""))
             pnl       = float(item.get("pnl", 0.0) or 0.0)
             invested  = float(item.get("invested", 1.0) or 1.0)
+            avg_price = float(item.get("avg_price", 0.0) or 0.0)
+            cur_price = float(item.get("current_price", 0.0) or 0.0)
             roi       = (pnl / invested * 100.0) if invested > 0 else 0.0
-            bar_frac  = min(1.0, abs(pnl) / max_abs)  # 0‥1
+            bar_frac  = min(1.0, abs(pnl) / max_abs)
 
-            accent  = ModernStyle.SUCCESS if pnl >= 0 else ModernStyle.ERROR
-            
-            # Ultra-thin zebra striping
+            accent = ModernStyle.SUCCESS if pnl >= 0 else ModernStyle.ERROR
+
+            # Refined zebra: white / Slate-50
             row_bg = ModernStyle.BG_SECONDARY if i % 2 == 0 else ModernStyle.SLATE_50
-            
-            # ── Row container ─────────────────────────────────────────────────
+
+            # ── Thin divider between rows ────────────────────────────────────
+            if i > 0:
+                tk.Frame(frame, bg=ModernStyle.DIVIDER_COLOR, height=1).pack(fill="x", padx=8)
+
+            # ── Row container ────────────────────────────────────────────────
             row = tk.Frame(frame, bg=row_bg)
             row.pack(fill="x", pady=0)
 
+            # Left accent strip (hidden initially, shown on hover)
+            accent_strip = tk.Frame(row, bg=row_bg, width=4)
+            accent_strip.pack(side="left", fill="y")
+
             content = tk.Frame(row, bg=row_bg)
-            content.pack(fill="x", padx=10, pady=(8, 8))
+            content.pack(fill="x", padx=(6, 10), pady=(8, 8))
 
-            # Left: rank + symbol
-            left = tk.Frame(content, bg=row_bg)
-            left.pack(side="left")
+            # ── Col 1: Rank badge ────────────────────────────────────────────
+            badge_text = {0: "🥇", 1: "🥈", 2: "🥉"}.get(i)
+            if badge_text:
+                badge_lbl = tk.Label(
+                    content, text=badge_text,
+                    fg=ModernStyle.TEXT_PRIMARY, bg=row_bg,
+                    font=ModernStyle.FONT_HEADING,
+                )
+            else:
+                # Positions 4+ get a colored circle badge
+                badge_lbl = tk.Label(
+                    content, text=f" {i+1} ",
+                    fg=ModernStyle.TEXT_ON_ACCENT,
+                    bg=ModernStyle.ACCENT_PRIMARY,
+                    font=ModernStyle.FONT_SMALL_BOLD,
+                    padx=4, pady=1,
+                )
+            badge_lbl.pack(side="left", padx=(0, 6))
 
-            badge   = {0: "🥇", 1: "🥈", 2: "🥉"}.get(i, f"#{i+1}")
-            badge_f = "ModernStyle.FONT_TABLE" if i < 3 else "ModernStyle.FONT_BODY"
-            tk.Label(
-                left,
-                text=badge,
-                fg=ModernStyle.TEXT_PRIMARY,
-                bg=row_bg,
-                font=ModernStyle.FONT_TABLE if i < 3 else ModernStyle.FONT_SMALL,
-            ).pack(side="left", padx=(0, 6))
-            tk.Label(
-                left,
-                text=sym,
-                fg=ModernStyle.ACCENT_PRIMARY,
-                bg=row_bg,
-                font=ModernStyle.FONT_SUBHEADING,
-            ).pack(side="left")
+            # ── Col 2: Symbol name (fixed width for alignment) ───────────────
+            sym_lbl = tk.Label(
+                content, text=sym, width=14, anchor="w",
+                fg=ModernStyle.ACCENT_PRIMARY, bg=row_bg,
+                font=ModernStyle.FONT_HEADING,
+            )
+            sym_lbl.pack(side="left", padx=(0, 8))
 
-            # Right: arrow + P&L + ROI%
-            right = tk.Frame(content, bg=row_bg)
-            right.pack(side="right")
+            # ── Col 3: Avg & LTP prices (expandable middle) ─────────────────
+            price_lbl = tk.Label(
+                content,
+                text=f"Avg {c_sym}{avg_price:,.1f}  •  LTP {c_sym}{cur_price:,.1f}",
+                fg=ModernStyle.TEXT_SECONDARY, bg=row_bg,
+                font=ModernStyle.FONT_BODY,
+            )
+            price_lbl.pack(side="left", padx=(0, 10), expand=True, fill="x")
+
+            # ── Col 4: Inline progress bar ───────────────────────────────────
+            pbar = tk.Canvas(
+                content, bg=ModernStyle.BG_TERTIARY,
+                height=6, highlightthickness=0, width=100,
+            )
+            pbar.pack(side="left", padx=(0, 10), pady=2)
+
+            def _draw_bar(e, c=pbar, frac=bar_frac, col=accent):
+                c.delete("all")
+                w = e.width if e else int(c.cget("width"))
+                h = e.height if e else int(c.cget("height"))
+                bar_w = max(2, int(w * frac))
+                # Filled portion (right-aligned)
+                c.create_rectangle(w - bar_w, 0, w, h, fill=col, outline="")
+
+            pbar.bind("<Configure>", _draw_bar)
+
+            # ── Col 5: P&L + ROI% ───────────────────────────────────────────
             arrow = "▲" if pnl >= 0 else "▼"
-            pnl_disp = _compact_money(abs(pnl))
-            tk.Label(
-                right,
-                text=f"{arrow} {pnl_disp}",
-                fg=accent,
-                bg=row_bg,
-                font=ModernStyle.FONT_SUBHEADING,
-            ).pack(side="left", padx=(0, 4))
-            tk.Label(
-                right,
-                text=f"({roi:+.1f}%)",
-                fg=accent,
-                bg=row_bg,
-                font=ModernStyle.FONT_SMALL,
-            ).pack(side="left")
+            pnl_disp = _compact_money(abs(pnl), c_val)
 
-            # Click drilldown + hover
-            def _click_fn(e=None, s=sym): self._open_trade_drilldown(s)
-            def _hover_in(e=None, f=row):
-                f.configure(bg=ModernStyle.BG_TERTIARY)
-                for w in f.winfo_children():
-                    w.configure(bg=ModernStyle.BG_TERTIARY)
-                    if w.winfo_children():
-                        for cw in w.winfo_children():
-                            cw.configure(bg=ModernStyle.BG_TERTIARY)
-            def _hover_out(e=None, f=row, base_bg=row_bg):
-                f.configure(bg=base_bg)
-                for w in f.winfo_children():
-                    w.configure(bg=base_bg)
-                    if w.winfo_children():
-                        for cw in w.winfo_children():
-                            cw.configure(bg=base_bg)
+            pnl_lbl = tk.Label(
+                content, text=f"{arrow} {pnl_disp}",
+                fg=accent, bg=row_bg,
+                font=ModernStyle.FONT_HEADING,
+            )
+            pnl_lbl.pack(side="right", padx=(4, 0))
+
+            roi_lbl = tk.Label(
+                content, text=f"({roi:+.1f}%)",
+                fg=accent, bg=row_bg,
+                font=ModernStyle.FONT_HEADING,
+            )
+            roi_lbl.pack(side="right", padx=(0, 2))
+
+            # ── Collect all widgets for hover & click ────────────────────────
+            all_widgets = [row, accent_strip, content, badge_lbl, sym_lbl, price_lbl, pnl_lbl, roi_lbl]
+
+            # List of widgets to change background color on hover
+            bg_widgets = [row, content, sym_lbl, price_lbl, pnl_lbl, roi_lbl]
+            if i < 3:
+                bg_widgets.append(badge_lbl)
+
+            def _click_fn(e=None, s=sym):
+                self._open_trade_drilldown(s)
+
+            def _hover_in(e, _row=row, _strip=accent_strip, _acc=accent, _bg_w=bg_widgets):
+                _strip.configure(bg=_acc)
+                for w in _bg_w:
+                    try:
+                        w.configure(bg=ModernStyle.BG_TERTIARY)
+                    except Exception:
+                        pass
+
+            def _hover_out(e, _row=row, _strip=accent_strip, _bg=row_bg, _bg_w=bg_widgets):
+                _strip.configure(bg=_bg)
+                for w in _bg_w:
+                    try:
+                        w.configure(bg=_bg)
+                    except Exception:
+                        pass
 
             row.configure(cursor="hand2")
-            for w in (row, content, left, right):
+            for w in all_widgets + [pbar]:
                 try:
                     w.bind("<Double-1>", _click_fn)
                     w.bind("<Enter>", _hover_in)
@@ -886,66 +1037,94 @@ class DashboardView(BaseView):
 
         # ── Tax Harvesting ─────────────────────────────────────────────────────
         if kind == "harvest":
+            from ui_utils import format_money
+
             for i, item in enumerate(data):
                 if not isinstance(item, dict):
                     continue
-                sym   = str(item.get("symbol", "")).strip()
-                loss  = float(item.get("unrealized_loss", 0.0) or 0.0)
-                qty   = item.get("qty", "")
-                avg   = float(item.get("avg_price", 0.0) or 0.0)
+                sym    = str(item.get("symbol", "")).strip()
+                loss   = float(item.get("unrealized_loss", 0.0) or 0.0)
+                qty    = item.get("qty", "")
+                avg    = float(item.get("avg_price", 0.0) or 0.0)
                 broker = str(item.get("broker", "") or "").strip()
+                _cur   = str(item.get("currency", "INR") or "INR").upper()
 
-                # Ultra-thin zebra striping
                 row_bg = ModernStyle.BG_SECONDARY if i % 2 == 0 else ModernStyle.SLATE_50
+
+                # Divider between rows
+                if i > 0:
+                    tk.Frame(frame, bg=ModernStyle.DIVIDER_COLOR, height=1).pack(fill="x", padx=8)
 
                 row = tk.Frame(frame, bg=row_bg)
                 row.pack(fill="x", pady=0)
 
-                top_line = tk.Frame(row, bg=row_bg)
-                top_line.pack(fill="x", padx=10, pady=(8, 2))
+                # Left accent strip (shown on hover)
+                accent_strip = tk.Frame(row, bg=row_bg, width=4)
+                accent_strip.pack(side="left", fill="y")
 
-                _cur = str(item.get("currency", "INR") or "INR").upper()
-                from ui_utils import format_money
-                tk.Label(top_line, text="⚠️", bg=row_bg, font=ModernStyle.FONT_SUBHEADING).pack(side="left", padx=(0, 6))
-                tk.Label(top_line, text=sym or "—", fg=ModernStyle.ACCENT_PRIMARY, bg=row_bg, font=ModernStyle.FONT_SUBHEADING).pack(side="left")
-                tk.Label(
-                    top_line,
+                line = tk.Frame(row, bg=row_bg)
+                line.pack(fill="x", padx=(6, 10), pady=(8, 8))
+
+                # Icon
+                icon_lbl = tk.Label(line, text="⚠️", bg=row_bg, font=ModernStyle.FONT_HEADING)
+                icon_lbl.pack(side="left", padx=(0, 6))
+
+                # Symbol (fixed width for alignment)
+                sym_lbl = tk.Label(
+                    line, text=sym or "—", width=14, anchor="w",
+                    fg=ModernStyle.ACCENT_PRIMARY, bg=row_bg,
+                    font=ModernStyle.FONT_HEADING,
+                )
+                sym_lbl.pack(side="left", padx=(0, 8))
+
+                # Qty & Avg detail (expandable middle)
+                detail_lbl = tk.Label(
+                    line,
+                    text=f"Qty {qty}  •  Avg {format_money(avg, _cur)}",
+                    fg=ModernStyle.TEXT_SECONDARY, bg=row_bg,
+                    font=ModernStyle.FONT_BODY,
+                )
+                detail_lbl.pack(side="left", expand=True, fill="x")
+
+                # Loss amount (right-aligned)
+                loss_lbl = tk.Label(
+                    line,
                     text=format_money(loss, _cur),
                     fg=ModernStyle.ERROR if loss < 0 else ModernStyle.SUCCESS,
                     bg=row_bg,
-                    font=ModernStyle.FONT_BODY_BOLD,
-                ).pack(side="right")
+                    font=ModernStyle.FONT_HEADING,
+                )
+                loss_lbl.pack(side="right")
 
-                tk.Label(row, text=f"Qty {qty}  \u2022  Avg {format_money(avg, _cur)}",
-                         fg=ModernStyle.TEXT_SECONDARY, bg=row_bg,
-                         font=ModernStyle.FONT_TINY).pack(anchor="w", padx=36, pady=(0, 8))
+                # Hover + click
+                all_w = [row, accent_strip, line, icon_lbl, sym_lbl, detail_lbl, loss_lbl]
 
+                def _hover_in(e=None, _strip=accent_strip, _all=all_w):
+                    _strip.configure(bg=ModernStyle.ERROR)
+                    for w in _all:
+                        try:
+                            if w is not _strip:
+                                w.configure(bg=ModernStyle.BG_TERTIARY)
+                        except Exception:
+                            pass
 
-                try:
-                    def _hover_in(e=None, r=row):
-                        r.configure(bg=ModernStyle.BG_TERTIARY)
-                        for w in r.winfo_children():
-                            w.configure(bg=ModernStyle.BG_TERTIARY)
-                            if w.winfo_children():
-                                for cw in w.winfo_children():
-                                    cw.configure(bg=ModernStyle.BG_TERTIARY)
-                    def _hover_out(e=None, r=row, base_bg=row_bg):
-                        r.configure(bg=base_bg)
-                        for w in r.winfo_children():
-                            w.configure(bg=base_bg)
-                            if w.winfo_children():
-                                for cw in w.winfo_children():
-                                    cw.configure(bg=base_bg)
-                    row.bind("<Double-1>", lambda e=None, s=sym, b=broker: self._open_trade_drilldown(s, broker=b or None))
-                    row.bind("<Enter>", _hover_in)
-                    row.bind("<Leave>", _hover_out)
-                    for w in row.winfo_children():
+                def _hover_out(e=None, _strip=accent_strip, _bg=row_bg, _all=all_w):
+                    _strip.configure(bg=_bg)
+                    for w in _all:
+                        try:
+                            if w is not _strip:
+                                w.configure(bg=_bg)
+                        except Exception:
+                            pass
+
+                row.configure(cursor="hand2")
+                for w in all_w:
+                    try:
                         w.bind("<Double-1>", lambda e=None, s=sym, b=broker: self._open_trade_drilldown(s, broker=b or None))
                         w.bind("<Enter>", _hover_in)
                         w.bind("<Leave>", _hover_out)
-                    row.configure(cursor="hand2")
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             return
 
         # ── Actionable Insights ────────────────────────────────────────────────
@@ -959,74 +1138,94 @@ class DashboardView(BaseView):
                     ).pack(anchor="w", pady=2)
                     continue
 
-                sym     = str(item.get("symbol", "")).strip()
-                signal  = str(item.get("signal", "") or "").strip().upper()
-                iv      = float(item.get("iv", 0.0) or 0.0)
-                cp      = float(item.get("current_price", 0.0) or 0.0)
+                sym      = str(item.get("symbol", "")).strip()
+                signal   = str(item.get("signal", "") or "").strip().upper()
+                iv       = float(item.get("iv", 0.0) or 0.0)
+                cp       = float(item.get("current_price", 0.0) or 0.0)
                 diff_pct = ((iv - cp) / cp * 100.0) if cp else 0.0
 
                 if signal == "ACCUMULATE":
-                    sig_icon = "📈"
-                    sig_color  = ModernStyle.SUCCESS
+                    sig_icon, sig_color = "📈", ModernStyle.SUCCESS
                 elif signal == "REDUCE":
-                    sig_icon = "📉"
-                    sig_color  = ModernStyle.ERROR
+                    sig_icon, sig_color = "📉", ModernStyle.ERROR
                 else:
-                    sig_icon = "⏸️"
-                    sig_color  = ModernStyle.TEXT_SECONDARY
+                    sig_icon, sig_color = "⏸️", ModernStyle.TEXT_SECONDARY
 
-                # Ultra-thin zebra striping
                 row_bg = ModernStyle.BG_SECONDARY if i % 2 == 0 else ModernStyle.SLATE_50
+
+                # Divider between rows
+                if i > 0:
+                    tk.Frame(frame, bg=ModernStyle.DIVIDER_COLOR, height=1).pack(fill="x", padx=8)
 
                 row = tk.Frame(frame, bg=row_bg)
                 row.pack(fill="x", pady=0)
 
-                top_line = tk.Frame(row, bg=row_bg)
-                top_line.pack(fill="x", padx=10, pady=(8, 2))
+                # Left accent strip (shown on hover)
+                accent_strip = tk.Frame(row, bg=row_bg, width=4)
+                accent_strip.pack(side="left", fill="y")
 
-                tk.Label(top_line, text=sig_icon, bg=row_bg, font=ModernStyle.FONT_SUBHEADING).pack(side="left", padx=(0, 6))
-                tk.Label(top_line, text=sym or "—", fg=ModernStyle.ACCENT_PRIMARY, bg=row_bg, font=ModernStyle.FONT_SUBHEADING).pack(side="left")
+                line = tk.Frame(row, bg=row_bg)
+                line.pack(fill="x", padx=(6, 10), pady=(8, 8))
 
-                # Signal text without a chip background
-                chip = tk.Label(
-                    top_line,
-                    text=signal,
-                    fg=sig_color, bg=row_bg,
-                    font=ModernStyle.FONT_SMALL_BOLD
+                # Icon
+                icon_lbl = tk.Label(line, text=sig_icon, bg=row_bg, font=ModernStyle.FONT_HEADING)
+                icon_lbl.pack(side="left", padx=(0, 6))
+
+                # Symbol (fixed width)
+                sym_lbl = tk.Label(
+                    line, text=sym or "—", width=14, anchor="w",
+                    fg=ModernStyle.ACCENT_PRIMARY, bg=row_bg,
+                    font=ModernStyle.FONT_HEADING,
                 )
-                chip.pack(side="right", padx=(0, 2))
+                sym_lbl.pack(side="left", padx=(0, 8))
 
+                # IV / Curr / Gap detail (expandable middle)
                 _sym_iv = "¥" if str(item.get("currency", "INR")).upper() == "JPY" else "₹"
-                detail = f"IV {_sym_iv}{iv:,.0f}  •  Curr {_sym_iv}{cp:,.0f}  •  Gap {diff_pct:+.1f}%"
-                tk.Label(row, text=detail, fg=ModernStyle.TEXT_TERTIARY, bg=row_bg, font=ModernStyle.FONT_TINY).pack(anchor="w", padx=36, pady=(0, 8))
+                detail_lbl = tk.Label(
+                    line,
+                    text=f"IV {_sym_iv}{iv:,.0f}  •  Curr {_sym_iv}{cp:,.0f}  •  Gap {diff_pct:+.1f}%",
+                    fg=ModernStyle.TEXT_SECONDARY, bg=row_bg,
+                    font=ModernStyle.FONT_BODY,
+                )
+                detail_lbl.pack(side="left", expand=True, fill="x")
 
+                # Signal chip (right-aligned)
+                chip_lbl = tk.Label(
+                    line, text=signal,
+                    fg=sig_color, bg=row_bg,
+                    font=ModernStyle.FONT_BODY_BOLD,
+                )
+                chip_lbl.pack(side="right", padx=(0, 2))
 
-                try:
-                    def _hover_in(e=None, r=row):
-                        r.configure(bg=ModernStyle.BG_TERTIARY)
-                        for w in r.winfo_children():
-                            w.configure(bg=ModernStyle.BG_TERTIARY)
-                            if w.winfo_children():
-                                for cw in w.winfo_children():
-                                    cw.configure(bg=ModernStyle.BG_TERTIARY)
-                    def _hover_out(e=None, r=row, base_bg=row_bg):
-                        r.configure(bg=base_bg)
-                        for w in r.winfo_children():
-                            w.configure(bg=base_bg)
-                            if w.winfo_children():
-                                for cw in w.winfo_children():
-                                    cw.configure(bg=base_bg)
+                # Hover + click
+                all_w = [row, accent_strip, line, icon_lbl, sym_lbl, detail_lbl, chip_lbl]
 
-                    row.bind("<Double-1>", lambda e=None, s=sym: self._open_trade_drilldown(s))
-                    row.bind("<Enter>", _hover_in)
-                    row.bind("<Leave>", _hover_out)
-                    for w in row.winfo_children():
+                def _hover_in(e=None, _strip=accent_strip, _col=sig_color, _all=all_w):
+                    _strip.configure(bg=_col)
+                    for w in _all:
+                        try:
+                            if w is not _strip:
+                                w.configure(bg=ModernStyle.BG_TERTIARY)
+                        except Exception:
+                            pass
+
+                def _hover_out(e=None, _strip=accent_strip, _bg=row_bg, _all=all_w):
+                    _strip.configure(bg=_bg)
+                    for w in _all:
+                        try:
+                            if w is not _strip:
+                                w.configure(bg=_bg)
+                        except Exception:
+                            pass
+
+                row.configure(cursor="hand2")
+                for w in all_w:
+                    try:
                         w.bind("<Double-1>", lambda e=None, s=sym: self._open_trade_drilldown(s))
                         w.bind("<Enter>", _hover_in)
                         w.bind("<Leave>", _hover_out)
-                    row.configure(cursor="hand2")
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             return
 
         # Default bullet list
@@ -1252,9 +1451,10 @@ class DashboardView(BaseView):
     # ──────────────────────────────────────────────────────────────────────────
 
     def _show_broker_breakdown(self, title: str, metric_key: str, *, is_currency: bool = True, color: str = ModernStyle.ACCENT_PRIMARY) -> None:
+        c_val = getattr(self, "currency_var", None).get() if hasattr(self, "currency_var") else "INR"
         try:
             from model.engine import get_metrics_by_broker
-            broker_metrics = get_metrics_by_broker()
+            broker_metrics = get_metrics_by_broker(currency_filter=c_val)
         except Exception as e:
             messagebox.showerror("Breakdown", f"Failed to load broker breakdown: {e}")
             return
@@ -1270,7 +1470,7 @@ class DashboardView(BaseView):
         modal = PremiumModal(self, title=title, geometry="600x400")
         modal.add_chip("📊", "Breakdown", bg_color=ModernStyle.SLATE_100, fg_color=color)
         if is_currency:
-            modal.status_lbl.configure(text=f"Total Across Brokers: {_money(total)}")
+            modal.status_lbl.configure(text=f"Total Across Brokers: {_money(total, c_val)}")
         else:
             modal.status_lbl.configure(text=f"Displaying individual {title} calculated per broker.")
         
@@ -1336,7 +1536,7 @@ class DashboardView(BaseView):
             vsb.pack(side="right", fill="y")
 
         for idx, (broker, v) in enumerate(rows):
-            disp = _money(v) if is_currency else _pct(v)
+            disp = _money(v, c_val) if is_currency else _pct(v)
             
             # Semantic tags based on Value
             tags = ["odd" if idx % 2 == 0 else "even"]
@@ -1360,27 +1560,27 @@ class DashboardView(BaseView):
                 cur = conn.cursor()
                 sql = None
                 if metric_key == "total_value":
-                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) > 0 ORDER BY val DESC"
+                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) > 0 ORDER BY val DESC"
                 elif metric_key == "total_invested":
-                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * h.avg_price) as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND (h.qty * h.avg_price) > 0 ORDER BY val DESC"
+                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * h.avg_price) as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND (h.qty * h.avg_price) > 0 ORDER BY val DESC"
                 elif metric_key == "overall_pnl":
-                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), running_pnl as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND running_pnl != 0 ORDER BY val DESC"
+                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), running_pnl as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND running_pnl != 0 ORDER BY val DESC"
                 elif metric_key == "unrealized_pnl":
-                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) != 0 ORDER BY val DESC"
+                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) != 0 ORDER BY val DESC"
                 elif metric_key == "unrealized_loss":
-                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) < 0 ORDER BY val ASC"
+                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) < 0 ORDER BY val ASC"
                 elif metric_key == "realized_pnl":
-                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), realized_pnl as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND realized_pnl != 0 ORDER BY val DESC"
+                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), realized_pnl as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND realized_pnl != 0 ORDER BY val DESC"
                 elif metric_key == "realized_loss":
-                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), realized_pnl as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND realized_pnl < 0 ORDER BY val ASC"
+                    sql = "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), realized_pnl as val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND realized_pnl < 0 ORDER BY val ASC"
 
                 if sql:
                     for broker, total_v in rows:
-                        cur.execute(sql, (broker,))
+                        cur.execute(sql, (broker, c_val.upper()))
                         for sym, name, val in cur.fetchall():
                             if abs(val) > 0.01:
                                 sym_pct_str = f"{(abs(val)/abs(total_v) * 100):.1f}%" if abs(total_v) > 0 else "0.0%"
-                                sym_disp = _money(val) if is_currency else f"{val:.2f}"
+                                sym_disp = _money(val, c_val) if is_currency else f"{val:.2f}"
                                 
                                 # Use name if it's different from symbol
                                 label = f"   ↳ {name}" if name and name != sym else f"   ↳ {sym}"

@@ -10,7 +10,7 @@ import shutil
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Prioritize the specified development assets path if it exists
-DEV_ASSETS_DIR = "/Users/selvakumar/Downloads/PROJECTS/assets"
+DEV_ASSETS_DIR = "/Volumes/SELVA DATA/USER DATA/srselvakumar/Downloads/PROJECTS/assets"
 if os.path.exists(DEV_ASSETS_DIR):
     LOCAL_ASSETS_DIR = DEV_ASSETS_DIR
 else:

@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Dict, Callable
 import atexit
 
+from PIL import Image, ImageTk, ImageDraw, ImageEnhance
 from model.state import AppState
-from PIL import Image, ImageTk
 from model.database import initialize_database, close_all_connections
 from ui_theme import ModernStyle
 from ui_widgets import ModernButton, ModernCard
@@ -329,7 +329,7 @@ class Sidebar(tk.Frame):
             from pathlib import Path
             logo_path = Path(__file__).resolve().parent / "assets" / "images" / "logo.png"
             if logo_path.exists():
-                from PIL import Image, ImageTk, ImageEnhance, ImageDraw
+
 
                 pil_img = Image.open(logo_path).convert("RGBA")
                 base_size = 64
@@ -383,26 +383,32 @@ class Sidebar(tk.Frame):
         self._status_badge = tk.Label(
             self._status_row, text="⏳ Syncing…",
             bg=self.sidebar_bg, fg=ModernStyle.SLATE_400,
-            font=ModernStyle.FONT_TINY, anchor="w",
+            font=ModernStyle.FONT_SMALL, anchor="w",
         )
         self._status_badge.pack(side=tk.LEFT, fill=tk.X)
 
-        self.after(100, self._refresh_status_badge)
+        self.after(1500, self._refresh_status_badge)
         self.after(100, self._pulse_step)
 
         # ── Portfolio Summary Card ────────────────────────────────────────────
         _card_bg = "#253347"
         self._summary_card = tk.Frame(self, bg=_card_bg, highlightbackground=self.accent_primary, highlightthickness=1)
         self._summary_card.pack(fill=tk.X, padx=16, pady=(4, 8))
-        self._summary_value_lbl = tk.Label(self._summary_card, text="₹ —", bg=_card_bg, fg="#FFFFFF", font=(ModernStyle.FONT_FAMILY, 18, "bold"), anchor="w")
-        self._summary_value_lbl.pack(fill=tk.X, padx=12, pady=(10, 2))
+        
+        _vrow = tk.Frame(self._summary_card, bg=_card_bg)
+        _vrow.pack(fill=tk.X, padx=12, pady=(10, 2))
+        self._summary_value_lbl = tk.Label(_vrow, text="₹ —", bg=_card_bg, fg="#FFFFFF", font=ModernStyle.FONT_TITLE, anchor="w")
+        self._summary_value_lbl.pack(side=tk.LEFT)
+        self._summary_label_lbl = tk.Label(_vrow, text="Invested", bg=_card_bg, fg=ModernStyle.SLATE_400, font=ModernStyle.FONT_SMALL_BOLD, anchor="w")
+        self._summary_label_lbl.pack(side=tk.LEFT, padx=(6, 0), pady=(2, 0))
+
         _srow = tk.Frame(self._summary_card, bg=_card_bg)
         _srow.pack(fill=tk.X, padx=12, pady=(0, 10))
         self._summary_pnl_lbl = tk.Label(_srow, text="P&L: —", bg=_card_bg, fg=ModernStyle.SUCCESS, font=ModernStyle.FONT_SMALL_BOLD, anchor="w")
         self._summary_pnl_lbl.pack(side=tk.LEFT)
         self._summary_count_lbl = tk.Label(_srow, text="0 holdings", bg=_card_bg, fg=ModernStyle.SLATE_400, font=ModernStyle.FONT_SMALL, anchor="e")
         self._summary_count_lbl.pack(side=tk.RIGHT)
-        self.after(2000, self._refresh_summary_card)
+        self.after(1500, self._refresh_summary_card)
 
         # ── Navigation Section Label ──────────────────────────────────────────
         self._nav_header = tk.Frame(self, bg=self.sidebar_bg)
@@ -410,7 +416,7 @@ class Sidebar(tk.Frame):
 
         self._menu_lbl = tk.Label(
             self._nav_header, text="N A V I G A T I O N",
-            font=ModernStyle.FONT_SMALL_BOLD,
+            font=ModernStyle.FONT_NAV_SECTION,
             bg=self.sidebar_bg, fg=self.accent_primary, anchor="w",
         )
         self._menu_lbl.pack(fill=tk.X)
@@ -429,12 +435,13 @@ class Sidebar(tk.Frame):
             ("🧾  Tax Report",   4),
             ("👁  Watchlist",    5),
             ("💠  Valuation",    6),
-            ("⚙️  Settings",     7),
-            ("🔆  Help",         8),
+            ("📰  Financial News", 7),
+            ("⚙️  Settings",     8),
+            ("🔆  Help",         9),
         ]
 
         self._nav_labels = {idx: label for (label, idx) in nav_items}
-        _divider_after = {3, 6}  # Core | Analysis | System
+        _divider_after = {3, 7}  # Core | Analysis | System
         for label, idx in nav_items:
             self._add_nav_button(label, idx)
             if idx in _divider_after:
@@ -452,7 +459,7 @@ class Sidebar(tk.Frame):
         self._exit_btn = tk.Label(
             quit_container, text="⏻  Quit / Logout",
             bg="#2A1B24", fg="#FCA5A5",
-            font=(ModernStyle.FONT_FAMILY, 13, "bold"),
+            font=ModernStyle.FONT_TITLE,
             cursor="hand2", anchor="center",
             pady=10
         )
@@ -474,7 +481,6 @@ class Sidebar(tk.Frame):
         avatar.pack(side=tk.LEFT)
         
         try:
-            from PIL import Image, ImageTk, ImageDraw
             import os, sys
             from pathlib import Path
             
@@ -512,7 +518,7 @@ class Sidebar(tk.Frame):
         self._profile_name_lbl = tk.Label(
             profile_row, text="Selvakumar",
             bg=self.sidebar_bg, fg="#E2E8F0",
-            font=(ModernStyle.FONT_FAMILY, 13, "bold")
+            font=ModernStyle.FONT_TITLE
         )
         self._profile_name_lbl.pack(side=tk.LEFT, padx=(10, 0))
 
@@ -536,7 +542,7 @@ class Sidebar(tk.Frame):
 
         tk.Label(
             self._ticker_frame, text="M A R K E T S [Live]",
-            font=ModernStyle.FONT_BODY_BOLD,
+            font=ModernStyle.FONT_NAV_SECTION,
             bg=self.sidebar_bg, fg=self.accent_primary, anchor="w"
         ).pack(fill=tk.X, padx=16, pady=(0, 0))
 
@@ -544,7 +550,7 @@ class Sidebar(tk.Frame):
 
         self._ticker_time_lbl = tk.Label(
             self._ticker_frame, text="⚡ Last Updated: —",
-            font=(ModernStyle.FONT_FAMILY, 12, "bold italic"),
+            font=ModernStyle.FONT_ITALIC_MD,
             bg=self.sidebar_bg, fg="yellow", anchor="w"
         )
         self._ticker_time_lbl.pack(fill=tk.X, padx=20, pady=(0, 4))
@@ -682,7 +688,7 @@ class Sidebar(tk.Frame):
 
     def _add_nav_button(self, label: str, idx: int):
         row = tk.Frame(self, bg=self.sidebar_bg)
-        row.pack(fill=tk.X, padx=(12, 16), pady=3)
+        row.pack(fill=tk.X, padx=(12, 16), pady=1)
 
         icon = self._icons.get(label)
         self._nav_has_icon[idx] = bool(icon)
@@ -698,7 +704,7 @@ class Sidebar(tk.Frame):
             width=self._btn_w_expanded,
             height=46,
             radius=8,
-            font=ModernStyle.FONT_HEADING,
+            font=ModernStyle.FONT_NAV,
             text_anchor="w",
             text_padx=14,
         )
@@ -810,36 +816,43 @@ class Sidebar(tk.Frame):
         """Fetch portfolio totals and update the summary card.
 
         Called once at startup and again when the dashboard Refresh button
-        is clicked (via refresh_sidebar_data).
+        is clicked (via refresh_sidebar_data).  Runs DB work in a
+        background thread to avoid blocking the UI.
         """
-        try:
-            from model.database import db_session
-            from model.engine import get_exchange_rate
-            with db_session() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT qty, avg_price, running_pnl, currency FROM holdings WHERE qty > 0")
-                count = 0
-                invested = 0.0
-                pnl = 0.0
-                for row in cur.fetchall():
-                    qty = float(row[0] or 0)
-                    price = float(row[1] or 0)
-                    running_pnl = float(row[2] or 0)
-                    currency = str(row[3] or 'INR').strip().upper()
-                    
-                    rate = get_exchange_rate(currency)
-                    count += 1
-                    invested += (qty * price) * rate
-                    pnl += running_pnl * rate
-                    
-                self._update_summary_ui(count, invested, pnl)
-        except Exception as e:
-            print(f"Summary card error: {e}")
+        def _bg():
+            try:
+                from model.database import db_session
+                from model.engine import get_exchange_rate
+                with db_session() as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT qty, avg_price, running_pnl, currency FROM holdings WHERE qty > 0")
+                    count = 0
+                    invested = 0.0
+                    pnl = 0.0
+                    for row in cur.fetchall():
+                        qty = float(row[0] or 0)
+                        price = float(row[1] or 0)
+                        running_pnl = float(row[2] or 0)
+                        currency = str(row[3] or 'INR').strip().upper()
+
+                        rate = get_exchange_rate(currency)
+                        count += 1
+                        invested += (qty * price) * rate
+                        pnl += running_pnl * rate
+
+                try:
+                    self.after(0, lambda: self._update_summary_ui(count, invested, pnl))
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Summary card error: {e}")
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     def _update_summary_ui(self, count, invested, pnl):
         try:
             # Correctly labelled as "Invested" since it is cost basis, not market value
-            self._summary_value_lbl.configure(text=f"₹{invested:,.0f}  Invested")
+            self._summary_value_lbl.configure(text=f"₹{invested:,.0f}")
             color = ModernStyle.SUCCESS if pnl >= 0 else ModernStyle.ERROR
             arrow = "▲" if pnl >= 0 else "▼"
             self._summary_pnl_lbl.configure(text=f"{arrow} P&L: ₹{pnl:,.0f}", fg=color)
@@ -850,34 +863,48 @@ class Sidebar(tk.Frame):
         """Fetch last sync time and update the status badge.
 
         Called once at startup and again via refresh_sidebar_data.
+        Runs DB work in a background thread to avoid blocking the UI.
         """
-        try:
-            from model.database import db_session
-            from datetime import datetime
-            with db_session() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM holdings WHERE qty > 0")
-                row1 = cur.fetchone()
-                count = row1[0] if row1 else 0
-                
-                cur.execute("SELECT MAX(last_updated) FROM marketdata")
-                row2 = cur.fetchone()
-                last_ts = row2[0] if row2 else None
-                
-            time_str = "Unknown"
-            if last_ts:
+        def _bg():
+            try:
+                from model.database import db_session
+                from datetime import datetime
+                with db_session() as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) FROM holdings WHERE qty > 0")
+                    row1 = cur.fetchone()
+                    count = row1[0] if row1 else 0
+
+                    cur.execute("SELECT MAX(last_updated) FROM marketdata")
+                    row2 = cur.fetchone()
+                    last_ts = row2[0] if row2 else None
+
+                time_str = "Unknown"
+                if last_ts:
+                    try:
+                        dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
+                        diff = int((datetime.now() - dt).total_seconds() / 60)
+                        if diff < 1: time_str = "Just now"
+                        elif diff < 60: time_str = f"{diff}m ago"
+                        else: time_str = f"{diff // 60}h ago"
+                    except Exception: pass
+
                 try:
-                    dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
-                    diff = int((datetime.now() - dt).total_seconds() / 60)
-                    if diff < 1: time_str = "Just now"
-                    elif diff < 60: time_str = f"{diff}m ago"
-                    else: time_str = f"{diff // 60}h ago"
-                except Exception: pass
-                
-            self._status_badge.configure(text=f"{count} active · {time_str}", fg=ModernStyle.SLATE_300)
-        except Exception as e:
-            print(f"Status badge error: {e}")
-            self._status_badge.configure(text=f"Sync error", fg=ModernStyle.ERROR)
+                    self.after(0, lambda: self._status_badge.configure(
+                        text=f"{count} active · {time_str}", fg=ModernStyle.SLATE_300
+                    ))
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Status badge error: {e}")
+                try:
+                    self.after(0, lambda: self._status_badge.configure(
+                        text="Sync error", fg=ModernStyle.ERROR
+                    ))
+                except Exception:
+                    pass
+
+        threading.Thread(target=_bg, daemon=True).start()
 
     def refresh_sidebar_data(self):
         """Public method: re-fetch sidebar investment & status data.
@@ -1095,7 +1122,7 @@ class PTrackerApp:
 
         # Start background tasks
         self._start_auto_refresh()
-        self._update_status_loop()
+        self.root.after(3000, self._update_status_loop)
 
     def _update_status_loop(self):
         """Periodically update the bottom status bar."""
@@ -1228,8 +1255,6 @@ class PTrackerApp:
             pil_img = Image.open(icon_path).convert("RGBA")
             icon_size = 128
             pil_img = pil_img.resize((icon_size, icon_size), Image.Resampling.LANCZOS)
-
-            from PIL import ImageDraw
             mask = Image.new('L', (icon_size, icon_size), 0)
             draw = ImageDraw.Draw(mask)
             draw.rounded_rectangle((0, 0, icon_size, icon_size), radius=int(icon_size * 0.225), fill=255)
@@ -1267,6 +1292,7 @@ class PTrackerApp:
         from views.tax_report_view import TaxReportView
         from views.watchlist_view import WatchlistView
         from views.valuation_view import ValuationView
+        from views.news_view import NewsView
 
         self.view_manager.register_view('dashboard', DashboardView)
         self.view_manager.register_view('holdings', HoldingsView)
@@ -1277,10 +1303,11 @@ class PTrackerApp:
         self.view_manager.register_view('tax', TaxReportView)
         self.view_manager.register_view('watchlist', WatchlistView)
         self.view_manager.register_view('valuation', ValuationView)
+        self.view_manager.register_view('news', NewsView)
 
     def navigate(self, view_idx: int):
         """Navigate to a view by index."""
-        views = ['dashboard', 'holdings', 'trade_entry', 'trade_history', 'tax', 'watchlist', 'valuation', 'settings', 'help']
+        views = ['dashboard', 'holdings', 'trade_entry', 'trade_history', 'tax', 'watchlist', 'valuation', 'news', 'settings', 'help']
         if 0 <= view_idx < len(views):
             try:
                 if hasattr(self, "sidebar") and hasattr(self.sidebar, "set_active"):
@@ -1302,7 +1329,6 @@ def main():
             pass
 
     root = tk.Tk()
-
     # Cleanup on exit
     def on_closing():
         root.iconify()
@@ -1323,6 +1349,6 @@ def main():
 
 # source .venv/bin/activate
 # python3 -m PyInstaller --noconfirm PortfolioTrack.spec
-
+# /usr/local/bin/pip3.14 install tkcalendar --break-system-packages
 if __name__ == '__main__':
     main()

@@ -93,34 +93,21 @@ class DataCache:
             trades_df = pd.read_sql_query(trades_query, conn)
 
         # Normalize types (cheap) so downstream filtering/summaries are stable.
-        try:
-            if not holdings_df.empty:
-                holdings_df["qty"] = holdings_df["qty"].astype(float)
-                holdings_df["avg_price"] = holdings_df["avg_price"].astype(float)
-                holdings_df["realized_pnl"] = holdings_df["realized_pnl"].astype(float)
-                holdings_df["running_pnl"] = holdings_df["running_pnl"].astype(float)
-                holdings_df["xirr"] = holdings_df["xirr"].astype(float)
-                holdings_df["cagr"] = holdings_df["cagr"].astype(float)
-                holdings_df["total_fees"] = holdings_df["total_fees"].astype(float)
-                holdings_df["market_price"] = holdings_df["market_price"].astype(float)
-                holdings_df["previous_close"] = holdings_df["previous_close"].astype(float)
-                holdings_df["pe_ratio"] = holdings_df["pe_ratio"].astype(float)
-                holdings_df["current_value"] = holdings_df["current_value"].astype(float)
-        except Exception:
-            pass
+        # Column by column with errors="coerce": one bad value (e.g. text in
+        # pe_ratio) used to stop every later column from being converted.
+        def _numeric(df, cols):
+            for col in cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
 
-        try:
-            if not trades_df.empty:
-                trades_df["qty"] = trades_df["qty"].astype(float)
-                trades_df["price"] = trades_df["price"].astype(float)
-                trades_df["fee"] = trades_df["fee"].astype(float)
+        if not holdings_df.empty:
+            _numeric(holdings_df, ["qty", "avg_price", "realized_pnl", "running_pnl", "xirr", "cagr",
+                                   "total_fees", "market_price", "previous_close", "pe_ratio", "current_value"])
+
+        if not trades_df.empty:
+            _numeric(trades_df, ["qty", "price", "fee", "run_qty", "avg_cost", "running_pnl", "trade_pnl"])
+            if "type" in trades_df.columns:
                 trades_df["type"] = trades_df["type"].astype(str).str.upper()
-                trades_df["run_qty"] = trades_df["run_qty"].astype(float)
-                trades_df["avg_cost"] = trades_df["avg_cost"].astype(float)
-                trades_df["running_pnl"] = trades_df["running_pnl"].astype(float)
-                trades_df["trade_pnl"] = trades_df["trade_pnl"].astype(float)
-        except Exception:
-            pass
 
         with self._lock:
             self._holdings_df = holdings_df
@@ -153,7 +140,7 @@ class DataCache:
             if filters.iv_signal == "N/A":
                 df = df[(df["action_signal"].isna()) | (df["action_signal"].astype(str) == "N/A")]
             else:
-                df = df[df["action_signal"].astype(str) == filters.iv_signal]
+                df = df[df["action_signal"].astype(str).str.upper() == filters.iv_signal.upper()]
 
         if filters.zero_qty_only:
             df = df[df["qty"] <= 0]
@@ -214,7 +201,11 @@ class DataCache:
                 df = df[df["symbol"].astype(str).str.upper().str.contains(sym, na=False)]
 
         if filters.trade_type and filters.trade_type != "All":
-            df = df[df["type"].astype(str).str.upper() == filters.trade_type]
+            t_col = df["type"].astype(str).str.upper().str.strip()
+            if filters.trade_type == "BUY":
+                df = df[t_col.str.startswith("B")]
+            elif filters.trade_type == "SELL":
+                df = df[t_col.str.startswith("S")]
 
         if filters.start_date:
             df = df[df["date"].astype(str) >= filters.start_date]
@@ -234,9 +225,12 @@ class DataCache:
                 "total_pnl": 0.0,
             }
 
-        type_u = df["type"].astype(str).str.upper()
-        qty_buy = float(df.loc[type_u == "BUY", "qty"].sum())
-        qty_sell = float(df.loc[type_u == "SELL", "qty"].sum())
+        type_u = df["type"].astype(str).str.upper().str.strip()
+        is_buy = type_u.str.startswith("B")
+        is_sell = type_u.str.startswith("S")
+        
+        qty_buy = float(df.loc[is_buy, "qty"].sum())
+        qty_sell = float(df.loc[is_sell, "qty"].sum())
 
         # Convert fees and PnL to INR for summary metrics if "All" is selected
         if not df.empty:
@@ -253,8 +247,8 @@ class DataCache:
                 
             rates_series = df["currency"].apply(_get_rate) if "currency" in df.columns else pd.Series(1.0, index=df.index)
             
-            fee_buy = float((df.loc[type_u == "BUY", "fee"] * rates_series.loc[type_u == "BUY"]).sum())
-            fee_sell = float((df.loc[type_u == "SELL", "fee"] * rates_series.loc[type_u == "SELL"]).sum())
+            fee_buy = float((df.loc[is_buy, "fee"] * rates_series.loc[is_buy]).sum())
+            fee_sell = float((df.loc[is_sell, "fee"] * rates_series.loc[is_sell]).sum())
             total_pnl = float((df["trade_pnl"] * rates_series).sum())
         else:
             fee_buy = 0.0

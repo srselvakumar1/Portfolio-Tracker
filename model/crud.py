@@ -24,7 +24,7 @@ def add_trades_batch(trades: list):
         cursor = conn.cursor()
         for t in trades:
             if len(t) == 8:
-                sql = 'INSERT INTO trades (trade_id, broker, date, symbol, type, qty, price, fee, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "INR")'
+                sql = "INSERT INTO trades (trade_id, broker, date, symbol, type, qty, price, fee, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'INR')"
                 cursor.execute(sql, t)
             else:
                 sql = 'INSERT INTO trades (trade_id, broker, date, symbol, type, qty, price, fee, currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
@@ -102,8 +102,10 @@ def delete_holding_and_trades(broker: str, symbol: str):
         cursor = conn.cursor()
         cursor.execute("DELETE FROM trades WHERE broker = ? AND symbol = ?", (broker, symbol))
         cursor.execute("DELETE FROM holdings WHERE broker = ? AND symbol = ?", (broker, symbol))
-        cursor.execute("DELETE FROM marketdata WHERE symbol = ?", (symbol,))
-        cursor.execute("DELETE FROM assets WHERE symbol = ?", (symbol,))
+        # Keep the price data while another broker still trades this symbol
+        # (deleting it showed those holdings at a price of 0)
+        cursor.execute("DELETE FROM marketdata WHERE symbol = ? AND symbol NOT IN (SELECT DISTINCT symbol FROM trades)", (symbol,))
+        cursor.execute("DELETE FROM assets WHERE symbol = ? AND symbol NOT IN (SELECT DISTINCT symbol FROM trades)", (symbol,))
 
 def get_all_brokers() -> list:
     with db_session() as conn:
@@ -111,13 +113,25 @@ def get_all_brokers() -> list:
         cursor.execute("SELECT name FROM brokers ORDER BY name")
         return [row[0] for row in cursor.fetchall()]
 
-def add_broker(name: str):
+def get_broker_currencies() -> dict:
+    """Returns a dictionary mapping broker name to its default currency."""
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, currency FROM brokers")
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
+def add_broker(name: str, currency: str = "INR"):
     with db_session() as conn:
         cursor = conn.cursor()
         try:
-            cursor.execute("INSERT INTO brokers (name) VALUES (?)", (name,))
+            cursor.execute("INSERT INTO brokers (name, currency) VALUES (?, ?)", (name, currency))
         except sqlite3.IntegrityError:
             pass  # Already exists
+
+def update_broker_currency(name: str, currency: str):
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE brokers SET currency = ? WHERE name = ?", (currency, name))
 
 def delete_broker(name: str):
     """Delete a broker and all its associated trades and holdings (cascading)."""

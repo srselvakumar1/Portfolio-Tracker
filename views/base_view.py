@@ -1,75 +1,50 @@
 import tkinter as tk
-from tkinter import ttk
 from abc import ABC, abstractmethod
 import sys
-from datetime import datetime
 
-from ui_theme import ModernStyle
-
-from ui_widgets import ModernButton
-from ui_utils import center_window
+from ui.ui_theme import ModernStyle
 
 def _create_date_input(parent: tk.Misc, text_var: tk.StringVar) -> tk.Widget:
+    """Date input: custom popup date picker widget."""
+    from datetime import datetime as _DT
+    from ui.ui_widgets import PopupDatePicker
+
+    current = text_var.get().strip()
     try:
-        from tkcalendar import DateEntry
-        from datetime import datetime
+        init_dt = _DT.strptime(current, "%Y-%m-%d")
+    except Exception:
+        init_dt = _DT.now()
+        text_var.set(init_dt.strftime("%Y-%m-%d"))
 
-        # Guarantee a valid initial date before creating the widget
-        current = text_var.get().strip()
-        try:
-            init_dt = datetime.strptime(current, "%Y-%m-%d")
-        except Exception:
-            init_dt = datetime.now()
-            text_var.set(init_dt.strftime("%Y-%m-%d"))
+    container = tk.Frame(parent, bg=ModernStyle.BG_PRIMARY)
+    
+    # Text entry for the date
+    entry = tk.Entry(
+        container, textvariable=text_var, width=11,
+        font=ModernStyle.FONT_BODY, bg=ModernStyle.ENTRY_BG,
+        fg=ModernStyle.TEXT_PRIMARY, relief=tk.FLAT,
+        highlightthickness=1, highlightbackground=ModernStyle.BORDER_COLOR,
+        highlightcolor=ModernStyle.ACCENT_PRIMARY
+    )
+    entry.pack(side="left", fill="y", padx=(0, 2))
+    
+    def _open_picker():
+        top = parent.winfo_toplevel()
+        PopupDatePicker(top, text_var)
 
-        w = DateEntry(
-            parent,
-            textvariable=text_var,
-            date_pattern="yyyy-mm-dd",
-            width=12,
-            state="normal",
-            font=ModernStyle.FONT_BODY,
-            foreground="white",
-            background="#009668",
-            borderwidth=2,
-            relief=tk.SOLID,
-            # Calendar popup colours
-            headersforeground="#4D88EC",
-            headersbackground="#DBEAFE",
-            selectforeground="white",
-            selectbackground="#FF6B6B",
-            normalforeground="#000000",
-            normalbackground="#F0F0F0",
-            weekendforeground="#E5E5E5",
-            weekendbackground="#FF0000",
-            disabledbackground="#D3D3D3",
-            disabledforeground="#A9A9A9",
-            cursor="hand2",
-        )
-        try:
-            w.set_date(init_dt)
-        except Exception:
-            pass
-        
-        def _on_selected(event=None):
-            val = w.get()
-            if val:  # guard against empty intermediate events
-                text_var.set(val)
+    # Calendar button
+    btn = tk.Button(
+        container, text="📅", font=ModernStyle.FONT_BODY,
+        bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_ACCENT,
+        activebackground=ModernStyle.BG_SECONDARY,
+        relief=tk.FLAT, bd=0, padx=6, pady=0,
+        cursor="hand2", command=_open_picker
+    )
+    btn.pack(side="left", fill="y")
 
-        w.bind("<<DateEntrySelected>>", _on_selected)
+    return container
 
-        return w
 
-    except Exception as e:
-        return tk.Entry(
-            parent,
-            textvariable=text_var,
-            bg=ModernStyle.ENTRY_BG,
-            fg=ModernStyle.TEXT_PRIMARY,
-            font=ModernStyle.FONT_BODY,
-            relief=tk.FLAT,
-            width=12,
-        )
 
 def _enable_canvas_mousewheel(canvas: tk.Canvas, *, include_widget: tk.Widget | None = None) -> None:
     def _wheel(event):
@@ -148,7 +123,7 @@ class BaseView(tk.Frame, ABC):
         pass
     
     def add_gradient_header(self, container, title: str, subtitle: str, right_widget_func=None, show_divider: bool = True):
-        """Add a dynamic gradient header banner to the view.
+        """Add a dynamic gradient header banner to the view using GradientHeader.
         
         Args:
             container: The parent frame/canvas to pack the header into.
@@ -156,89 +131,14 @@ class BaseView(tk.Frame, ABC):
             subtitle: The subtitle text.
             right_widget_func: A callable that takes a parent frame and returns a widget to place on the right.
         """
-        header_canvas = tk.Canvas(
-            container, bg=ModernStyle.BG_PRIMARY, highlightthickness=0, height=75
-        )
-        header_canvas.pack(fill="x", padx=20, pady=(6, 4))
-
-        # Gradient colors: deep blue → teal
-        grad_start = (30, 58, 138)   # #1E3A8A
-        grad_end   = (13, 148, 136)  # #0D9488
-
-        right_frame = None
-        # Draw Title & Subtitle directly on the canvas for true 100% transparent background
-        header_canvas.create_text(
-            20, 22,
-            text=title,
-            fill="#FFFFFF",
-            font=ModernStyle.FONT_PAGE_TITLE,
-            anchor="w",
-            tags="header_content"
-        )
-        header_canvas.create_text(
-            20, 48,
-            text=subtitle,
-            fill="#94A3B8",
-            font=ModernStyle.FONT_BODY,
-            anchor="w",
-            tags="header_content"
-        )
-
-        def _draw_header_gradient(event=None):
-            w = event.width if event else header_canvas.winfo_width()
-            h = event.height if event else header_canvas.winfo_height()
-            if w < 10:
-                return
-            header_canvas.delete("gradient")
-            steps = max(1, w // 4)  # ~1 rect per 4px for performance
-            for i in range(steps):
-                t = i / max(1, steps - 1)
-                r = int(grad_start[0] + (grad_end[0] - grad_start[0]) * t)
-                g = int(grad_start[1] + (grad_end[1] - grad_start[1]) * t)
-                b = int(grad_start[2] + (grad_end[2] - grad_start[2]) * t)
-                color = f"#{r:02x}{g:02x}{b:02x}"
-                x0 = int(i * w / steps)
-                x1 = int((i + 1) * w / steps) + 1
-                header_canvas.create_rectangle(x0, 0, x1, h, fill=color, outline="", tags="gradient")
-
-            if right_frame:
-                t_right = max(0, min(1, (w - 70) / max(1, w)))
-                r = int(grad_start[0] + (grad_end[0] - grad_start[0]) * t_right)
-                g = int(grad_start[1] + (grad_end[1] - grad_start[1]) * t_right)
-                b = int(grad_start[2] + (grad_end[2] - grad_start[2]) * t_right)
-                right_color = f"#{r:02x}{g:02x}{b:02x}"
-                try:
-                    right_frame.config(bg=right_color)
-                    for child in right_frame.winfo_children():
-                        try:
-                            child.config(bg=right_color)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-            header_canvas.tag_raise("header_content")
-
-        if right_widget_func:
-            right_frame = tk.Frame(header_canvas, bg="#0D9488")
-            right_widget_func(right_frame)
-            header_canvas.create_window(
-                0, 37, window=right_frame, anchor="e", tags=("header_content", "right_hdr")
-            )
-
-        def _reposition_right(event=None):
-            w = event.width if event else header_canvas.winfo_width()
-            if w > 10 and right_frame:
-                header_canvas.coords("right_hdr", w - 20, 37)
-                
-        header_canvas.bind("<Configure>", lambda e: (_draw_header_gradient(e), _reposition_right(e)), add="+")
+        import re
+        from ui.ui_widgets import GradientHeader
+        # No emoji in titles: the clean title reads better on the gradient
+        title = re.sub(r"^[^\w(]+", "", title).strip() or title
+        header = GradientHeader(container, title=title, subtitle=subtitle, right_widget_func=right_widget_func)
+        header.pack(fill="x", padx=20, pady=(6, 4))
         
-        # Thin accent divider under header
-        if show_divider:
-            tk.Frame(container, bg=ModernStyle.BRAND_GOLD, height=2).pack(
-                fill="x", padx=20, pady=(4, 0)
-            )
-        return header_canvas
+        return header   # (no gold divider: the rounded banner stands on its own)
 
     def show(self) -> None:
         """Called when view becomes visible. Override to refresh data."""

@@ -1,468 +1,501 @@
-"""
-Help view for TKinter-based PTracker application.
+"""Help page: one scrollable, read-only text with colourful sections.
+
+The whole guide is a single tk.Text widget. Tags give each section its own
+coloured heading band, bold coloured key words, striped tables (tab stops) and
+bulleted lists. One widget instead of ~470 labels and frames makes the page
+open at once, and every section is always open (no expand/collapse).
+
+To change the guide, edit SECTIONS below. Blocks:
+    ("p", text)                  paragraph; **words** become bold, in the section colour
+    ("sub", text)                small heading inside a section
+    ("bullets", [text, ...])     bulleted list
+    ("table", header, rows)      table; the LAST column may be long (it wraps)
+    ("formula", text)            formula line on a tinted band
+    ("note", text)               small italic remark
 """
 
+import re
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 
-from views.base_view import BaseView, _enable_canvas_mousewheel
-from ui_theme import ModernStyle
-from ui_widgets import ModernButton
+from views.base_view import BaseView
+from ui.ui_theme import ModernStyle
+from views.tax_report_view import MenuPill
+from model.applog import log
+
+_KW = re.compile(r"(\*\*.+?\*\*)")
+
+# ── The guide ────────────────────────────────────────────────────────────────
+INTRO = (
+    "**PTracker** keeps your trades and works out your holdings, profit and loss, XIRR and "
+    "capital-gains tax, with live prices. Every section of this guide is always open: scroll "
+    "down, use **Jump to a section** at the top right, or click a name below."
+)
+
+SECTIONS = [
+    ("shortcuts", "⌨️  Keyboard shortcuts and handy tricks", "blue", [
+        ("p", "Hold **Option** (the **Alt** key) and press a number to open one of the first "
+              "nine pages in the sidebar:"),
+        ("table", ["Keys", "Opens"], [
+            ["Option + 1", "Dashboard"],
+            ["Option + 2", "My Holdings"],
+            ["Option + 3", "Trade Entry"],
+            ["Option + 4", "Trade History"],
+            ["Option + 5", "Tax Report"],
+            ["Option + 6", "P&L Report"],
+            ["Option + 7", "Watchlist"],
+            ["Option + 8", "Valuation"],
+            ["Option + 9", "Financial News"],
+        ]),
+        ("note", "Settings and Help have no shortcut: click them in the sidebar."),
+        ("bullets", [
+            "**Sort a table**: click a column heading; click it again to reverse the order.",
+            "**Copy from a table**: right-click (or Control-click) a row and choose **Copy Selected "
+            "Row** or **Copy All Rows**, then paste into Excel or Numbers.",
+            "**Copy from this page**: drag over the text and press **⌘C**.",
+        ]),
+    ]),
+
+    ("screens", "🧭  The screens", "purple", [
+        ("table", ["Screen", "What it is for"], [
+            ["**Dashboard**", "A summary of the whole portfolio: key numbers, best and worst performers and insights."],
+            ["**My Holdings**", "What you own now, per broker. Double-click a row to see the trades behind it."],
+            ["**Trade Entry**", "Add a trade by hand, or import many at once from a CSV file (see Bulk import)."],
+            ["**Trade History**", "Search and filter every trade. Double-click a trade to edit it; select several to delete them together."],
+            ["**Tax Report**", "Realised capital gains for a financial year (see Tax Report below)."],
+            ["**P&L Report**", "Invested, current value, profit and loss and XIRR for each broker, with a chart and a PDF."],
+            ["**Watchlist**", "Shares you are watching, with fundamental and technical numbers."],
+            ["**Valuation**", "Intrinsic value from a discounted-cash-flow (DCF) estimate, with Accumulate / Hold / Reduce signals."],
+            ["**Financial News**", "Market news headlines."],
+            ["**Settings**", "Brokers, appearance, backups, the data cache, and deleting data."],
+        ]),
+    ]),
+
+    ("tax", "🧾  Tax Report", "green", [
+        ("p", "The Tax Report lists the **capital gains you have realised** by selling shares, for one "
+              "**financial year** (1 April to 31 March) or for **All Time**. Choose **All**, **INR** or "
+              "**JPY** at the top right, and the year next to it."),
+        ("sub", "The four cards"),
+        ("bullets", [
+            "**Short-term gains**: INR sales of shares held **12 months or less**.",
+            "**Long-term gains**: INR sales of shares held **more than 12 months**.",
+            "**Not split (JPY)**: Japanese sales. Japan taxes listed-share gains at **one flat rate** "
+            "(20.315%), so they are not split into short and long term.",
+            "**Net realised gains**: every row added up. This is **before** the ₹1.25 lakh long-term "
+            "exemption and before losses are set off, so it is not the amount you pay tax on.",
+        ]),
+        ("sub", "The table"),
+        ("p", "Each row is **one matched piece of a sale**. If one sale used shares from three different "
+              "buys, you see three rows, each with its own buy date, days held and term. Gains are green "
+              "with ▲, losses red with ▼."),
+        ("sub", "How the matching works (FIFO: first in, first out)"),
+        ("table", ["Step", "What happens"], [
+            ["**1**", "Buys are queued oldest first, **separately for each broker, symbol and currency**. "
+                      "A sale is never matched with shares bought at another broker."],
+            ["**2**", "Each sale uses up the **oldest shares first**."],
+            ["**3**", "Days held = sell date − buy date. For INR, **more than 12 months** is long-term."],
+            ["**4**", "Gain = sale value − cost − its share of the buy fee − its share of the sell fee. Fees "
+                      "are shared out by the number of shares, so **each fee is counted exactly once**, "
+                      "even when one buy is sold in several parts."],
+        ]),
+        ("sub", "Indian tax rates for listed shares (sales from 23 July 2024)"),
+        ("table", ["Type", "Held for", "Tax rate"], [
+            ["**Short-term (STCG)**", "12 months or less", "**20%**"],
+            ["**Long-term (LTCG)**", "more than 12 months", "**12.5%** on long-term gains above **₹1.25 lakh** in a year"],
+        ]),
+        ("note", "Plus surcharge and 4% cess. These rates are for listed shares and equity mutual funds on "
+                 "which STT is paid (Sections 111A and 112A). Sales before 23 July 2024 used the old rates: "
+                 "15% short-term, and 10% long-term above ₹1 lakh."),
+        ("sub", "Messages you may see"),
+        ("bullets", [
+            "**No buy found** (amber rows, listed first): a sale with no earlier buy at the same broker, or "
+            "more shares sold than bought. It is **not counted** in the totals. Usually the buy was entered "
+            "under another broker, or is missing.",
+            "**Bad data** (amber rows): a trade whose date or numbers could not be read, for example a date "
+            "written 15/01/2024. It is left out; correct it in **Trade History** (dates are YYYY-MM-DD).",
+            "**Red message**: the report could not be worked out at all. The cards then show — rather than "
+            "an older year's figures.",
+            "**All currencies**: JPY amounts are converted to ₹ at **today's exchange rate**, because past "
+            "rates are not stored. Choose **INR** or **JPY** for exact figures in each currency.",
+            "**JPY and the tax year**: Japan's tax year is January to December, but the year picker uses "
+            "India's April to March year.",
+        ]),
+        ("sub", "Tax-harvesting ideas"),
+        ("table", ["Situation", "Idea", "Why it helps"], [
+            ["A holding is at a loss", "Sell before 31 March", "Short-term losses reduce short- or long-term gains; long-term losses reduce long-term gains only."],
+            ["Exemption not used up", "Book long-term gains up to ₹1.25 lakh", "No tax on that part, and buying back raises your cost for later."],
+            ["Shares almost 12 months old", "Wait until they pass 12 months", "12.5% long-term tax instead of 20% short-term."],
+        ]),
+        ("sub", "Please note"),
+        ("bullets", [
+            "This report is a **guide, not tax advice**. Check the figures with your CA before filing "
+            "(Schedule CG of your income-tax return).",
+            "Shares bought **before 1 February 2018**: the law lets you use the higher of your cost and the "
+            "price on 31 January 2018 (grandfathering). PTracker uses your actual buy price.",
+            "The ₹1.25 lakh exemption is for listed equity shares and equity mutual funds (Section 112A).",
+            "My Holdings and the P&L Report work out realised P&L from your **average buy price**, without "
+            "fees, so their realised figures can differ a little from this report.",
+        ]),
+    ]),
+
+    ("pnl", "📊  P&L Report", "amber", [
+        ("p", "The P&L Report shows, **for each broker**, how much you invested, what it is worth now, and "
+              "your profit or loss. Choose **All**, **INR** or **JPY** at the top right."),
+        ("bullets", [
+            "**Cards**: Total Invested, Current Value, Overall P&L, Overall XIRR and Overall CAGR. With "
+            "**All**, the cards are in ₹ and JPY amounts are converted at today's exchange rate (the line "
+            "under the cards shows the rate).",
+            "**Table**: one row per broker, grouped by currency, with a TOTAL row. **Unrealised** P&L is on "
+            "shares you still hold; **Realised** P&L is on shares you have sold. The Loss columns add up "
+            "only the holdings that are, or were sold, at a loss.",
+            "**Chart**: invested (blue) against current value (**green** when above what you invested, "
+            "**red** when below). Point at a bar to see its amount.",
+            "**Save PDF**: saves a printable report with the summary, the chart and every broker's holdings. "
+            "It is made in the background; the line under the cards says when it is saved.",
+        ]),
+    ]),
+
+    ("import", "📥  Bulk import (CSV files)", "teal", [
+        ("p", "On **Trade Entry** you can import a CSV file, for example one exported from your broker. "
+              "Use these columns:"),
+        ("table", ["Column", "Needed?", "Also accepted", "Notes"], [
+            ["**date**", "Yes", "trade_date", "**YYYY-MM-DD** (2024-03-25) or **DD-MM-YYYY** (25-03-2024)"],
+            ["**symbol**", "Yes", "–", "Ticker, for example RELIANCE.NS"],
+            ["**type**", "Yes", "trade_type", "BUY or SELL (capitals or not)"],
+            ["**qty**", "Yes", "quantity", "Number of shares, more than 0"],
+            ["**price**", "Yes", "–", "₹, $ and commas are removed for you"],
+            ["**trade_id**", "No", "–", "Stops the same row being imported twice"],
+            ["**broker**", "No", "–", "If missing, the broker chosen on screen is used"],
+        ]),
+        ("bullets", [
+            "**Rejected rows are listed with the reason** (for example a bad date or a missing price); "
+            "all the other rows are imported.",
+            "Headings such as 'Trade Date' or 'Quantity' are recognised automatically.",
+            "A **backup** is saved before every import, so you can undo it with **Restore…** in Settings.",
+        ]),
+    ]),
+
+    ("backups", "💾  Backups", "purple", [
+        ("p", "Find these in **Settings → Data Backup & Export**."),
+        ("bullets", [
+            "**Automatic daily backup**: one copy a day when PTracker starts; the last **30** are kept.",
+            "**Safety backup**: a copy is also saved **before every delete, wipe, import or restore**.",
+            "**Back Up Now**: makes a copy straight away. These are never deleted automatically.",
+            "**Restore…**: go back to a backup. Your current data is saved first, so a restore can be "
+            "undone too.",
+            "**Show Backups**: opens the folder with the backup files in Finder.",
+            "**Delete All Data** (Danger Zone): wipes trades, market data and holdings (brokers are kept). "
+            "You must **type DELETE** to confirm, and a backup is saved first.",
+        ]),
+    ]),
+
+    ("appearance", "🎨  Appearance", "blue", [
+        ("p", "In **Settings → Appearance** choose:"),
+        ("bullets", [
+            "**Theme**: Light, Dark, or **Match macOS** (follows your Mac's light or dark setting).",
+            "**Text size**: Normal, Large or Extra large.",
+            "Changes apply **after you restart** PTracker.",
+        ]),
+    ]),
+
+    ("formulas", "🧮  Formulas and worked examples", "green", [
+        ("sub", "Average buy price"),
+        ("formula", "Average buy price = cost of the shares you still hold ÷ number of shares held"),
+        ("note", "Fees are not included here; they are counted in XIRR and in the Tax Report."),
+        ("sub", "Unrealised P&L (shares you still hold)"),
+        ("formula", "Unrealised P&L = (current price − average buy price) × shares held"),
+        ("table", ["Date", "Type", "Qty", "Price", "Current", "Unrealised P&L"], [
+            ["2023-01-01", "BUY", "10", "₹100", "₹120", "**+₹200**"],
+            ["2023-01-05", "BUY", "5", "₹110", "₹120", "**+₹50**"],
+            ["Total", "–", "15", "₹103.33 average", "₹120", "**+₹250**"],
+        ]),
+        ("sub", "Realised P&L (shares you have sold)"),
+        ("formula", "Realised P&L = (sell price − average buy price) × shares sold"),
+        ("table", ["Date", "Action", "Qty", "Price", "Average cost", "Realised"], [
+            ["2023-01-01", "BUY", "10", "₹100", "–", "–"],
+            ["2023-02-01", "SELL", "5", "₹150", "₹100", "**+₹250**"],
+            ["Left", "–", "5", "–", "₹100", "–"],
+        ]),
+        ("sub", "CAGR (compound annual growth rate)"),
+        ("formula", "CAGR = (ending value ÷ starting value) ^ (1 ÷ years) − 1"),
+        ("table", ["Year", "Invested", "Value", "Total return", "CAGR"], [
+            ["Start", "₹10,000", "₹10,000", "–", "–"],
+            ["Year 1", "₹10,000", "₹11,500", "15%", "**15.0%**"],
+            ["Year 3", "₹10,000", "₹15,000", "50%", "**14.47%**"],
+        ]),
+        ("sub", "XIRR"),
+        ("p", "Your **yearly return** worked out from the date and amount of every buy and sale (fees "
+              "included) plus today's value, like a bank's annual interest rate. Money added later counts "
+              "for less time, which CAGR cannot show."),
+        ("sub", "Where each number is worked out"),
+        ("table", ["Number", "Worked out per", "Why"], [
+            ["Running quantity", "trade", "Changes with each trade"],
+            ["Cost", "trade", "Builds up trade by trade"],
+            ["Realised P&L", "trade", "Only happens on a SELL"],
+            ["Fees", "trade", "Stored with each trade"],
+            ["Cash flows", "trade", "Collected for XIRR"],
+            ["Average price", "holding", "From the final totals"],
+            ["Unrealised P&L", "holding", "Uses today's price"],
+            ["Running P&L", "holding", "Realised plus unrealised"],
+            ["XIRR / CAGR", "holding", "Uses the whole cash-flow history"],
+        ]),
+    ]),
+
+    ("fees", "💸  Trade fees (Indian shares, NSE delivery)", "amber", [
+        ("p", "Charges for a delivery trade on NSE, checked in April 2026. The sample columns are for a "
+              "**₹1,00,000** trade."),
+        ("table", ["Charge", "BUY", "SELL", "Rate"], [
+            ["**Brokerage**", "₹1.00", "₹1.00", "Flat ₹1 per order (Zerodha charges ₹0 for delivery)"],
+            ["**STT**", "₹100.00", "₹100.00", "0.1% of the trade value, on both sides"],
+            ["**Exchange charge**", "₹2.97", "₹2.97", "₹2.97 per lakh (0.00297%, NSE cash market)"],
+            ["**SEBI fee**", "₹0.10", "₹0.10", "₹10 per crore (0.0001%)"],
+            ["**Stamp duty**", "₹15.00", "–", "0.015%, on BUY only"],
+            ["**DP charge**", "–", "₹15.34", "₹13 + 18% GST, on SELL only"],
+            ["**GST**", "₹0.73", "₹0.73", "18% of brokerage + exchange charge + SEBI fee"],
+            ["**Total**", "**₹119.80**", "**₹120.14**", "IPFT (₹0.01 per crore) is too small to include"],
+        ]),
+        ("formula", "BUY total = brokerage + STT + exchange charge + SEBI fee + stamp duty + GST"),
+        ("formula", "SELL total = brokerage + STT + exchange charge + SEBI fee + DP charge + GST"),
+    ]),
+
+    ("valuations", "⚖️  Valuations and action signals", "teal", [
+        ("p", "The **intrinsic value** is a discounted-cash-flow estimate: earnings per share (EPS) grow "
+              "**12%** a year for 5 years, each year is discounted at **10%**, and a final value of "
+              "**15 ×** the year-5 EPS is added."),
+        ("table", ["Year", "Projected EPS", "Discount factor", "Present value"], [
+            ["Start", "₹10.00", "1.000", "–"],
+            ["Year 1", "₹11.20", "0.909", "₹10.18"],
+            ["Year 5", "₹17.62", "0.621", "₹10.94"],
+            ["Final value", "₹264.35", "0.621", "₹164.14"],
+            ["**Intrinsic value**", "–", "–", "**₹216.94** (all five years plus the final value)"],
+        ]),
+        ("bullets", [
+            "**ACCUMULATE**: the market price is below **70%** of the intrinsic value.",
+            "**HOLD**: the price is between 70% and 110% of the intrinsic value.",
+            "**REDUCE**: the price is above **110%** of the intrinsic value.",
+        ]),
+    ]),
+
+    ("watchlist", "👁  Watchlist benchmarks", "green", [
+        ("p", "The Watchlist shows fundamental and technical numbers for each symbol. These rules of thumb "
+              "help you judge them."),
+        ("sub", "Value"),
+        ("table", ["Number", "Look for", "What it means"], [
+            ["**P/E ratio**", "Compare with the industry", "Price ÷ earnings: cheap or expensive? A very low P/E can be a value trap."],
+            ["**PEG ratio**", "Below 1 (best) or 2", "P/E ÷ growth: is the P/E justified by the company's growth?"],
+            ["**EPS**", "Double digits (> 10)", "The profit for each share."],
+            ["**Debt to equity**", "Below 1", "Borrowing ÷ shareholders' money: is the company over-borrowed?"],
+            ["**Book value**", "Compare with the price", "Net assets per share: roughly what is left if the company closed."],
+            ["**Intrinsic value**", "Above the market price", "The estimated fair value of the business."],
+        ]),
+        ("sub", "Profitability"),
+        ("table", ["Number", "Look for", "What it means"], [
+            ["**ROE**", "Double digits", "Return on equity: how well shareholders' money earns a profit."],
+            ["**ROCE**", "Double digits", "Return on capital employed: profit on all the money used (equity + debt)."],
+            ["**OPM**", "Above 10–15%", "Operating profit margin: what is left of sales after running costs."],
+            ["**Free cash flow**", "Positive", "Cash left after all expenses and investment."],
+            ["**Inventory days**", "Lower is better", "Days it takes to turn stock into sales."],
+        ]),
+        ("sub", "Growth, owners and price trend"),
+        ("table", ["Number", "Look for", "What it means"], [
+            ["**Sales growth**", "Double digits", "Revenue growth, year on year and quarter on quarter."],
+            ["**Profit growth**", "Double digits", "Net profit growth; ideally at least as fast as sales."],
+            ["**Promoter holding**", "High and steady", "The share of the company owned by its founders."],
+            ["**Pledged shares**", "Zero", "Founders' shares given as security for loans."],
+            ["**FII / DII holding**", "Rising or steady", "Ownership by foreign and Indian institutions (funds)."],
+            ["**Order book**", "Large", "Orders still to be delivered: a guide to future sales."],
+            ["**50 and 200 DMA**", "Price above them", "Moving averages: is the share in a long-term uptrend?"],
+            ["**RSI**", "30 low / 70 high", "Relative strength: is the share oversold or overbought?"],
+            ["**Volume**", "Rising", "Shows that a price move has real buying or selling behind it."],
+        ]),
+    ]),
+
+    ("market", "📡  Prices and market data", "purple", [
+        ("bullets", [
+            "Prices come from **Yahoo Finance** (yfinance). Indian symbols end in **.NS** (NSE) or "
+            "**.BO** (BSE); Japanese ones in **.T** (Tokyo), for example 7203.T.",
+            "Prices refresh **in the background**, so the window stays responsive. The sidebar shows when "
+            "they were last updated.",
+            "PTracker is for your own records: check important figures against your broker's statements.",
+        ]),
+    ]),
+]
+
+
+def _palette() -> dict:
+    """Section colour name -> (text colour, soft tint), from the active theme."""
+    return {
+        "blue": (ModernStyle.TEXT_ACCENT, ModernStyle.ACCENT_PRIMARY_PALE),
+        "purple": (ModernStyle.TEXT_PURPLE, ModernStyle.ACCENT_PURPLE_PALE),
+        "teal": (ModernStyle.INFO, ModernStyle.INFO_PALE),
+        "green": (ModernStyle.SUCCESS, ModernStyle.SUCCESS_PALE),
+        "amber": (ModernStyle.WARNING, ModernStyle.WARNING_PALE),
+        "red": (ModernStyle.ERROR, ModernStyle.ERROR_PALE),
+    }
+
+
+def _plain(title: str) -> str:
+    """Section title without its leading emoji (for menus and links)."""
+    return title.split("  ", 1)[-1] if "  " in title else title
+
 
 class HelpView(BaseView):
-    """Help and documentation view."""
-    
-    def build(self):
-        """Build help documentation view (rich, sectioned like the Flet help page)."""
+    """Help and documentation: one read-only, word-wrapped, scrollable text."""
 
-        self._help_font_scale = 2
-        self._section_map = {}  # Tracks section_id -> widget for navigation
+    def build(self):
+        self._titles = {_plain(title): sid for sid, title, _c, _b in SECTIONS}
 
         def _build_right(parent):
-            tk.Label(parent, text="Text Size", fg="#FFFFFF", bg="#0D9488", font=ModernStyle.FONT_SMALL).pack(side="left", padx=(0, 8))
-            ModernButton(parent, text="-", command=lambda: self._help_adjust_font(-1), bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY, canvas_bg="#0D9488", width=42, height=34).pack(side="left", padx=(0, 6))
-            ModernButton(parent, text="+", command=lambda: self._help_adjust_font(1), bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY, canvas_bg="#0D9488", width=42, height=34).pack(side="left")
+            MenuPill(parent, values=list(self._titles), text="Jump to a section",
+                     command=lambda title: self.jump_to(self._titles[title])).pack(side="left")
 
         self.add_gradient_header(
             self,
-            "❓ Help & Documentation",
-            "Comprehensive documentation and formulas used in PTracker.",
-            right_widget_func=_build_right
+            "❓ Help & Guide",
+            "How PTracker works and what each screen shows.",
+            right_widget_func=_build_right,
         )
 
-        # Stationary navigation bar for quick links
-        self._nav_bar = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        self._nav_bar.pack(fill="x", padx=15, pady=(0, 10))
+        card = tk.Frame(self, bg=ModernStyle.BG_SECONDARY, highlightthickness=1,
+                        highlightbackground=ModernStyle.BORDER_COLOR)
+        card.pack(fill="both", expand=True, padx=20, pady=(10, 16))
 
-        # Scrollable container
-        self.canvas = tk.Canvas(self, bg=ModernStyle.BG_PRIMARY, highlightthickness=0)
-        vscroll = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vscroll.set)
-        vscroll.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True, padx=15, pady=0)
+        self.text = tk.Text(
+            card, wrap="word", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY,
+            font=ModernStyle.FONT_BODY, relief="flat", borderwidth=0, highlightthickness=0,
+            padx=26, pady=14, spacing2=3, cursor="arrow", insertwidth=0,
+            selectbackground=ModernStyle.ACCENT_PRIMARY, selectforeground=ModernStyle.TEXT_ON_ACCENT,
+            inactiveselectbackground=ModernStyle.ACCENT_PRIMARY_PALE,
+        )
+        vsb = ttk.Scrollbar(card, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        # Mouse-wheel and trackpad scrolling come with tk.Text itself.
 
-        self._help_content = tk.Frame(self.canvas, bg=ModernStyle.BG_PRIMARY)
-        cid = self.canvas.create_window((0, 0), window=self._help_content, anchor="nw")
+        self._configure_tags()
+        self._fill()
+        self.text.configure(state="disabled")    # read-only (text can still be selected and copied)
 
-        def _on_cfg(_e=None):
-            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-            self.canvas.itemconfigure(cid, width=self.canvas.winfo_width())
+    # ── styles ───────────────────────────────────────────────────────────────
+    def _configure_tags(self):
+        t = self.text
+        self._font_body = tkfont.Font(font=ModernStyle.FONT_BODY)
+        self._font_bold = tkfont.Font(font=ModernStyle.FONT_BODY_BOLD)
 
-        self._help_content.bind("<Configure>", _on_cfg)
-        self.canvas.bind("<Configure>", _on_cfg)
+        # Base tags first: tags configured later win where they overlap.
+        t.tag_configure("p", lmargin1=4, lmargin2=4, spacing3=10)
+        t.tag_configure("intro", font=ModernStyle.FONT_BODY, lmargin1=4, lmargin2=4, spacing3=8)
+        t.tag_configure("gap", font=ModernStyle.FONT_SMALL, spacing1=6)
+        t.tag_configure("h", font=ModernStyle.FONT_SECTION_LABEL, lmargin1=14, lmargin2=14,
+                        spacing1=7, spacing3=7)
+        t.tag_configure("sub", font=ModernStyle.FONT_HEADING, lmargin1=4, lmargin2=4, spacing1=10, spacing3=5)
+        bullet_x = self._font_body.measure("•") + 22
+        t.tag_configure("bullet", lmargin1=12, lmargin2=12 + bullet_x, tabs=(12 + bullet_x,), spacing3=5)
+        t.tag_configure("formula", font=ModernStyle.FONT_BODY_BOLD, foreground=ModernStyle.TEXT_PURPLE,
+                        background=ModernStyle.BG_TERTIARY, lmargin1=16, lmargin2=16,
+                        lmargincolor=ModernStyle.BG_TERTIARY, spacing1=5, spacing3=5)
+        t.tag_configure("note", font=ModernStyle.FONT_ITALIC_MD, foreground=ModernStyle.TEXT_SECONDARY,
+                        lmargin1=4, lmargin2=4, spacing1=4, spacing3=10)
+        t.tag_configure("td", spacing1=4, spacing3=4)
+        t.tag_configure("odd", background=ModernStyle.BG_TERTIARY, lmargincolor=ModernStyle.BG_TERTIARY)
+        t.tag_configure("th", font=ModernStyle.FONT_TABLE_BOLD, foreground=ModernStyle.TABLE_HEADER_FG,
+                        background=ModernStyle.TABLE_HEADER_BG, lmargincolor=ModernStyle.TABLE_HEADER_BG,
+                        spacing1=5, spacing3=5)
+        t.tag_configure("tbl_end", font=ModernStyle.FONT_SMALL, spacing3=4)
 
-        # Mouse wheel scrolling over the help content
-        _enable_canvas_mousewheel(self.canvas, include_widget=self._help_content)
+        # Section colours: heading band, plain colour, and bold key words
+        for name, (fg, tint) in _palette().items():
+            t.tag_configure(f"h_{name}", foreground=fg, background=tint, lmargincolor=tint)
+            t.tag_configure(f"c_{name}", foreground=fg)
+        for name, (fg, _tint) in _palette().items():
+            t.tag_configure(f"kw_{name}", foreground=fg, font=ModernStyle.FONT_BODY_BOLD)
+            t.tag_configure(f"link_{name}", foreground=fg, font=ModernStyle.FONT_BODY_BOLD, underline=True)
 
-        # Build content
-        self._help_text_widgets: list[tk.Widget] = []
-        self._help_title_widgets: list[tk.Widget] = []
+    # ── content ──────────────────────────────────────────────────────────────
+    def _fill(self):
+        t = self.text
+        segs = []
 
-        self._build_help_sections(self._help_content)
-        self._build_quick_navigation()
-        self._help_apply_font_scale()
+        def add(s, *tags):
+            segs.extend((s, tags))
 
-    def _help_adjust_font(self, delta: int) -> None:
-        self._help_font_scale = max(-3, min(6, int(self._help_font_scale) + int(delta)))
-        self._help_apply_font_scale()
+        def rich(s, base, colour):
+            for part in _KW.split(s):
+                if part.startswith("**") and part.endswith("**") and len(part) > 4:
+                    add(part[2:-2], *base, f"kw_{colour}")
+                elif part:
+                    add(part, *base)
 
-    def _help_apply_font_scale(self) -> None:
-        # Scale base fonts by +/- a few points.
+        rich(INTRO + "\n", ("intro",), "blue")
+        add("Contents:  ", "intro", "kw_blue")
+        for i, (sid, title, colour, _blocks) in enumerate(SECTIONS):
+            tag = f"goto_{sid}"
+            add(_plain(title), "intro", f"link_{colour}", tag)
+            if i < len(SECTIONS) - 1:
+                add("   ·   ", "intro")
+            t.tag_bind(tag, "<Button-1>", lambda _e, s=sid: self.jump_to(s))
+            t.tag_bind(tag, "<Enter>", lambda _e: t.configure(cursor="hand2"))
+            t.tag_bind(tag, "<Leave>", lambda _e: t.configure(cursor="arrow"))
+        add("\n", "intro")
+        t.insert("end", *segs)
+
+        for sid, title, colour, blocks in SECTIONS:
+            segs = []
+            add("\n", "gap")
+            t.insert("end", *segs)
+            t.mark_set(f"sec_{sid}", "end-1c")
+            t.mark_gravity(f"sec_{sid}", "left")
+            segs = []
+            add(title + "\n", "h", f"h_{colour}")
+            for block in blocks:
+                kind = block[0]
+                if kind == "p":
+                    rich(block[1] + "\n", ("p",), colour)
+                elif kind == "sub":
+                    add(block[1] + "\n", "sub", f"c_{colour}")
+                elif kind == "note":
+                    add(block[1] + "\n", "note")
+                elif kind == "formula":
+                    add(block[1] + "\n", "formula")
+                elif kind == "bullets":
+                    for item in block[1]:
+                        add("•\t", "bullet", f"kw_{colour}")
+                        rich(item + "\n", ("bullet",), colour)
+                    add("\n", "tbl_end")
+                elif kind == "table":
+                    self._table(add, rich, block[1], block[2], colour)
+            t.insert("end", *segs)
+
+    def _table(self, add, rich, header, rows, colour):
+        """Striped table using tab stops; the last column wraps under itself."""
+        n = len(header)
+        lm = 12
+        tabs, x = [], lm
+        for c in range(n - 1):
+            cells = [_KW.sub(lambda m: m.group(0)[2:-2], str(r[c])) for r in rows]
+            width = max([self._font_bold.measure(header[c])] + [self._font_bold.measure(s) for s in cells])
+            x += width + 30
+            tabs.append(x)
+        tag = f"tbl_{id(rows)}"
+        self.text.tag_configure(tag, tabs=tuple(tabs), lmargin1=lm, lmargin2=tabs[-1] if tabs else lm, rmargin=12)
+        self.text.tag_lower(tag)     # colours and fonts of the other tags win
+        add("\t".join(header) + "\n", tag, "th")
+        for i, row in enumerate(rows):
+            base = (tag, "td") + (("odd",) if i % 2 else ())
+            for c, cell in enumerate(row):
+                rich(str(cell) + ("\t" if c < n - 1 else "\n"), base, colour)
+        add("\n", "tbl_end")
+
+    # ── navigation ───────────────────────────────────────────────────────────
+    def jump_to(self, section_id: str) -> None:
+        """Scroll so the section's heading is at the top."""
+        t = self.text
         try:
-            base = int(ModernStyle.FONT_BODY[1])
-            small = int(ModernStyle.FONT_SMALL[1])
-            heading = int(ModernStyle.FONT_SUBHEADING[1])
-        except Exception:
-            base, small, heading = 11, 10, 12
-        s = int(self._help_font_scale)
-        f_body = (ModernStyle.FONT_FAMILY, max(9, base + s))
-        f_small = (ModernStyle.FONT_FAMILY, max(8, small + s))
-        f_head = (ModernStyle.FONT_FAMILY, max(10, heading + s), "bold")
-
-        for w in getattr(self, "_help_text_widgets", []):
-            try:
-                w.configure(font=f_body)
-            except Exception:
-                pass
-        for w in getattr(self, "_help_title_widgets", []):
-            try:
-                w.configure(font=f_head)
-            except Exception:
-                pass
-
-    def _help_card(self, parent: tk.Misc, title: str, section_id: str | None = None) -> tk.Frame:
-        card = tk.Frame(parent, bg=ModernStyle.BG_SECONDARY, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1)
-        card.pack(fill="x", pady=(0, 12))
-        
-        if section_id:
-            self._section_map[section_id] = card
-
-        title_lbl = tk.Label(card, text=title, fg=ModernStyle.ACCENT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_HEADING)
-        title_lbl.pack(anchor="w", padx=12, pady=(10, 6))
-        self._help_title_widgets.append(title_lbl)
-        inner = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
-        inner.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        return inner
-
-    def _help_paragraph(self, parent: tk.Misc, text: str) -> tk.Label:
-        lbl = tk.Label(
-            parent,
-            text=text,
-            fg=ModernStyle.TEXT_SECONDARY,
-            bg=ModernStyle.BG_SECONDARY,
-            font=ModernStyle.FONT_BODY,
-            justify="left",
-            wraplength=1100,
-        )
-        lbl.pack(anchor="w", pady=(0, 8))
-        self._help_text_widgets.append(lbl)
-        return lbl
-
-    def _help_item(self, parent: tk.Misc, title: str, desc: str) -> None:
-        t = tk.Label(parent, text=title, fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SUBHEADING)
-        t.pack(anchor="w", pady=(8, 2))
-        self._help_title_widgets.append(t)
-        self._help_paragraph(parent, desc)
-
-    def _help_table(self, parent: tk.Misc, cols: list[str], rows: list[list[str]]) -> None:
-        wrap = tk.Frame(parent, bg=ModernStyle.BG_SECONDARY, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1)
-        wrap.pack(fill="x", pady=(6, 0))
-
-        grid = tk.Frame(wrap, bg=ModernStyle.BG_SECONDARY)
-        grid.pack(fill="x", padx=10, pady=10)
-
-        # Header
-        for c, name in enumerate(cols):
-            grid.grid_columnconfigure(c, weight=1, uniform="ht")
-            h = tk.Label(grid, text=name, fg=ModernStyle.TEXT_ON_ACCENT, bg=ModernStyle.ACCENT_PRIMARY, font=ModernStyle.FONT_SMALL)
-            h.grid(row=0, column=c, sticky="ew", padx=(0, 6 if c < len(cols) - 1 else 0))
-            self._help_text_widgets.append(h)
-
-        # Rows
-        for r_i, r in enumerate(rows):
-            bg = ModernStyle.BG_PRIMARY if (r_i % 2 == 0) else ModernStyle.BG_SECONDARY
-            for c_i, val in enumerate(r):
-                cell = tk.Label(grid, text=str(val), fg=ModernStyle.TEXT_SECONDARY, bg=bg, font=ModernStyle.FONT_SMALL, justify="left", wraplength=240)
-                cell.grid(row=r_i + 1, column=c_i, sticky="ew", padx=(0, 6 if c_i < len(cols) - 1 else 0), pady=(4, 0))
-                self._help_text_widgets.append(cell)
-
-    def _scroll_to_section(self, section_id: str) -> None:
-        """Scroll the canvas to the specified section widget."""
-        widget = self._section_map.get(section_id)
-        if not widget:
-            return
-
-        self.canvas.update_idletasks() # Ensure geometry is updated
-        
-        # Calculate Y relative to the content frame
-        y = widget.winfo_y()
-        total_h = self._help_content.winfo_height()
-        
-        if total_h > 0:
-            # We want the widget at the top, but let's give a tiny bit of padding (e.g. 5px)
-            fraction = max(0, (y - 5) / total_h)
-            self.canvas.yview_moveto(fraction)
-
-    def _build_quick_navigation(self) -> None:
-        """Build the horizontal chip row for quick links."""
-        links = [
-            ("⌨️ Shortcuts", "shortcuts"),
-            ("📥 Bulk Import", "import"),
-            ("🧮 Formulas", "formulas"),
-            ("💸 Trade Fees", "fees"),
-            ("📄 Tax Report", "tax"),
-            ("📊 Watchlist", "watchlist"),
-        ]
-        
-        for text, sid in links:
-            btn = ModernButton(
-                self._nav_bar,
-                text=text,
-                command=lambda s=sid: self._scroll_to_section(s),
-                bg=ModernStyle.BG_TERTIARY,
-                fg=ModernStyle.TEXT_PRIMARY,
-                canvas_bg=ModernStyle.BG_PRIMARY,
-                height=32,
-                radius=16, # Pill shape
-                font=ModernStyle.FONT_SMALL,
-            )
-            btn.pack(side="left", padx=(0, 8))
-            self._help_text_widgets.append(btn)
-
-    def _build_help_sections(self, parent: tk.Misc) -> None:
-        # Example data (mirrors the Flet help page)
-        pnl_run_cols = ["Date", "Type", "Qty", "Price", "Current", "Running PnL"]
-        pnl_run_rows = [
-            ["2023-01-01", "BUY", "10", "₹100", "₹120", "+₹200"],
-            ["2023-01-05", "BUY", "5", "₹110", "₹120", "+₹150"],
-            ["Total", "-", "15", "₹103.33", "₹120", "+₹250"],
-        ]
-
-        pnl_real_cols = ["Date", "Action", "Qty", "Price", "Avg Cost", "Realized"]
-        pnl_real_rows = [
-            ["2023-01-01", "BUY", "10", "₹100", "-", "-"],
-            ["2023-02-01", "SELL", "5", "₹150", "₹100", "+₹250"],
-            ["Balance", "-", "5", "-", "₹100", "-"],
-        ]
-
-        cagr_cols = ["Year", "Investment", "Value", "Return", "CAGR"]
-        cagr_rows = [
-            ["Start", "₹10,000", "₹10,000", "-", "-"],
-            ["Year 1", "₹10,000", "₹11,500", "15%", "15.0%"],
-            ["Year 3", "₹10,000", "₹15,000", "50%", "14.47%"],
-        ]
-
-        iv_cols = ["Year", "Proj. EPS", "Disc. Factor", "Pres. Value"]
-        iv_rows = [
-            ["Base", "₹10.00", "1.000", "₹10.00"],
-            ["Year 1", "₹11.20", "0.909", "₹10.18"],
-            ["Year 5", "₹17.62", "0.621", "₹10.94"],
-            ["TV", "₹264.30", "0.621", "₹164.13"],
-            ["Total IV", "-", "-", "₹214.25"],
-        ]
-
-        fees_cols = ["Charge", "Rate / Logic", "BUY ₹1L sample", "SELL ₹1L sample"]
-        fees_rows = [
-            ["Brokerage",         "Flat ₹1 per order",               "₹1.00",    "₹1.00"],
-            ["STT",               "0.1% of turnover (both sides)",   "₹100.00",  "₹100.00"],
-            ["Transaction Chg",   "₹2.97/lakh = 0.00297% (NSE CM)", "₹2.97",    "₹2.97"],
-            ["SEBI Charges",      "₹10 per crore (0.0001%)",         "₹0.10",    "₹0.10"],
-            ["Stamp Duty",        "0.015% of turnover (BUY only)",   "₹15.00",   "-"],
-            ["DP Charges",        "₹13 + 18% GST = ₹15.34 (SELL)",  "-",        "₹15.34"],
-            ["GST",               "18% on (Brkg + Txn + SEBI)",      "₹0.73",    "₹0.73"],
-            ["Total Fees",        "-",                               "₹119.80",  "₹120.14"],
-        ]
-
-        calc_levels_cols = ["Calculation", "Level", "Reason"]
-        calc_levels_rows = [
-            ["Running Quantity", "Transaction", "Evolves with each trade"],
-            ["Cost Basis", "Transaction", "Accumulates through each trade"],
-            ["Realized PnL", "Transaction", "Only occurs per SELL"],
-            ["Fee Accumulation", "Transaction", "Sums stored fees per trade"],
-            ["Cash Flows", "Transaction", "Collected per trade for XIRR"],
-            ["Average Price", "Holding", "Computed from final totals"],
-            ["Unrealized PnL", "Holding", "Uses current market price + final state"],
-            ["Running PnL", "Holding", "Combines all realized + unrealized"],
-            ["XIRR/CAGR", "Holding", "Uses complete cash flow history"],
-            ["Total Fees", "Holding", "Sum of all trade fees"],
-        ]
-
-        shortcuts_cols = ["Shortcut", "Platform", "Action"]
-        shortcuts_rows = [
-            ["Ctrl+N", "Windows/Linux | Cmd+N on Mac", "Add new trade (Trade Entry)"],
-            ["Esc", "All Platforms", "Close open dialogs"],
-            ["Ctrl+K", "Windows/Linux | Cmd+K on Mac", "Focus symbol search (Holdings/Trade History)"],
-        ]
-
-        import_cols = ["CSV Header", "Required?", "Accepted Aliases", "Notes"]
-        import_rows = [
-            ["date",      "Yes", "trade_date",  "Supports YYYY-MM-DD and DD-MM-YYYY"],
-            ["symbol",    "Yes", "-",           "Ticker symbol (e.g. RELIANCE.NS)"],
-            ["type",      "Yes", "trade_type",  "Must be BUY or SELL (case-insensitive)"],
-            ["qty",       "Yes", "quantity",    "Number of shares (must be > 0)"],
-            ["price",     "Yes", "-",           "Smart cleaning: ₹, $ and commas are ignored"],
-            ["trade_id",  "No",  "-",           "Prevents duplicates if same file is re-imported"],
-            ["broker",    "No",  "-",           "If missing, uses default selected in UI"],
-        ]
-
-        # Sections
-        s = self._help_card(parent, "Keyboard Shortcuts & Quick Navigation", "shortcuts")
-        self._help_item(s, "Available Shortcuts", "Use these keyboard shortcuts to navigate faster and perform common actions without clicking.")
-        self._help_table(s, shortcuts_cols, shortcuts_rows)
-
-        s = self._help_card(parent, "Project Overview")
-        self._help_item(
-            s,
-            "About PTracker",
-            "PTracker is a portfolio management tool for tracking holdings and trades, computing performance metrics, and surfacing actionable insights.",
-        )
-
-        s = self._help_card(parent, "Application Views")
-        self._help_item(s, "Dashboard", "High-level financial summary with key metrics, performers, actionable insights, and tax harvesting opportunities.")
-        self._help_item(s, "Holdings", "Current portfolio holdings. Double-click a row to open drilldown and view the trade history for that holding.")
-        self._help_item(s, "Trade Entry", "Add new trades manually or import a CSV. Case-insensitive symbols and types are handled automatically.")
-        self._help_item(s, "Trade History", "Search and filter every transaction. Supports copy/export, edit on double-click, and bulk deletion.")
-
-        s = self._help_card(parent, "📥 Bulk Import (CSV Format)", "import")
-        self._help_item(
-            s, "Smart CSV Importing",
-            "PTracker supports flexible CSV imports from most brokers. Use the following column structure to ensure a successful upload."
-        )
-        self._help_table(s, import_cols, import_rows)
-        self._help_item(
-            s, "Key Features",
-            "• Smart Normalization: Headers like 'Trade Date' or 'Quantity' are automatically mapped.\n"
-            "• Currency Cleaning: Prices like '₹72.81' or '$150.00' have symbols and commas stripped automatically.\n"
-            "• Date Freedom: Both '2024-03-25' and '25-03-2024' formats are recognized.\n"
-            "• Duplicate Prevention: If you include a 'trade_id', the app will skip any rows that were already imported."
-        )
-
-        s = self._help_card(parent, "Metric Formulas & Tabular Examples", "formulas")
-        self._help_item(s, "Avg Purchase Price", "Calculated as: Total Cost Basis / Current Quantity. Fees are included in the cost basis for BUY trades and deducted for SELL trades.")
-        self._help_item(s, "Running (Unrealized) PnL", "(Current Price - Avg Purchase Price) × Current Quantity.")
-        self._help_table(s, pnl_run_cols, pnl_run_rows)
-        self._help_item(s, "Running PnL", "Combines realized gains (SELL) and unrealized gains/losses from open quantity.")
-        self._help_table(s, pnl_real_cols, pnl_real_rows)
-        self._help_item(s, "Overall CAGR", "(Ending Value / Beginning Value)^(1/Years) - 1")
-        self._help_table(s, cagr_cols, cagr_rows)
-        self._help_item(s, "Overall XIRR", "Annualized return using dated cashflows (IRR/XIRR).")
-
-        s = self._help_card(parent, "Calculation Levels: Transaction vs Holding")
-        self._help_item(s, "Understanding Where Calculations Happen", "Some values evolve per trade, while others are computed after aggregating a holding.")
-        self._help_table(s, calc_levels_cols, calc_levels_rows)
-
-        s = self._help_card(parent, "Intrinsic Value & Action Signals")
-        self._help_item(s, "Intrinsic Value (DCF)", "Discounted Cash Flow style intrinsic value based on projected EPS and discount factors.")
-        self._help_table(s, iv_cols, iv_rows)
-        self._help_item(s, "ACCUMULATE", "Current Market Price < 70% of Intrinsic Value.")
-        self._help_item(s, "REDUCE", "Current Market Price > 110% of Intrinsic Value.")
-        self._help_item(s, "HOLD", "Price is between 70% and 110% of Intrinsic Value.")
-
-        s = self._help_card(parent, "Trade Fees (Indian Equity — NSE Delivery)", "fees")
-        self._help_item(
-            s, "Charge Breakdown (verified April 2026)",
-            "Fee table for equity delivery trades on NSE. "
-            "All charges apply per order. Sample columns assume a ₹1,00,000 turnover trade."
-        )
-        self._help_table(s, fees_cols, fees_rows)
-        self._help_item(
-            s, "Key Notes",
-            "• Brokerage: flat ₹1 per order (generic default; Zerodha = ₹0 for delivery).\n"
-            "• STT: 0.1% on both BUY and SELL sides.\n"
-            "• Exchange Txn Charges: ₹2.97/lakh (NSE Cash Market, revised Oct 2024).\n"
-            "• Stamp Duty: 0.015% on BUY side only (uniform nationwide).\n"
-            "• DP Charges: ₹13.00 + 18% GST = ₹15.34 on SELL delivery trades only.\n"
-            "• GST: 18% on (Brokerage + Transaction Charges + SEBI Charges).\n"
-            "• SEBI Turnover Fee: ₹10 per crore of turnover.\n"
-            "• IPFT: ₹0.01 per crore — negligible, not included."
-        )
-        self._help_item(
-            s, "BUY Formula",
-            "Total = Brkg(₹1) + STT(0.1%) + TxnChg(0.00297%) + SEBI(0.0001%) + Stamp(0.015%) + GST(18% on Brkg+Txn+SEBI)"
-        )
-        self._help_item(
-            s, "SELL Formula",
-            "Total = Brkg(₹1) + STT(0.1%) + TxnChg(0.00297%) + SEBI(0.0001%) + DP(₹15.34) + GST(18% on Brkg+Txn+SEBI)"
-        )
-
-        s = self._help_card(parent, "Market Data & Sync")
-        self._help_item(s, "Data Source", "Market data is fetched via yfinance. Indian symbols may be suffixed with .NS or .BO.")
-        self._help_item(s, "Syncing", "Market data sync runs in the background to keep the UI responsive.")
-
-        # ── Tax Report & Harvesting ────────────────────────────────────────────
-        tax_cols = ["Term", "Holding Period", "Tax Rate (Indian Equity)", "FY Window"]
-        tax_rows = [
-            ["STCG", "≤ 1 year", "15% flat on gains", "Apr 1 – Mar 31"],
-            ["LTCG", "> 1 year", "10% on gains above ₹1L exemption", "Apr 1 – Mar 31"],
-        ]
-
-        fifo_cols = ["Step", "Action", "Result"]
-        fifo_rows = [
-            ["1", "Sort all BUY lots for a symbol by date (oldest first)", "Establishes cost queue"],
-            ["2", "Match each SELL against the oldest BUY lot first", "Consumes oldest shares first"],
-            ["3", "Record (Sell Date − Buy Date) to classify STCG vs LTCG", "Determines holding period"],
-            ["4", "Net PnL = Sale Proceeds − Cost − Proportional Fees", "Computes actual gain/loss"],
-        ]
-
-        harvest_cols = ["Scenario", "Action", "Benefit"]
-        harvest_rows = [
-            ["Unrealized loss > ₹10K", "Sell before Mar 31 to book loss", "Offset STCG/LTCG gains"],
-            ["LTCG exemption headroom", "Book gains up to ₹1L", "Avoid 10% tax; re-enter position"],
-            ["Mix of STCG & LTCG lots", "Sell LTCG lots first (hold >1yr)", "Lower effective tax rate"],
-        ]
-
-        s = self._help_card(parent, "📄 Tax Report & Harvesting", "tax")
-        self._help_item(
-            s, "What is the Tax Report?",
-            "The Tax Report view computes your Short Term (STCG) and Long Term (LTCG) Capital Gains "
-            "for any selected financial year using FIFO (First-In, First-Out) matching of buy/sell trades. "
-            "It mimics the method used by Indian Income Tax rules."
-        )
-        self._help_table(s, tax_cols, tax_rows)
-
-        self._help_item(
-            s, "How FIFO Matching Works",
-            "For every SELL trade, shares are matched against the earliest BUY lots first. "
-            "The holding period (Buy Date → Sell Date) determines whether the gain is classified as STCG or LTCG."
-        )
-        self._help_table(s, fifo_cols, fifo_rows)
-
-        self._help_item(
-            s, "Steps to Generate Your Tax Report",
-            "1. Navigate to Tax Report from the sidebar.\n"
-            "2. Select the applicable Financial Year (FY 2024-2025 = April 1, 2024 – March 31, 2025).\n"
-            "3. The summary cards show your total STCG, LTCG, and combined taxable gains.\n"
-            "4. The table below lists every sale with its holding duration, gain type, and net PnL.\n"
-            "5. Use this data when filing your ITR under Schedule CG (Capital Gains)."
-        )
-
-        self._help_item(
-            s, "Tax Harvesting Strategies",
-            "Tax-loss harvesting allows you to reduce your taxable gains by strategically selling "
-            "positions before the financial year ends. Common strategies are listed below."
-        )
-        self._help_table(s, harvest_cols, harvest_rows)
-
-        self._help_item(
-            s, "Important Notes",
-            "• This report is for reference only and does not constitute professional tax advice.\n"
-            "• Fees are apportioned proportionally to each matched SELL chunk.\n"
-            "• If a SELL consumes lots with different holding periods, the longest period is displayed.\n"
-            "• Always verify the output with a CA or tax professional before filing.\n"
-            "• LTCG exemption of ₹1 lakh per FY applies only to equity/equity mutual funds (Section 112A)."
-        )
-
-
-        # ── Watchlist Advanced Metrics ─────────────────────────────────────────
-
-        s = self._help_card(parent, "📊 Advanced Watchlist Benchmarks", "watchlist")
-        self._help_item(
-            s, "Using Advanced Metrics",
-            "The Watchlist allows you to track up to 20 fundamental and technical metrics for any symbol. "
-            "Use the following benchmarks to evaluate if a stock matches your investing criteria."
-        )
-
-        val_cols = ["Metric / Ratio", "Ideal Benchmark / Target", "Description"]
-        val_rows = [
-            ["P/E Ratio", "Compare with Industry", "Price-to-Earnings; determines if the stock is cheap or expensive. Avoid 'Value Traps' with very low P/E."],
-            ["PEG Ratio", "< 1.0 (Best) or < 2.0", "Price/Earnings to Growth; measures if the P/E is justified by the company's growth rate."],
-            ["EPS", "Double Digits (>10)", "Earnings Per Share; the portion of a company's profit allocated to each outstanding share."],
-            ["Debt to Equity", "< 1.0", "Total liabilities divided by shareholder equity; ensures the company is not over-leveraged."],
-            ["Book Value", "Compare to Price", "The net asset value. Useful for understanding 'De-listing' or liquidation value."],
-            ["Intrinsic Value", "Higher than Market Price", "The actual 'fair value' of the business based on its brand and assets."],
-        ]
-        self._help_table(s, val_cols, val_rows)
-
-        prof_cols = ["Metric / Ratio", "Ideal Benchmark / Target", "Description"]
-        prof_rows = [
-            ["ROE", "Double Digits", "Return on Equity; measures how effectively the company uses investor money to generate profit."],
-            ["ROCE", "Double Digits", "Return on Capital Employed; measures profit against total capital (Equity + Debt)."],
-            ["OPM (%)", "> 10% - 15%", "Operating Profit Margin; the percentage of revenue left after paying for variable costs."],
-            ["Free Cash Flow", "Must be Positive", "The actual cash remaining after all expenses and investments (CapEx)."],
-            ["Inventory Days", "Lower is generally better", "The number of days it takes to turn stock into sales."],
-        ]
-        self._help_table(s, prof_cols, prof_rows)
-
-        growth_cols = ["Metric", "Target", "Description"]
-        growth_rows = [
-            ["Sales Growth", "Double Digits", "Revenue growth on a Year-on-Year (YoY) and Quarter-on-Quarter (QoQ) basis."],
-            ["Profit Growth", "Double Digits", "Net profit growth; must ideally grow faster than or equal to sales growth."],
-        ]
-        self._help_table(s, growth_cols, growth_rows)
-
-        op_cols = ["Metric", "Observation", "Description"]
-        op_rows = [
-            ["Promoter Holding", "High & Stable", "The percentage of the company owned by the founders/owners."],
-            ["Pledged Shares", "Zero (Ideal)", "Whether promoters have used their shares as collateral for loans."],
-            ["FII / DII Holding", "Increasing / Stable", "Ownership by Foreign and Domestic Institutional Investors (Mutual Funds)."],
-            ["Order Book", "High Visibility", "Total value of orders yet to be executed; provides a roadmap for future revenue."],
-        ]
-        self._help_table(s, op_cols, op_rows)
-
-        tech_cols = ["Metric", "Observation", "Description"]
-        tech_rows = [
-            ["50 & 200 DMA", "Above the lines", "Moving Averages; used to see if the stock is in a long-term uptrend."],
-            ["RSI", "30 (Oversold) / 70 (Overbought)", "Relative Strength Index; identifies if a stock is at a buying or selling extreme."],
-            ["Volume", "Increasing", "Confirms if a price movement is backed by significant market interest."],
-        ]
-        self._help_table(s, tech_cols, tech_rows)
+            y = t.count("1.0", f"sec_{section_id}", "update", "ypixels", return_ints=True) or 0
+            total = t.count("1.0", "end", "ypixels", return_ints=True) or 1
+            t.yview_moveto(max(0.0, (y - 4) / total))
+        except tk.TclError:
+            log.exception("Help: could not jump to %s", section_id)
+            t.see(f"sec_{section_id}")

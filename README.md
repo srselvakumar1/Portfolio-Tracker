@@ -68,25 +68,24 @@ python main.py
 *   **UI Framework:** Tkinter (Custom Modern Theme)
 *   **Database:** SQLite (via `model/database.py`)
 *   **Data Handling:** Pandas
-*   **Icons:** Font Awesome via `customtkinter`
+*   **Icons:** emoji, drawn by the system font
 
-All three of those adjustments are done! If you interact with the app now, you'll see:
+## 💾 Your data, backups and logs
+*   **Database:** `~/Library/Application Support/PTracker/portfolio.db` (the installed app). The app never replaces an existing database.
+*   **Backups:** an automatic backup is saved once a day (the last 30 are kept), and before every delete, wipe, import or restore, in the `Backups` folder next to the database. Settings → Data Backup & Export has **Back Up Now**, **Restore…** and **Show Backups**.
+*   **Log:** problems are written to `~/Library/Logs/PTracker/ptracker.log` (Settings → About → Show Log).
 
-Refresh Time Visibility: I changed the background color of the refresh time label (and its surrounding container/button) to a deep teal (#0D9488) so it flawlessly blends into the right side of the new gradient header banner instead of looking out of place.
+## 🎨 Appearance
+Settings → Appearance: **Light**, **Dark** or **Match macOS**, and **Normal / Large / Extra-large** text. Changes apply after a restart (the Restart Now button does it for you).
 
-Instant Sync Status: The sidebar no longer hangs on "Syncing..." for 3 seconds. It now fetches the database status immediately upon opening the app (100ms), and I also added an invisible polling loop so it auto-updates every 30 seconds to stay fresh.
+## 🧪 Tests
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
 
-Faster KPI Rolling: I significantly sped up the KPI number animation. The count-up duration has been slashed by more than half (down to 400ms), resulting in a quick, snappy roll that feels premium without taking too long to settle.
-
-Side Menu Values Not Loaded: When the sidebar was collapsed/expanded, the custom ModernButton widget was calling its redraw function to update the layout, but it was missing the command to explicitly update the canvas text item itself—so the text was left blank! I updated the button's internal _redraw method to correctly push the text updates to the canvas.
-
---------
-
-I like these  4
-
-#1 — Animated KPI counters: This is the single biggest "wow" moment. Seeing numbers roll up from zero is mesmerizing and gives the app a fintech-grade feel.
-#2 — Gradient header banner: Transforms the dashboard from "business app" to "premium dashboard" in one change.
-#3 — Pulsing live dot: A tiny detail that makes the app feel alive and real-time.
-7	Color-coded P&L background tint on KPI cards	
-
-token - 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
+## 📦 Building the app
+```bash
+.venv/bin/pyinstaller --noconfirm PortfolioTrack.spec
+pkgbuild --component ./dist/PTracker.app --install-location /Applications ./PTracker.pkg
+```
+The installer bundles an empty starter database only — never your own trades.

@@ -16,6 +16,7 @@ class AppState:
         # - Broker list is used by Settings + Trade Entry and can be reused to
         #   avoid repeated SQLite reads on each view mount.
         self.brokers_cache: list[str] | None = None
+        self.broker_currencies_cache: dict[str, str] | None = None
         self.brokers_cache_version: int = 0
 
         # In-memory dataset cache (holdings/trades pre-joined)
@@ -26,8 +27,18 @@ class AppState:
         if force_refresh or self.brokers_cache is None:
             import model.crud as crud
             self.brokers_cache = crud.get_all_brokers()
+            self.broker_currencies_cache = crud.get_broker_currencies()
             self.brokers_cache_version += 1
         return self.brokers_cache
+
+    def get_broker_currencies_cached(self, *, force_refresh: bool = False) -> dict[str, str]:
+        """Return broker to currency dictionary, using cache when possible."""
+        if force_refresh or self.broker_currencies_cache is None:
+            import model.crud as crud
+            self.brokers_cache = crud.get_all_brokers()
+            self.broker_currencies_cache = crud.get_broker_currencies()
+            self.brokers_cache_version += 1
+        return self.broker_currencies_cache
 
     def init_data_cache(self) -> None:
         """Initial load of all datasets into memory (blocking)."""

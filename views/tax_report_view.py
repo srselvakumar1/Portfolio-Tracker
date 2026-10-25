@@ -1,363 +1,496 @@
+"""Tax Report: realised capital gains for a financial year (FIFO matching).
+
+The calculation itself lives in model/tax.py (pure Python, unit-tested in
+tests/test_tax.py). This view reads the trades, runs that calculation in the
+background and shows the totals, any problems found, and one row per matched
+piece of every sale.
+"""
+
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk
 from datetime import datetime
-import threading
 
-from views.base_view import BaseView, _enable_canvas_mousewheel
-from ui_theme import ModernStyle
-from ui_widgets import ModernButton, ModernCard, ModernDropdown
-from ui_utils import add_treeview_copy_menu, treeview_sort_column
-
+from views.base_view import BaseView
+from ui.ui_theme import ModernStyle
+from ui.ui_utils import add_treeview_copy_menu, treeview_sort_column, run_in_background, format_money
+from model.applog import log
 from model.database import db_session
+from model.tax import compute_realised_gains, LONG_TERM, SHORT_TERM
 
+CURRENCIES = ("All", "INR", "JPY")
+_SYMBOLS = {"INR": "₹", "JPY": "¥", "USD": "$", "GBP": "£", "CNY": "¥"}
+
+
+# ── Small helpers (also used by the P&L Report) ──────────────────────────────
+def currency_symbol(code: str) -> str:
+    """₹ for INR, ¥ for JPY, $ for USD, £ for GBP; otherwise the code itself."""
+    code = (code or "INR").upper()
+    return _SYMBOLS.get(code, code + " ")
+
+
+def signed_money(value: float, currency: str = "INR") -> str:
+    """▲ ₹1,234.50 for a gain, ▼ ₹1,234.50 for a loss, ₹0.00 for nothing."""
+    v = float(value or 0.0)
+    if abs(v) < 0.005:
+        return format_money(0.0, currency)
+    return f"{'▲' if v > 0 else '▼'} {format_money(abs(v), currency)}"
+
+
+def gain_colour(value) -> str:
+    if value is None or abs(float(value)) < 0.005:
+        return ModernStyle.TEXT_PRIMARY
+    return ModernStyle.SUCCESS if value > 0 else ModernStyle.ERROR
+
+
+_measure_fonts = {}
+
+
+def fit_value_font(labels, avail: int) -> None:
+    """Big KPI font for the value labels, or a smaller one when a value would not fit."""
+    big, small = ModernStyle.FONT_KPI_VALUE, ModernStyle.FONT_SECTION_LABEL
+    if big not in _measure_fonts:
+        _measure_fonts[big] = tkfont.Font(font=big)
+    need = max((_measure_fonts[big].measure(lbl.cget("text")) for lbl in labels), default=0)
+    font = big if need <= avail else small
+    for lbl in labels:
+        if getattr(lbl, "_fit_font", None) != font:
+            lbl._fit_font = font
+            lbl.config(font=font)
+
+
+def fit_columns(tree, prefs: dict, drop_order=(), min_scale: float = 0.86) -> None:
+    """Keep a table's columns inside its width: scale them to fit, and hide the
+    columns in drop_order (in that order) when the window is too narrow."""
+    state = {"w": 0}
+
+    def _on_configure(e):
+        w = e.width - 4
+        if w < 100 or abs(w - state["w"]) < 6:
+            return
+        state["w"] = w
+        cols = list(prefs)
+        for c in drop_order:
+            if sum(prefs[x] for x in cols) * min_scale <= w:
+                break
+            cols.remove(c)
+        scale = w / sum(prefs[x] for x in cols)
+        tree.configure(displaycolumns=cols)
+        for c in cols:
+            tree.column(c, width=max(30, int(prefs[c] * scale)))
+
+    tree.bind("<Configure>", _on_configure, add="+")
+
+
+class CurrencyToggle(tk.Frame):
+    """[All | INR | JPY] pill for the gradient header (keeps its own colours).
+
+    Clicking only sets `variable`; whoever owns the variable reacts to it
+    (one trace), so a click loads the data once.
+    """
+
+    def __init__(self, parent, variable: tk.StringVar, options=CURRENCIES):
+        super().__init__(parent, bg=ModernStyle.BG_SECONDARY, padx=3, pady=3)
+        self._ignore_sync_bg = True          # the header must not recolour it
+        self._var = variable
+        self._labels = {}
+        for opt in options:
+            lbl = tk.Label(self, text=opt, font=ModernStyle.FONT_BODY_BOLD,
+                           padx=12, pady=3, cursor="hand2")
+            lbl.pack(side="left", padx=(0, 2) if opt != options[-1] else 0)
+            lbl.bind("<Button-1>", lambda _e, v=opt: self._pick(v))
+            self._labels[opt] = lbl
+        variable.trace_add("write", lambda *_: self._paint())
+        self._paint()
+
+    def _pick(self, value):
+        if self._var.get() != value:
+            self._var.set(value)
+
+    def _paint(self):
+        current = self._var.get()
+        for opt, lbl in self._labels.items():
+            if opt == current:
+                lbl.config(bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT)
+            else:
+                lbl.config(bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY)
+
+
+def build_table_rows(res, disp: str) -> list:
+    """Table rows as (values, colour tag): problems first (amber), then sales newest first.
+    Pure formatting, so it runs in the background thread."""
+    sym = currency_symbol(disp)
+    rows = []
+    for u in res.unmatched_sells:
+        rows.append(((u.broker, u.symbol, "—", u.date, f"{u.qty:g}", "—", f"{sym}{u.price:,.2f}",
+                      "—", "No buy found", "not counted"), "problem"))
+    for s in res.skipped:
+        rows.append(((s.broker, s.symbol, "—", s.date or "—", "—", "—", "—", "—", "Bad data",
+                      "not counted"), "problem"))
+    terms = {SHORT_TERM: "Short-term", LONG_TERM: "Long-term"}
+    for r in sorted(res.rows, key=lambda x: (x.sell_date, x.buy_date), reverse=True):
+        tag = "gain" if r.pnl > 0.005 else ("loss" if r.pnl < -0.005 else "flat")
+        rows.append(((r.broker, r.symbol, r.buy_date, r.sell_date, f"{r.qty:g}",
+                      f"{sym}{r.buy_price:,.2f}", f"{sym}{r.sell_price:,.2f}", f"{r.days:,}",
+                      terms.get(r.term, f"n/a ({r.currency})"), signed_money(r.pnl, disp)), tag))
+    return rows
+
+
+class MenuPill(tk.Label):
+    """A light pill for the gradient header that opens a native menu of choices.
+
+    Much cheaper to show than a canvas dropdown (about 0.15 s less every time
+    the page is shown). With `variable`, it shows and sets the chosen value;
+    with `command`, it calls command(choice).
+    """
+
+    def __init__(self, parent, *, values, variable=None, text="", command=None):
+        super().__init__(parent, font=ModernStyle.FONT_BODY_BOLD, bg=ModernStyle.BG_SECONDARY,
+                         fg=ModernStyle.TEXT_PRIMARY, padx=14, pady=5, cursor="hand2")
+        self._ignore_sync_bg = True          # the header must not recolour it
+        self._var, self._command = variable, command
+        self._menu = tk.Menu(self, tearoff=0)
+        for v in values:
+            self._menu.add_command(label=v, command=lambda v=v: self._choose(v))
+        if variable is not None:
+            variable.trace_add("write", lambda *_: self.config(text=f"{variable.get()}  ▾"))
+            text = variable.get()
+        self.config(text=f"{text}  ▾")
+        self.bind("<Button-1>", self._open)
+
+    def _open(self, _e=None):
+        try:
+            self._menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height() + 2)
+        finally:
+            self._menu.grab_release()
+
+    def _choose(self, value):
+        if self._var is not None and self._var.get() != value:
+            self._var.set(value)
+        if self._command:
+            self._command(value)
+
+
+# ── The view ─────────────────────────────────────────────────────────────────
 class TaxReportView(BaseView):
-    """View to display Tax Harvesting and Capital Gains report."""
-    
+    """Realised capital gains (short-term / long-term for INR) per financial year."""
+
+    COLUMNS = ("#", "Broker", "Symbol", "Buy date", "Sell date", "Qty",
+               "Buy price", "Sell price", "Days held", "Term", "Gain / loss")
+
     def __init__(self, parent, app_state=None):
-        # Build FY list dynamically based on current date
         self._fy_options_list = self._build_fy_options()
-        # Default to the current Indian FY
         now = datetime.now()
         current_fy_start = now.year if now.month >= 4 else now.year - 1
         self._current_fy_val = f"FY {current_fy_start}-{current_fy_start + 1}"
-        self._current_fy = None  # Will be set in build()
+        self._load_seq = 0
         super().__init__(parent, app_state=app_state)
 
     @staticmethod
     def _build_fy_options() -> list:
-        """Generate FY options from the earliest trade year to the current FY."""
+        """FY options from the year of the earliest sale to the current FY."""
         now = datetime.now()
         current_fy_start = now.year if now.month >= 4 else now.year - 1
-
-        # Try to find the earliest sell year in the database
-        earliest_fy_start = current_fy_start - 2  # default fallback: 2 years back
+        earliest_fy_start = current_fy_start - 2  # fallback: 2 years back
         try:
-            from model.database import db_session as _db
-            with _db() as conn:
-                row = conn.cursor().execute(
-                    "SELECT MIN(date) FROM trades WHERE type='SELL'"
-                ).fetchone()
+            with db_session() as conn:
+                row = conn.cursor().execute("SELECT MIN(date) FROM trades WHERE type='SELL'").fetchone()
                 if row and row[0]:
-                    yr = int(row[0][:4])
-                    mo = int(row[0][5:7])
-                    earliest_fy_start = yr if mo >= 4 else yr - 1
+                    yr, mo = int(row[0][:4]), int(row[0][5:7])
+                    earliest_fy_start = min(current_fy_start, yr if mo >= 4 else yr - 1)
         except Exception:
-            pass
-
-        options = []
-        for fy_start in range(current_fy_start, earliest_fy_start - 1, -1):
-            options.append(f"FY {fy_start}-{fy_start + 1}")
+            log.exception("Tax Report: could not read the earliest sale date")
+        options = [f"FY {y}-{y + 1}" for y in range(current_fy_start, earliest_fy_start - 1, -1)]
         options.append("All Time")
         return options
 
+    # ── layout ───────────────────────────────────────────────────────────────
     def build(self):
-        self._ui_built = False
         self._current_fy = tk.StringVar(value=self._current_fy_val)
         self._current_currency = tk.StringVar(value="All")
-        
-        # No scroll — use self directly as the layout container
+
         self._content = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
         self._content.pack(fill="both", expand=True)
-        
+
         self._build_header()
-        self._build_summary_bar()
-        self._build_trades_table()
-        
-        self._ui_built = True
+        self._build_summary()
+        self._build_notes()
+        self._build_table()
+
+        # One trace per choice: each change loads the report exactly once.
+        self._current_fy.trace_add("write", lambda *_: self.load_data())
+        self._current_currency.trace_add("write", lambda *_: self.load_data())
 
     def _build_header(self):
         def _build_right(parent):
-            tk.Label(parent, text="💴 Currency:", bg="#0D9488", fg="#FFFFFF", font=ModernStyle.FONT_BODY).pack(side="left", padx=(10, 2))
-            currency_cb = ModernDropdown(
-                parent, textvariable=self._current_currency,
-                values=["All", "INR", "JPY"], width=80,
-                font=ModernStyle.FONT_BODY
-            )
-            currency_cb.pack(side="left", padx=(0, 15))
-
-            tk.Label(parent, text="Financial Year:", bg="#0D9488", fg="#FFFFFF", font=ModernStyle.FONT_BODY).pack(side="left", padx=(0, 2))
-            cb = ModernDropdown(
-                parent, textvariable=self._current_fy,
-                values=self._fy_options_list, width=150,
-                font=ModernStyle.FONT_BODY
-            )
-            cb.pack(side="left")
-            try:
-                 self._current_fy.trace_add("write", lambda *args: self.load_data())
-                 self._current_currency.trace_add("write", lambda *args: self.load_data())
-            except Exception:
-                 pass
+            CurrencyToggle(parent, self._current_currency).pack(side="left", padx=(0, 14))
+            tk.Label(parent, text="Year:", bg=parent.cget("bg"), fg=ModernStyle.HEADER_FG,
+                     font=ModernStyle.FONT_BODY_BOLD).pack(side="left", padx=(0, 6))
+            MenuPill(parent, values=self._fy_options_list, variable=self._current_fy).pack(side="left")
 
         self.add_gradient_header(
             self._content,
-            "📜 Tax Report & Harvesting",
-            "View Realized Capital Gains (STCG & LTCG) per Indian Tax Rules.",
-            right_widget_func=_build_right
+            "🧾 Tax Report",
+            "Realised gains, matched first-in first-out per broker.",
+            right_widget_func=_build_right,
         )
 
-    def _build_summary_bar(self):
-        """Compact inline summary bar instead of tall cards."""
-        self._summary_frame = ModernCard(self._content, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1, radius=8)
-        self._summary_frame.pack(fill="x", padx=20, pady=(8, 0))
+    def _build_summary(self):
+        bar = tk.Frame(self._content, bg=ModernStyle.BG_PRIMARY)
+        bar.pack(fill="x", padx=20, pady=(10, 0))
+        specs = [
+            ("short", "Short-term gains", "held 12 months or less", ModernStyle.WARNING_FILL, ModernStyle.WARNING),
+            ("long", "Long-term gains", "held over 12 months", ModernStyle.INFO_FILL, ModernStyle.INFO),
+            ("other", "Not split (JPY)", "one flat rate in Japan", ModernStyle.PURPLE_FILL, ModernStyle.TEXT_PURPLE),
+            ("net", "Net realised gains", "before exemptions", ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ACCENT),
+        ]
+        self._stat = {}
+        for col, (key, title, caption, bar_fill, title_fg) in enumerate(specs):
+            bar.grid_columnconfigure(col, weight=1, uniform="taxstats")
+            card = tk.Frame(bar, bg=ModernStyle.BG_SECONDARY, highlightthickness=1,
+                            highlightbackground=ModernStyle.BORDER_COLOR)
+            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == 3 else 5))
+            tk.Frame(card, bg=bar_fill, width=5).pack(side="left", fill="y")
+            body = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
+            body.pack(side="left", fill="both", expand=True, padx=14, pady=10)
+            tk.Label(body, text=title, bg=ModernStyle.BG_SECONDARY, fg=title_fg,
+                     font=ModernStyle.FONT_KPI_LABEL, anchor="w").pack(fill="x")
+            value = tk.Label(body, text="…", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY,
+                             font=ModernStyle.FONT_KPI_VALUE, anchor="w")
+            value.pack(fill="x", pady=(2, 0))
+            tk.Label(body, text=caption, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY,
+                     font=ModernStyle.FONT_SMALL, anchor="w").pack(fill="x")
+            self._stat[key] = value
+        self._stat_bar = bar
+        bar.bind("<Configure>", lambda e: self._fit_stats(e.width))
 
-        def _stat(parent, label, init_val, fg_color=ModernStyle.TEXT_PRIMARY):
-            cell = tk.Frame(parent.content, bg=ModernStyle.BG_SECONDARY)
-            cell.pack(side="left", padx=20, pady=8)
-            tk.Label(cell, text=label, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_KPI_LABEL).pack(anchor="w")
-            lbl = tk.Label(cell, text=init_val, bg=ModernStyle.BG_SECONDARY, fg=fg_color, font=ModernStyle.FONT_KPI_VALUE)
-            lbl.pack(anchor="w")
-            return lbl
+    def _fit_stats(self, width=None):
+        width = width or self._stat_bar.winfo_width()
+        if width > 100:
+            fit_value_font(list(self._stat.values()), width // 4 - 50)
 
-        self._stcg_lbl  = _stat(self._summary_frame, "▶ STCG (Short Term)", "₹0.00", ModernStyle.WARNING)
-        
-        # Thin vertical divider
-        tk.Frame(self._summary_frame.content, bg=ModernStyle.BORDER_COLOR, width=1).pack(side="left", fill="y", pady=6)
-        
-        self._ltcg_lbl  = _stat(self._summary_frame, "▶ LTCG (Long Term)",  "₹0.00", ModernStyle.ACCENT_PRIMARY)
-        
-        tk.Frame(self._summary_frame.content, bg=ModernStyle.BORDER_COLOR, width=1).pack(side="left", fill="y", pady=6)
+    def _build_notes(self):
+        """Up to five one-paragraph messages (errors, problems found, how amounts were worked out)."""
+        self._notes_frame = tk.Frame(self._content, bg=ModernStyle.BG_PRIMARY)
+        self._notes_frame.pack(fill="x", padx=20, pady=(8, 0))
+        self._note_labels = []
+        for _ in range(5):
+            lbl = tk.Label(self._notes_frame, font=ModernStyle.FONT_BODY, anchor="w",
+                           justify="left", padx=12, pady=5, wraplength=900)
+            self._note_labels.append(lbl)
+        self._note_wrap = 900
 
-        self._total_lbl = _stat(self._summary_frame, "▶ Total Taxable Gains", "₹0.00", ModernStyle.SUCCESS)
+        def _rewrap(e):
+            w = max(300, e.width - 30)
+            if abs(w - self._note_wrap) > 20:
+                self._note_wrap = w
+                for lbl in self._note_labels:
+                    lbl.config(wraplength=w)
+        self._notes_frame.bind("<Configure>", _rewrap)
 
+    def _show_notes(self, notes):
+        """notes: list of (kind, text) with kind in error / warning / info."""
+        styles = {
+            "error": (ModernStyle.ERROR_PALE, ModernStyle.ERROR),
+            "warning": (ModernStyle.WARNING_PALE, ModernStyle.WARNING),
+            "info": (ModernStyle.INFO_PALE, ModernStyle.INFO),
+        }
+        for i, lbl in enumerate(self._note_labels):
+            if i < len(notes):
+                kind, text = notes[i]
+                bg, fg = styles[kind]
+                lbl.config(text=text, bg=bg, fg=fg)
+                if not lbl.winfo_ismapped():
+                    lbl.pack(fill="x", pady=(0, 4))
+            elif lbl.winfo_ismapped():
+                lbl.pack_forget()
 
-    def _build_trades_table(self):
-        table_frame = ModernCard(self._content, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1, radius=10, expand_height=True)
-        table_frame.pack(fill="both", expand=True, padx=20, pady=(0, 30))
-        table_frame.content.grid_rowconfigure(0, weight=1)
-        table_frame.content.grid_columnconfigure(0, weight=1)
-        
-        tk.Label(table_frame.content, text="Realized Sales (FIFO Matching)", font=ModernStyle.FONT_HEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(anchor="w", padx=20, pady=(15, 10))
-        
-        cols = ("#", "Symbol", "Buy Date", "Date Sold", "Qty", "Buy Price", "Sell Price", "Holding Days", "Type", "PnL")
-        
-        tv_frame = tk.Frame(table_frame.content, bg=ModernStyle.BG_SECONDARY)
-        tv_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        
+    def _build_table(self):
+        card = tk.Frame(self._content, bg=ModernStyle.BG_SECONDARY, highlightthickness=1,
+                        highlightbackground=ModernStyle.BORDER_COLOR)
+        card.pack(fill="both", expand=True, padx=20, pady=(6, 16))
+
+        head = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
+        head.pack(fill="x", padx=16, pady=(10, 6))
+        tk.Label(head, text="Realised sales", font=ModernStyle.FONT_HEADING,
+                 bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_ACCENT).pack(side="left")
+        self._caption = tk.Label(head, text="Calculating…", font=ModernStyle.FONT_BODY,
+                                 bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY)
+        self._caption.pack(side="left", padx=(12, 0))
+
+        tv_frame = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
+        tv_frame.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+
         style = ttk.Style()
-        style.configure("Tax.Treeview", font=ModernStyle.FONT_TABLE, rowheight=32)
-        style.configure("Tax.Treeview.Heading", font=ModernStyle.FONT_SUBHEADING)
-        
-        self.tv = ttk.Treeview(tv_frame, columns=cols, show="headings", height=15, style="Tax.Treeview")
-        
-        sortable_cols = ("Symbol", "Date Sold", "Type", "PnL")
-        for c in cols:
-            if c in sortable_cols:
-                self.tv.heading(c, text=f"{c} ↕", anchor="w", command=lambda col=c: treeview_sort_column(self.tv, col, False))
-            else:
-                self.tv.heading(c, text=c, anchor="w")
-            self.tv.column(c, anchor="w", width=100)
-            
+        style.configure("Tax.Treeview", font=ModernStyle.FONT_TABLE, rowheight=ModernStyle.TABLE_ROW_HEIGHT)
+        style.configure("Tax.Treeview.Heading", font=ModernStyle.FONT_TABLE_BOLD)
+
+        self.tv = ttk.Treeview(tv_frame, columns=self.COLUMNS, show="headings", height=15, style="Tax.Treeview")
+        widths = {"#": 46, "Broker": 110, "Symbol": 120, "Buy date": 100, "Sell date": 100, "Qty": 60,
+                  "Buy price": 105, "Sell price": 105, "Days held": 85, "Term": 105, "Gain / loss": 130}
+        right = {"Qty", "Buy price", "Sell price", "Days held", "Gain / loss"}
+        for c in self.COLUMNS:
+            anchor = "e" if c in right else ("center" if c == "#" else "w")
+            self.tv.heading(c, text=c, anchor=anchor, command=lambda col=c: treeview_sort_column(self.tv, col, False))
+            self.tv.column(c, anchor=anchor, width=widths[c], minwidth=30, stretch=False)
+        # Narrow window: hide the price columns first (Copy All Rows still copies them)
+        fit_columns(self.tv, widths, drop_order=("Buy price", "Sell price", "Days held", "#"))
         add_treeview_copy_menu(self.tv)
-            
-        self.tv.heading("#", anchor="center")
-        self.tv.column("#", anchor="center", width=40)
-        
-        # Center align specific columns
-        for c in ["Qty", "Buy Price", "Sell Price", "PnL"]:
-            self.tv.heading(c, anchor="center")
-            self.tv.column(c, anchor="center", width=90)
-            
-        self.tv.column("Qty", width=70)
-        self.tv.column("Holding Days", width=110)
-        self.tv.column("Type", width=70)
-        
-        self.tv.tag_configure('stcg', foreground="#ef4444")
-        self.tv.tag_configure('ltcg', foreground="#10b981")
-        self.tv.tag_configure('even', background=ModernStyle.BG_SECONDARY)
-        self.tv.tag_configure('odd', background=ModernStyle.BG_TERTIARY)
-        
+
+        self.tv.tag_configure("gain", foreground=ModernStyle.SUCCESS)
+        self.tv.tag_configure("loss", foreground=ModernStyle.ERROR)
+        self.tv.tag_configure("flat", foreground=ModernStyle.TEXT_PRIMARY)
+        self.tv.tag_configure("problem", foreground=ModernStyle.WARNING)
+        self.tv.tag_configure("even", background=ModernStyle.BG_SECONDARY)
+        self.tv.tag_configure("odd", background=ModernStyle.BG_TERTIARY)
+
         vsb = ttk.Scrollbar(tv_frame, orient="vertical", command=self.tv.yview)
         self.tv.configure(yscrollcommand=vsb.set)
-        
         self.tv.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-        
-    def show(self):
-        super().show()
-        if not self._ui_built:
-            self.build()
-        self.load_data()
-        
-    def load_data(self):
-        fy_str = self._current_fy.get() if self._current_fy else self._current_fy_val
-        start_date = None
-        end_date = None
-        
-        # Dynamically parse "FY YYYY-YYYY" instead of hardcoded if/elif
+
+        # Shown over the table when the year has no sales
+        self._empty = tk.Label(tv_frame, text="", font=ModernStyle.FONT_EMPTY_STATE, justify="center",
+                               bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY)
+
+    # ── data ─────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _fy_window(fy_str: str):
+        """'FY 2024-2025' -> ('2024-04-01', '2025-03-31', nice label); All Time -> (None, None, label)."""
         if fy_str.startswith("FY "):
             try:
-                parts = fy_str[3:].split("-")
-                fy_start_year = int(parts[0])
-                start_date = f"{fy_start_year}-04-01"
-                end_date = f"{fy_start_year + 1}-03-31"
+                y = int(fy_str[3:].split("-")[0])
+                return f"{y}-04-01", f"{y + 1}-03-31", f"{fy_str} (1 Apr {y} – 31 Mar {y + 1})"
             except (ValueError, IndexError):
-                pass  # Fall through to All Time (no filter)
-            
-        threading.Thread(target=self._calc_taxes, args=(start_date, end_date), daemon=True).start()
+                pass
+        return None, None, "All years"
 
-    def _calc_taxes(self, start_date, end_date):
-        # We need a FIFO queue of ALL buys to match against ALL sells.
-        # This gives us exact holding periods for each sell instance.
-        currency_filter = self._current_currency.get() if hasattr(self, "_current_currency") else "All"
-        from model.engine import get_exchange_rate
+    def load_data(self):
+        # Read the Tk variables here, on the main thread, then work in the background.
+        fy_str = self._current_fy.get()
+        currency = self._current_currency.get()
+        start, end, fy_label = self._fy_window(fy_str)
+        self._load_seq += 1
+        seq = self._load_seq
+        self._caption.config(text="Calculating…")
 
-        with db_session() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT symbol, type, date, qty, price, fee, currency FROM trades ORDER BY date ASC, type ASC, trade_id ASC")
-            trades_raw = cur.fetchall()
+        def work():
+            with db_session() as conn:
+                trades = conn.cursor().execute(
+                    "SELECT broker, symbol, type, date, qty, price, fee, currency FROM trades "
+                    "ORDER BY date ASC, type ASC, trade_id ASC"
+                ).fetchall()
+            if currency != "All":
+                trades = [t for t in trades if str(t[7] or "INR").strip().upper() == currency]
+            rates = {}
 
-            # ── Ground-truth net positions ─────────────────────────────
-            cur.execute(
-                "SELECT broker, symbol, "
-                "  SUM(CASE WHEN type='BUY' THEN qty ELSE 0 END), "
-                "  SUM(CASE WHEN type='SELL' THEN qty ELSE 0 END), "
-                "  currency "
-                "FROM trades GROUP BY broker, symbol, currency"
-            )
-            symbol_net = {}
-            for _, symbol, total_buy, total_sell, cur_currency in cur.fetchall():
-                total_buy = float(total_buy or 0.0)
-                total_sell = float(total_sell or 0.0)
-                cur_currency = str(cur_currency or 'INR').strip().upper()
-                if currency_filter != "All" and cur_currency != currency_filter.upper():
-                    continue
-                symbol_net[symbol] = symbol_net.get(symbol, 0.0) + (total_buy - total_sell)
+            def fx(cur):
+                if currency == "All":
+                    from model.engine import get_exchange_rate
+                    rates[cur] = get_exchange_rate(cur)
+                else:
+                    rates[cur] = 1.0
+                return rates[cur]
 
-        # Filter trades list by active currency filter
-        trades = []
-        for sym, ttype, date_str, qty, px, fee, currency in trades_raw:
-            currency = str(currency or 'INR').strip().upper()
-            if currency_filter != "All" and currency != currency_filter.upper():
-                continue
-            trades.append((sym, ttype, date_str, qty, px, fee, currency))
-            
-        inventory_by_symbol = {}
-        realized_events = []
-        
-        stcg_total = 0.0
-        ltcg_total = 0.0
-        
-        for sym, ttype, date_str, qty, px, fee, currency in trades:
-            ttype = str(ttype).upper()
-            qty = float(qty)
-            px = float(px)
-            fee = float(fee)
-            
-            rate = 1.0 if currency_filter != "All" else get_exchange_rate(currency)
-            
-            if sym not in inventory_by_symbol:
-                inventory_by_symbol[sym] = []
-                
-            q = inventory_by_symbol[sym]
-            
-            if ttype == 'BUY':
-                q.append({'date': date_str, 'qty': qty, 'price': px * rate, 'fee': fee * rate, 'currency': currency})
-            elif ttype == 'SELL':
-                rem_qty = qty
-                
-                while rem_qty > 1e-6 and q:
-                    buy = q[0]
-                    if buy['qty'] <= 1e-6:
-                        q.pop(0)
-                        continue
+            result = compute_realised_gains(trades, start, end, fx_rate=fx)
+            return result, rates, build_table_rows(result, "INR" if currency == "All" else currency)
 
-                    consume = min(rem_qty, buy['qty'])
-                    
-                    # Calculate dates
-                    d_buy = datetime.strptime(buy['date'], '%Y-%m-%d')
-                    d_sell = datetime.strptime(date_str, '%Y-%m-%d')
-                    delta = (d_sell - d_buy).days
-                    is_ltcg = delta > 365
-                    
-                    # Cost block
-                    cost_basis = consume * buy['price']
-                    sale_proceeds = consume * px * rate
-                    
-                    # For simplicity, assign proportion of buy/sell fees to this chunk
-                    chunk_pf = (consume / buy['qty']) * buy['fee'] if buy['qty'] > 0 else 0.0
-                    chunk_sf = (consume / qty) * fee * rate if qty > 0 else 0.0
-                    
-                    net_pnl = sale_proceeds - cost_basis - chunk_pf - chunk_sf
-                    
-                    # Only include this chunk if it falls in our FY window.
-                    include = True
-                    if start_date and date_str < start_date: include = False
-                    if end_date and date_str > end_date: include = False
-                    
-                    if include:
-                        if is_ltcg:
-                            ltcg_total += net_pnl
-                        else:
-                            stcg_total += net_pnl
-                            
-                        realized_events.append({
-                            'sym': sym,
-                            'buy_date': buy['date'],
-                            'date': date_str,
-                            'qty': consume,
-                            'buy_px': buy['price'],
-                            'px': px * rate,
-                            'days': delta,
-                            'type': "LTCG" if is_ltcg else "STCG",
-                            'pnl': net_pnl,
-                            'currency': 'INR' if currency_filter == "All" else currency
-                        })
-                    
-                    buy['qty'] -= consume
-                    rem_qty -= consume
-                    
-                    if buy['qty'] <= 1e-6:
-                        q.pop(0)
-                # If rem_qty > 0 here, this sell had no matching buys
-                # (intraday/cross-broker). Silently skip — the net
-                # position check below will catch inconsistencies.
+        def done(payload):
+            if seq == self._load_seq:
+                result, rates, table_rows = payload
+                self._apply_result(result, rates, table_rows, currency, fy_str, fy_label)
 
-        # Update UI safely
-        self.after(0, lambda: self._apply_data(realized_events, stcg_total, ltcg_total))
+        def failed(err):
+            if seq == self._load_seq:
+                self._show_failure(err)
 
-    def _apply_data(self, events, stcg, ltcg):
-        for it in self.tv.get_children():
-            self.tv.delete(it)
-            
-        currency_filter = self._current_currency.get() if hasattr(self, "_current_currency") else "All"
-        sym_char = "¥" if currency_filter == "JPY" else "₹"
+        run_in_background(work, done, failed, widget=self, name="tax-report")
 
-        # Update summary cards
-        stcg_color = ModernStyle.SUCCESS if stcg >= 0 else ModernStyle.ERROR
-        ltcg_color = ModernStyle.SUCCESS if ltcg >= 0 else ModernStyle.ERROR
-        total = stcg + ltcg
-        total_color = ModernStyle.SUCCESS if total >= 0 else ModernStyle.ERROR
-        
-        stcg_arrow = "▲" if stcg >= 0 else "▼"
-        ltcg_arrow = "▲" if ltcg >= 0 else "▼"
-        total_arrow = "▲" if total >= 0 else "▼"
-        
-        self._stcg_lbl.config(text=f"{stcg_arrow} {sym_char}{abs(stcg):,.2f}", fg=stcg_color)
-        self._ltcg_lbl.config(text=f"{ltcg_arrow} {sym_char}{abs(ltcg):,.2f}", fg=ltcg_color)
-        self._total_lbl.config(text=f"{total_arrow} {sym_char}{abs(total):,.2f}", fg=total_color)
-        
-        # Insert table data
-        events.sort(key=lambda x: x['date'], reverse=True)
-        
-        for idx, row in enumerate(events):
-            stripe = 'odd' if idx % 2 else 'even'
-            tag = 'ltcg' if row['type'] == 'LTCG' else 'stcg'
-            
-            pnl_arrow = "▲" if row['pnl'] >= 0 else "▼"
-            row_currency = row.get('currency', 'INR')
-            row_sym = "¥" if row_currency == "JPY" else "₹"
+    def _set_stat(self, key, value, currency):
+        lbl = self._stat[key]
+        if value is None:
+            lbl.config(text="—", fg=ModernStyle.TEXT_TERTIARY)
+        else:
+            lbl.config(text=signed_money(value, currency), fg=gain_colour(value))
 
-            vals = (
-                idx + 1,
-                row['sym'],
-                row['buy_date'],
-                row['date'],
-                f"{row['qty']:g}",
-                f"{row_sym}{row['buy_px']:,.2f}",
-                f"{row_sym}{row['px']:,.2f}",
-                f"{row['days']} days",
-                row['type'],
-                f"{pnl_arrow} {row_sym}{abs(row['pnl']):,.2f}"
-            )
-            
-            self.tv.insert("", "end", values=vals, tags=(stripe, tag))
+    def _show_failure(self, err):
+        """Clear everything so last year's totals are never left on screen."""
+        for key in self._stat:
+            self._set_stat(key, None, "INR")
+        self.tv.delete(*self.tv.get_children())
+        self._empty.place_forget()
+        self._caption.config(text="Not available")
+        self._show_notes([("error", f"✖  The report could not be worked out: {err}. "
+                                    "Nothing below is up to date. The details are in the app log.")])
+
+    def _fill_table(self, table_rows, seq, start=0):
+        if seq != self._load_seq:
+            return  # a newer report replaced this one
+        chunk = 1000 if start == 0 else 2500
+        for i in range(start, min(start + chunk, len(table_rows))):
+            values, tag = table_rows[i]
+            self.tv.insert("", "end", values=(i + 1,) + values, tags=("odd" if i % 2 else "even", tag))
+        if start + chunk < len(table_rows):
+            self.after(1, lambda: self._fill_table(table_rows, seq, start + chunk))
+
+    def _apply_result(self, res, rates, table_rows, currency, fy_str, fy_label):
+        disp = "INR" if currency == "All" else currency
+        non_inr = sorted(c for c in res.currencies if c != "INR")
+
+        # Totals ("—" where a total does not apply to the chosen currency)
+        self._set_stat("short", res.short_term if currency != "JPY" else None, disp)
+        self._set_stat("long", res.long_term if currency != "JPY" else None, disp)
+        self._set_stat("other", res.not_split if (non_inr or currency == "JPY") else None, disp)
+        self._set_stat("net", res.net, disp)
+        self._fit_stats()
+
+        # Messages: problems first, then how the numbers were worked out
+        notes = []
+        if res.unmatched_sells:
+            n = len(res.unmatched_sells)
+            notes.append(("warning",
+                f"⚠  {n} sale{'s' if n != 1 else ''} had no earlier buy at the same broker, so "
+                f"{'they are' if n != 1 else 'it is'} not counted in the totals. "
+                "They are listed first in the table (Term: No buy found). Check that the buy was "
+                "entered for the same broker and currency."))
+        if res.skipped:
+            n = len(res.skipped)
+            examples = "; ".join(f"{s.symbol or '?'} ({s.broker or '?'}): {s.reason}" for s in res.skipped[:3])
+            more = f"; and {n - 3} more" if n > 3 else ""
+            notes.append(("warning",
+                f"⚠  {n} trade{'s' if n != 1 else ''} could not be read and {'were' if n != 1 else 'was'} "
+                f"left out: {examples}{more}. Please correct {'them' if n != 1 else 'it'} in Trade History."))
+        if currency == "All" and non_inr:
+            parts = ", ".join(f"{currency_symbol(c)}1 = ₹{rates.get(c, 0.0):.4f}" for c in non_inr)
+            notes.append(("info",
+                f"ℹ  Amounts are in ₹. {', '.join(non_inr)} sales are converted at today's "
+                f"exchange rate ({parts}), because past exchange rates are not stored."))
+        if non_inr or currency == "JPY":
+            text = "ℹ  " + " ".join(res.notes) if res.notes else (
+                "ℹ  JPY gains are not split into short and long term: Japan taxes listed-share "
+                "gains at one flat rate (about 20.315%).")
+            if fy_str.startswith("FY ") and ("JPY" in non_inr or currency == "JPY"):
+                text += " Japan's tax year is January to December; this year picker uses the Indian April to March year."
+            notes.append(("info", text))
+        self._show_notes(notes)
+
+        # Table: filled in slices so a long "All Time" list never freezes the window
+        self.tv.delete(*self.tv.get_children())
+        self._fill_table(table_rows, self._load_seq)
+        sym = currency_symbol(disp)
+
+        n = len(res.rows)
+        cur_label = "all currencies" if currency == "All" else currency
+        self._caption.config(text=f"{fy_label} · {cur_label} · {n:,} sale row{'s' if n != 1 else ''}"
+                                  f" · amounts in {sym.strip()}")
+
+        if not table_rows:
+            which = "" if currency == "All" else f" ({currency})"
+            if fy_str.startswith("FY "):
+                msg = f"No realised sales in {fy_str}{which}.\nShares you sell during this year will be listed here."
+            else:
+                msg = f"No realised sales yet{which}.\nShares you sell will be listed here."
+            self._empty.config(text=msg)
+            self._empty.place(relx=0.5, rely=0.45, anchor="center")
+        else:
+            self._empty.place_forget()

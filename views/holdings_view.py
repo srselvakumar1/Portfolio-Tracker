@@ -1,1792 +1,1824 @@
 """
-Holdings View - Tkinter Implementation
-Modern, premium aesthetic with real-time data display
+Holdings page: what you own, one row per stock per broker.
+
+The same stock bought through two brokers shows as two rows; the Broker column
+tells them apart. Rows come from the shared in-memory cache
+(app_state.data_cache). Filtering and formatting run in a background thread and
+only the finished rows are put into the table on the Tk thread, so the window
+never freezes. The cache is reloaded from the database only when needed: on the
+first visit if it is still empty, after an edit or delete made here, when
+another page asks for it (view._data_loaded = False) or with ⟳ Refresh.
+
+Row colours mean one thing only, the gain or loss on the shares still held:
+light green = in profit, light red = down more than 10 %.
 """
 
+import math
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox
-import threading
-import pandas as pd
 from typing import Optional
-from model.data_cache import DataCache, HoldingsFilters, TradeHistoryFilters
-from model.database import db_session
-import model.crud as crud
 
-from ui_theme import ModernStyle
-from ui_widgets import ModernButton, ModernEntry, PremiumModal, ModernDropdown, ModernCard, ClearableEntry
-from ui_utils import center_window, add_treeview_copy_menu, treeview_sort_column, fade_color_transition
+import pandas as pd
+
+import model.crud as crud
+from model.app_settings import load_settings, save_settings
+from model.applog import log
+from model.data_cache import DataCache, HoldingsFilters, TradeHistoryFilters
+from ui.ui_theme import ModernStyle
+from ui.ui_utils import (HeadingTips, ToolTip, format_money, run_in_background, show_toast,
+                         treeview_sort_column)
+from ui.ui_widgets import ClearableEntry, ModernButton, ModernCard, PremiumModal
 from views.base_view import BaseView
 
+
+# ── Settings and rules ────────────────────────────────────────────────────────
+LOSS_TINT_PCT = -10.0          # rows losing more than this are tinted light red
+WEIGHT_PCT_PER_BLOCK = 4.0     # weight bar: each ▰ is 4 % of the total (5 = 20 %)
+FILTER_DEBOUNCE_MS = 250       # wait this long after the last filter change
+HIDDEN_COLUMNS_KEY = "holdings_hidden_columns"
+
+CURRENCY_SYMBOLS = {"INR": "₹", "JPY": "¥", "USD": "$", "GBP": "£", "CNY": "¥"}
+
+# (column id, heading, sample text used to size the column, anchor)
+COLUMNS = [
+    ("num",      "#",              "999",              "center"),
+    ("symbol",   "Symbol",         "BANDHANBNK",       "w"),
+    ("broker",   "Broker",         "Mithun-Kite",      "w"),
+    ("name",     "Name",           "Bharat Electronics", "w"),
+    ("qty",      "Qty",            "12,345",           "e"),
+    ("avg",      "Avg Cost",       "₹12,345.67",       "e"),
+    ("price",    "Price",          "₹12,345.67",       "e"),
+    ("day",      "Day Chg",        "▼ 12.34%",         "e"),
+    ("unreal",   "Unrealised P&L", "▼ ₹123,456",       "e"),
+    ("pnl_pct",  "P&L %",          "▼ 12.3%",          "e"),
+    ("weight",   "Weight",         "▰▰▰▰▰  12.3%",     "w"),
+    ("xirr",     "XIRR",           "-100.00%",         "e"),
+    ("cagr",     "CAGR",           "-100.00%",         "e"),
+    ("realised", "Realised P&L",   "▼ ₹123,456",       "e"),
+    ("total",    "Total P&L",      "▼ ₹123,456",       "e"),
+    ("fees",     "Fees",           "₹12,345.67",       "e"),
+    ("pe",       "P/E",            "106.68",           "e"),
+    ("signal",   "Signal",         "➕ Accumulate",    "w"),
+]
+COLUMN_IDS = [c[0] for c in COLUMNS]
+HEADINGS = {c[0]: c[1] for c in COLUMNS}
+ALWAYS_SHOWN = ("num", "symbol")
+# Hidden until the user turns them on, so the table fits a normal window.
+DEFAULT_HIDDEN = ["day", "xirr", "cagr", "realised", "total", "fees", "pe"]
+
+# What each column means, shown in the "Columns" menu.
+COLUMN_HELP = {
+    "broker":   "Broker (the account holding the shares)",
+    "name":     "Name",
+    "qty":      "Qty (shares held)",
+    "avg":      "Avg Cost (average price paid)",
+    "price":    "Price (latest market price)",
+    "day":      "Day Chg (price change today)",
+    "unreal":   "Unrealised P&L (on shares you still hold)",
+    "pnl_pct":  "P&L % (gain or loss on shares you hold)",
+    "weight":   "Weight (share of the total; each ▰ = 4%)",
+    "xirr":     "XIRR (yearly return from your cash flows)",
+    "cagr":     "CAGR (yearly growth rate)",
+    "realised": "Realised P&L (from shares already sold)",
+    "total":    "Total P&L (realised + unrealised)",
+    "fees":     "Fees (all brokerage and charges)",
+    "pe":       "P/E (price ÷ earnings per share)",
+    "signal":   "Signal (advisor suggestion)",
+}
+
+# Signal filter: button label → value stored in the database
+SIGNAL_FILTERS = {
+    "All": "All",
+    "Accumulate": "ACCUMULATE",
+    "Hold": "HOLD",
+    "Reduce": "REDUCE",
+    "No signal": "N/A",
+}
+STATUS_TEXT = {"Active": "active holding", "Closed": "closed position", "All": "holding (active + closed)"}
+
+
+# ── Small pure helpers (safe to call from worker threads) ─────────────────────
+def _num(value) -> float:
+    """float(value), with None / NaN / text turned into 0.0."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if f != f else f
+
+
+def _money0(value: float, currency: str) -> str:
+    """Money without paise/sen, e.g. ₹1,234 or -¥56,000."""
+    s = format_money(round(value), currency)
+    return s[:-3] if s.endswith(".00") else s
+
+
+def _pnl_text(value: float, currency: str) -> str:
+    """▲ ₹1,234 for a gain, ▼ ₹1,234 for a loss (the arrow carries the sign)."""
+    if abs(value) < 0.5:
+        return _money0(0, currency)
+    return f"{'▲' if value > 0 else '▼'} {_money0(abs(value), currency)}"
+
+
+def _pct_text(pct: float, decimals: int = 2) -> str:
+    """▲ 1.23% / ▼ 1.23% / 0.00% (the arrow carries the sign)."""
+    if abs(pct) < 0.5 * 10 ** -decimals:
+        return f"{0:.{decimals}f}%"
+    return f"{'▲' if pct > 0 else '▼'} {abs(pct):.{decimals}f}%"
+
+
+def _qty_text(qty: float) -> str:
+    return f"{qty:,.0f}" if float(qty).is_integer() else f"{qty:,.2f}"
+
+
+def _weight_text(pct: float) -> str:
+    """A 5-block bar (each block = 4 % of the total) followed by the percentage."""
+    filled = 0 if pct < 0.5 else min(5, math.ceil(pct / WEIGHT_PCT_PER_BLOCK))
+    return "▰" * filled + "▱" * (5 - filled) + f"  {pct:.1f}%"
+
+
+def _signal_text(signal) -> str:
+    s = str(signal if signal is not None else "").strip().upper()
+    if s in {"ACCUMULATE", "BUY", "ADD"}:
+        return "➕ Accumulate"
+    if s in {"REDUCE", "SELL", "TRIM"}:
+        return "➖ Reduce"
+    if s in {"HOLD", "WAIT"}:
+        return "⏸ Hold"
+    if s in {"", "N/A", "NA", "NAN", "NONE"}:
+        return "No signal"
+    return str(signal).title()
+
+
+def _clean_name(value) -> str:
+    if value is None or (isinstance(value, float) and value != value):
+        return ""
+    return str(value).strip()
+
+
+def _short(text: str, limit: int = 28) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _cur_symbol(currency: str) -> str:
+    return CURRENCY_SYMBOLS.get(str(currency or "INR").upper(), str(currency or "INR").upper() + " ")
+
+
+def _refresh_shared_cache(cache: DataCache, app_state) -> None:
+    """Reload the shared cache (and the broker list) from the database. Worker thread only."""
+    try:
+        from model.database import _invalidate_thread_connection
+        _invalidate_thread_connection()
+    except Exception:
+        pass
+    if app_state is not None and getattr(app_state, "data_cache", None) is cache \
+            and hasattr(app_state, "refresh_data_cache"):
+        app_state.refresh_data_cache()
+    else:
+        cache.refresh_from_db()
+
+
+def _broker_info(app_state) -> tuple[list, dict]:
+    """(broker names, {broker: currency}). Worker thread only."""
+    try:
+        if app_state is not None and hasattr(app_state, "get_brokers_cached"):
+            brokers = list(app_state.get_brokers_cached() or [])
+            currencies = dict(app_state.get_broker_currencies_cached() or {})
+        else:
+            brokers = list(crud.get_all_brokers())
+            currencies = dict(crud.get_broker_currencies())
+        return brokers, currencies
+    except Exception:
+        log.warning("Holdings: could not read the broker list", exc_info=True)
+        return [], {}
+
+
+def _compute_holdings(cache: DataCache, p: dict) -> dict:
+    """Filter the cache and build every table row and total. Worker thread only.
+
+    `p` holds plain filter values read from the Tk variables beforehand.
+    """
+    from model.engine import get_exchange_rate
+
+    state = p["state"]
+    filters = HoldingsFilters(
+        broker=p["broker"], currency=p["currency"], symbol_like=p["symbol"].upper(),
+        iv_signal=p["signal"], exclude_zero_qty=(state == "Active"), zero_qty_only=(state == "Closed"),
+    )
+    df, summary = cache.get_holdings_filtered(filters)
+    if p["symbol"] or p["signal"] != "All":
+        # Weight % is measured against everything you hold, not just the matches
+        base = HoldingsFilters(broker=p["broker"], currency=p["currency"],
+                               exclude_zero_qty=(state == "Active"), zero_qty_only=(state == "Closed"))
+        _, base_summary = cache.get_holdings_filtered(base)
+    else:
+        base_summary = summary
+    total_value = _num(base_summary.get("current"))
+
+    convert = p["currency"] == "All"     # mixed currencies are added up in ₹
+    rates: dict = {}
+
+    def rate(cur: str) -> float:
+        if not convert:
+            return 1.0
+        if cur not in rates:
+            rates[cur] = _num(get_exchange_rate(cur)) or 1.0
+        return rates[cur]
+
+    if df is not None and not df.empty and "symbol" in df.columns:
+        df = df.sort_values(["symbol", "broker"], kind="stable")
+
+    rows = []
+    unreal_total = real_total = fee_total = 0.0
+    for row in (df.itertuples(index=False) if df is not None and not df.empty else ()):
+        cur = str(getattr(row, "currency", "") or "INR").strip().upper()
+        if cur in ("NAN", "NONE"):
+            cur = "INR"
+        qty = _num(getattr(row, "qty", 0))
+        avg = _num(getattr(row, "avg_price", 0))
+        mkt = _num(getattr(row, "market_price", 0))
+        prev = _num(getattr(row, "previous_close", 0))
+        running = _num(getattr(row, "running_pnl", 0))
+        realised = _num(getattr(row, "realized_pnl", 0))
+        fees = _num(getattr(row, "total_fees", 0))
+        pe = _num(getattr(row, "pe_ratio", 0))
+        xirr = _num(getattr(row, "xirr", 0))
+        cagr = _num(getattr(row, "cagr", 0))
+        value = _num(getattr(row, "current_value", 0))
+        symbol = str(getattr(row, "symbol", "") or "")
+        broker = str(getattr(row, "broker", "") or "")
+        stock_name = _clean_name(getattr(row, "stock_name", ""))
+        signal = getattr(row, "action_signal", None)
+
+        held = qty > 0
+        unreal = (mkt - avg) * qty if held and mkt > 0 else None
+        pnl_pct = ((mkt / avg) - 1.0) * 100.0 if held and mkt > 0 and avg > 0 else None
+        day_pct = ((mkt - prev) / prev) * 100.0 if mkt > 0 and prev > 0 else None
+        weight = (value * rate(cur) / total_value) * 100.0 if held and total_value > 0 else None
+
+        r = rate(cur)
+        unreal_total += (unreal or 0.0) * r
+        real_total += realised * r
+        fee_total += fees * r
+
+        if pnl_pct is not None and pnl_pct > 0:
+            tint = "gain"
+        elif pnl_pct is not None and pnl_pct < LOSS_TINT_PCT:
+            tint = "loss"
+        else:
+            tint = None
+
+        values = (
+            "",                                                   # row number, set on display
+            symbol or "—",
+            broker or "—",
+            _short(stock_name) if stock_name else "—",
+            _qty_text(qty),
+            format_money(avg, cur) if avg > 0 else "—",
+            format_money(mkt, cur) if mkt > 0 else "—",
+            _pct_text(day_pct) if day_pct is not None else "—",
+            _pnl_text(unreal, cur) if unreal is not None else "—",
+            _pct_text(pnl_pct, 1) if pnl_pct is not None else "—",
+            _weight_text(weight) if weight is not None else "—",
+            f"{xirr:.2f}%" if held and xirr != -100 else "—",
+            f"{cagr:.2f}%" if held else "—",
+            _pnl_text(realised, cur) if realised else "—",
+            _pnl_text(running, cur),
+            format_money(fees, cur),
+            f"{pe:.2f}" if pe > 0 else "—",
+            _signal_text(signal),
+        )
+        meta = {
+            "broker": broker, "symbol": symbol, "stock_name": stock_name, "currency": cur,
+            "qty": qty, "avg_price": avg, "market_price": mkt, "running_pnl": running,
+            "realized_pnl": realised, "total_fees": fees, "tint": tint,
+        }
+        rows.append((values, meta))
+
+    return {
+        "rows": rows,
+        "invested": _num(summary.get("invested")),
+        "current": _num(summary.get("current")),
+        "unrealised": unreal_total,
+        "realised": real_total,
+        "fees": fee_total,
+    }
+
+
+def _trade_rows(tdf: pd.DataFrame, fallback_currency: str) -> list:
+    """Rows for the drill-down trade table. Worker thread only."""
+    from datetime import datetime
+    rows = []
+    if tdf is None or tdf.empty:
+        return rows
+    for i, r in enumerate(tdf.itertuples(index=False)):
+        rtype = str(getattr(r, "type", "")).upper()
+        cur = str(getattr(r, "currency", "") or fallback_currency).strip().upper() or fallback_currency
+        if rtype in {"BUY", "B"}:
+            type_disp, tag = "▲ BUY", "buy"
+        elif rtype in {"SELL", "S"}:
+            type_disp, tag = "▼ SELL", "sell"
+        else:
+            type_disp, tag = rtype, ""
+        raw_d = str(getattr(r, "date", ""))
+        try:
+            disp_d = datetime.strptime(raw_d, "%Y-%m-%d").strftime("%Y-%b-%d")
+        except ValueError:
+            disp_d = raw_d
+        rows.append(((
+            str(i + 1),
+            disp_d,
+            str(getattr(r, "trade_id", "")),
+            type_disp,
+            _qty_text(_num(getattr(r, "qty", 0))),
+            format_money(_num(getattr(r, "price", 0)), cur),
+            format_money(_num(getattr(r, "fee", 0)), cur),
+            _qty_text(_num(getattr(r, "run_qty", 0))),
+            format_money(_num(getattr(r, "avg_cost", 0)), cur),
+            _pnl_text(_num(getattr(r, "running_pnl", 0)), cur),
+            str(getattr(r, "broker", "")),
+        ), tag))
+    return rows
+
+
+def _copy_cell(value) -> str:
+    """A table cell as a plain number/text for pasting into a spreadsheet."""
+    s = str(value)
+    negative = "▼" in s
+    for ch in ("₹", "¥", "$", "£", ",", "%", "▲", "▼", "▰", "▱"):
+        s = s.replace(ch, "")
+    s = s.strip()
+    if negative and s and not s.startswith("-"):
+        s = "-" + s   # ▼ shows a loss without a minus sign; keep it negative when pasted
+    return s
+
+
+# ── Widgets ───────────────────────────────────────────────────────────────────
+class FilterButtonGroup(ModernCard):
+    """A row of pill buttons that act like radio buttons (exactly one is selected).
+
+    Canvas-based ModernButtons avoid the macOS redraw flicker of tk.Radiobutton.
+    """
+
+    def __init__(self, parent, options, variable, command, per_option_colors, bg, height=30, gap=4):
+        super().__init__(
+            parent,
+            bg=bg,
+            canvas_bg=parent.cget("bg"),
+            highlight_color=ModernStyle.BORDER_COLOR,
+            highlight_thickness=1,
+            radius=20,
+        )
+        self.variable = variable
+        self.command = command
+        self.per_option_colors = per_option_colors
+        self.buttons = {}
+        self._shown = None
+        measure = tkfont.Font(font=ModernStyle.FONT_BODY_BOLD).measure
+
+        for opt in options:
+            btn = ModernButton(
+                self.content, text=opt, font=ModernStyle.FONT_BODY_BOLD,
+                width=max(44, measure(opt) + 18), height=height, canvas_bg=bg, radius=14,
+                command=lambda v=opt: self._select(v),
+            )
+            btn.pack(side=tk.LEFT, padx=gap // 2, pady=3)
+            self.buttons[opt] = btn
+
+        self.variable.trace_add("write", self._on_var_changed)
+        self._update_ui()
+
+    def _select(self, val):
+        if self.variable.get() != val:
+            self.variable.set(val)
+
+    def _on_var_changed(self, *_):
+        self._update_ui()
+        if self.command:
+            self.command()
+
+    def _update_ui(self):
+        sel = self.variable.get()
+        if sel == self._shown:
+            return
+        for opt, btn in self.buttons.items():
+            if opt == sel:
+                bg, fg = self.per_option_colors.get(opt, (ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ON_ACCENT))
+                btn.set_palette(bg=bg, fg=fg, hover_bg=bg, pressed_bg=bg)
+            elif opt == self._shown or self._shown is None:
+                btn.set_palette(bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY,
+                                hover_bg=ModernStyle.BG_HOVER, pressed_bg=ModernStyle.BORDER_COLOR)
+        self._shown = sel
+
+
+# ── The page ──────────────────────────────────────────────────────────────────
 class HoldingsView(BaseView):
     def build(self):
-        self._search_timer = None
-        self.current_df: Optional[pd.DataFrame] = None
         self._row_meta: dict[str, dict] = {}
-        
-        # Initialize data cache
-        self.data_cache = DataCache()
-        try:
-            self.data_cache.refresh_from_db()
-        except Exception as e:
-            print(f"Error loading data cache: {e}")
-            
+        self._own_cache: Optional[DataCache] = None
+
+        # Loading state: one background load at a time, newest filters win
+        self._load_gen = 0
+        self._load_running = False
+        self._want_refresh = False
+        self._filter_timer = None
+        self._shown_version = None      # cache version the table was built from
+        self._shown_params = None       # filters the table was built with
+        self._refreshing = False        # ⟳ Refresh (prices) in progress
+        self._brokers: list = []
+        self._broker_currency: dict = {}
+
+        # Sorting
+        self._sort_col: Optional[str] = None
+        self._sort_reverse = False
+
+        # Fonts for measuring column / KPI widths
+        self._font_table = tkfont.Font(font=ModernStyle.FONT_TABLE)
+        self._font_table_bold = tkfont.Font(font=ModernStyle.FONT_TABLE_BOLD)
+        self._font_kpi_big = tkfont.Font(font=ModernStyle.FONT_KPI_VALUE)
+        self._font_kpi_label = tkfont.Font(font=ModernStyle.FONT_KPI_LABEL)
+        self._kpi_big = True
+
+        self.currency_var = tk.StringVar(value="INR")
+        self.currency_var.trace_add("write", lambda *_: self._on_currency_changed())
+
+        self._hidden_cols = self._load_hidden_columns()
+
         self._build_header()
         self._build_filter_panel()
         self._build_stats_card()
+        self._build_info_bar()
         self._build_table()
-        self.load_data()
-    
+
+        # main.py calls on_show() right after building; this covers any other path.
+        self.after_idle(self._first_load_if_needed)
+
+    # ── Data source ───────────────────────────────────────────────────────
+    def _cache(self) -> DataCache:
+        """The app's shared cache (a private one only if there is no app_state)."""
+        cache = getattr(self.app_state, "data_cache", None) if self.app_state is not None else None
+        if cache is not None:
+            return cache
+        if self._own_cache is None:
+            self._own_cache = DataCache()
+        return self._own_cache
+
+    # ── Header ────────────────────────────────────────────────────────────
     def _build_header(self):
+        def _build_right(parent):
+            self._currency_btns = {}
+            for code in ("INR", "JPY"):
+                btn = ModernButton(
+                    parent, text=f"{_cur_symbol(code)} {code}",
+                    command=lambda c=code: self.currency_var.set(c),
+                    bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+                    width=86, height=32, radius=14, font=ModernStyle.FONT_BODY_BOLD,
+                )
+                btn.pack(side="left", padx=(0, 6))
+                ToolTip(btn, f"Show holdings bought in {'Indian rupees' if code == 'INR' else 'Japanese yen'}")
+                self._currency_btns[code] = btn
+            self._update_currency_buttons()
+
+            self._refresh_btn = ModernButton(
+                parent, text="↻ Refresh", command=self.refresh,
+                bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
+                width=150, height=32,
+            )
+            self._refresh_btn.pack(side="left", padx=(10, 0))
+            ToolTip(self._refresh_btn, "Fetch the latest prices from the internet and recalculate every holding")
+
         self.add_gradient_header(
             self,
             "💹 Holdings",
-            "Manage and monitor your stock portfolio",
-            show_divider=False
+            "What you own, one row per stock per broker",
+            show_divider=True,
+            right_widget_func=_build_right,
         )
-    
+
+    def _update_currency_buttons(self):
+        sel = self.currency_var.get()
+        fills = {"INR": ModernStyle.SUCCESS_FILL, "JPY": ModernStyle.PURPLE_FILL}
+        for code, btn in getattr(self, "_currency_btns", {}).items():
+            if code == sel:
+                btn.set_palette(bg=fills.get(code, ModernStyle.ACCENT_PRIMARY))
+                btn.set_text(f"✓ {_cur_symbol(code)} {code}")
+            else:
+                btn.set_palette(bg=ModernStyle.NEUTRAL_FILL)
+                btn.set_text(f"{_cur_symbol(code)} {code}")
+
+    def _on_currency_changed(self):
+        self._update_currency_buttons()
+        self.on_filter_change()
+
+    # ── Filter bar ────────────────────────────────────────────────────────
     def _build_filter_panel(self):
-        """Build filters grouped into two visual zones, separated by a colored divider."""
-        from ui_widgets import ModernSegmentedControl
+        """Broker, symbol search, signal and status filters.
 
-        CTRL_HEIGHT = 32  # unified control height for the whole bar
-        FONT = ModernStyle.FONT_HEADING
+        In a narrow window the bar wraps onto two lines instead of cutting off.
+        """
+        CTRL_HEIGHT = 30
+        BG = ModernStyle.BG_SECONDARY
+        FONT_LBL = ModernStyle.FONT_SUBHEADING
 
-        filter_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        filter_frame.pack(fill=tk.X, padx=20, pady=(4, 2))
+        wrapper = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        wrapper.pack(fill=tk.X, padx=20, pady=(4, 2))
+        self._toolbar = toolbar = tk.Frame(
+            wrapper, bg=BG, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1, bd=0,
+        )
+        toolbar.pack(fill=tk.X, expand=True)
 
-        # ── GROUP 1: Search ────────────────────────────────────────────────────
-        grp1 = tk.Frame(filter_frame, bg=ModernStyle.BG_SECONDARY)
-        grp1.pack(side=tk.LEFT, padx=(0, 0), pady=4, anchor=tk.CENTER)
+        def _group(label_text, tooltip=None, divider=True, fg=None):
+            g = tk.Frame(toolbar, bg=BG)
+            div = tk.Frame(g, bg=ModernStyle.DIVIDER_COLOR, width=2)
+            if divider:
+                div.pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=(0, 4))
+            lbl = tk.Label(g, text=label_text, bg=BG, fg=fg or ModernStyle.TEXT_SECONDARY, font=FONT_LBL)
+            lbl.pack(side=tk.LEFT, padx=(6, 4), pady=6)
+            if tooltip:
+                ToolTip(lbl, tooltip)
+            g._divider, g._label = div, lbl
+            return g
 
         # Broker
-        tk.Label(
-            grp1, text="🏦 Broker:", bg=ModernStyle.BG_SECONDARY,
-            fg=ModernStyle.TEXT_PRIMARY, font=FONT
-        ).pack(side=tk.LEFT, padx=(10, 4), pady=4, anchor=tk.CENTER)
+        broker_grp = _group("Broker", "Show one broker's account, or All", divider=False, fg=ModernStyle.TEXT_PURPLE)
         self.broker_var = tk.StringVar(value="All")
         self.broker_combo = ttk.Combobox(
-            grp1, textvariable=self.broker_var,
-            values=["All"], state="readonly", width=12, font=ModernStyle.FONT_TABLE
+            broker_grp, textvariable=self.broker_var, values=["All"],
+            state="readonly", width=10, font=ModernStyle.FONT_TABLE,
         )
-        self.broker_combo.pack(side=tk.LEFT, padx=(0, 6), pady=6, anchor=tk.CENTER)
-        try:
-            self.broker_var.trace_add("write", lambda *args: self._on_broker_selected())
-        except Exception:
-            pass
-
-        # Currency variable (no UI toggle — auto-detected from broker/data)
-        self.currency_var = tk.StringVar(value="INR")
-
-        # Thin inner divider
-        tk.Frame(grp1, bg=ModernStyle.ACCENT_PRIMARY, width=1).pack(
-            side=tk.LEFT, fill=tk.Y, pady=6
-        )
+        self.broker_combo.pack(side=tk.LEFT, padx=(0, 8), pady=6)
+        self.broker_var.trace_add("write", lambda *_: self._on_broker_selected())
 
         # Symbol search
-        tk.Label(
-            grp1, text="🔍 Symbol:", bg=ModernStyle.BG_SECONDARY,
-            fg=ModernStyle.TEXT_PRIMARY, font=FONT
-        ).pack(side=tk.LEFT, padx=(8, 4), pady=4, anchor=tk.CENTER)
+        symbol_grp = _group("Symbol", "Type part of a symbol, e.g. HDFC", fg=ModernStyle.TEXT_ACCENT)
         self._symbol_bar = ClearableEntry(
-            grp1,
-            placeholder="Search...",
-            on_change=self._on_symbol_search,
-            bg=ModernStyle.ENTRY_BG,
-            fg=ModernStyle.ACCENT_PRIMARY,
-            font=ModernStyle.FONT_INPUT,
-            width=15,
+            symbol_grp, placeholder="Search symbol…", on_change=self._on_symbol_search,
+            bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_ACCENT, font=ModernStyle.FONT_TABLE, width=11,
         )
-        self._symbol_bar.pack(side=tk.LEFT, padx=(0, 10), pady=6, anchor=tk.CENTER)
+        self._symbol_bar.pack(side=tk.LEFT, padx=(0, 8), pady=6)
         self.symbol_entry = self._symbol_bar.entry
 
-        # ── COLORED VERTICAL DIVIDER ─────────────────────────────────────────
-        tk.Frame(filter_frame, bg=ModernStyle.ACCENT_PRIMARY, width=3).pack(
-            side=tk.LEFT, fill=tk.Y, padx=8, pady=6
+        # Signal
+        signal_grp = _group(
+            "Signal",
+            "Advisor signal: Accumulate (buy more), Hold, Reduce (sell some), "
+            "or No signal (the advisor has no view on this stock)",
+            fg=ModernStyle.WARNING,
         )
-
-        # ── GROUP 2: Filters ──────────────────────────────────────────────────
-        grp2 = tk.Frame(filter_frame, bg=ModernStyle.BG_SECONDARY)
-        grp2.pack(side=tk.LEFT, padx=(0, 0), pady=4, anchor=tk.CENTER)
-
-        # Signal segmented control
-        tk.Label(
-            grp2, text="📊 Signal:", bg=ModernStyle.BG_SECONDARY,
-            fg=ModernStyle.TEXT_PRIMARY, font=FONT
-        ).pack(side=tk.LEFT, padx=(10, 4), pady=4, anchor=tk.CENTER)
         self.signal_var = tk.StringVar(value="All")
-        signal_seg = ModernSegmentedControl(
-            grp2,
-            options=["All", "Accumulate", "Reduce", "None"],
-            variable=self.signal_var,
-            command=self.on_filter_change,
-            bg=ModernStyle.BG_TERTIARY,
-            fg=ModernStyle.TEXT_SECONDARY,
-            container_bg=ModernStyle.BG_SECONDARY,
-            font=FONT,
-            height=CTRL_HEIGHT,
+        FilterButtonGroup(
+            signal_grp, options=list(SIGNAL_FILTERS), variable=self.signal_var,
+            command=self.on_filter_change, bg=BG, height=CTRL_HEIGHT, gap=4,
             per_option_colors={
-                "Accumulate": (ModernStyle.SUCCESS,        ModernStyle.TEXT_ON_ACCENT),
-                "Reduce":     (ModernStyle.ERROR,          ModernStyle.TEXT_ON_ACCENT),
                 "All":        (ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ON_ACCENT),
-                "None":       (ModernStyle.TEXT_SECONDARY, ModernStyle.TEXT_ON_ACCENT),
+                "Accumulate": (ModernStyle.SUCCESS_FILL, ModernStyle.TEXT_ON_ACCENT),
+                "Hold":       (ModernStyle.INFO_FILL, ModernStyle.TEXT_ON_ACCENT),
+                "Reduce":     (ModernStyle.ERROR_FILL, ModernStyle.TEXT_ON_ACCENT),
+                "No signal":  (ModernStyle.NEUTRAL_FILL, ModernStyle.TEXT_ON_ACCENT),
             },
-        )
-        signal_seg.pack(side=tk.LEFT, padx=(0, 6), pady=4, anchor=tk.CENTER)
+        ).pack(side=tk.LEFT, padx=(0, 8), pady=6)
 
-        # Thin inner divider
-        tk.Frame(grp2, bg=ModernStyle.SUCCESS, width=1).pack(
-            side=tk.LEFT, fill=tk.Y, pady=6
-        )
-
-        # Position / state segmented control
-        tk.Label(
-            grp2, text="🛡️ Filter:", bg=ModernStyle.BG_SECONDARY,
-            fg=ModernStyle.TEXT_PRIMARY, font=FONT
-        ).pack(side=tk.LEFT, padx=(8, 4), pady=4, anchor=tk.CENTER)
+        # Status
+        status_grp = _group("Status", "Active: shares you still hold. Closed: everything sold. All: both.", fg=ModernStyle.SUCCESS)
         self.holding_state_var = tk.StringVar(value="Active")
-        state_seg = ModernSegmentedControl(
-            grp2,
-            options=["All", "Active", "Closed"],
-            variable=self.holding_state_var,
-            command=self.on_filter_change,
-            bg=ModernStyle.BG_TERTIARY,
-            fg=ModernStyle.TEXT_SECONDARY,
-            container_bg=ModernStyle.BG_SECONDARY,
-            active_bg=ModernStyle.SUCCESS,
-            font=FONT,
-            height=CTRL_HEIGHT,
+        FilterButtonGroup(
+            status_grp, options=["All", "Active", "Closed"], variable=self.holding_state_var,
+            command=self.on_filter_change, bg=BG, height=CTRL_HEIGHT, gap=4,
+            per_option_colors={
+                "All":    (ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ON_ACCENT),
+                "Active": (ModernStyle.SUCCESS_FILL, ModernStyle.TEXT_ON_ACCENT),
+                "Closed": (ModernStyle.NEUTRAL_FILL, ModernStyle.TEXT_ON_ACCENT),
+            },
+        ).pack(side=tk.LEFT, padx=(0, 8), pady=6)
+
+        self._filter_groups = (broker_grp, symbol_grp, signal_grp, status_grp)
+        self._toolbar_wide = None
+        self._toolbar_needed = None     # width needed for one line, measured once
+        self._layout_filters(True)
+        toolbar.bind("<Configure>", self._on_toolbar_resize)
+
+    def _layout_filters(self, wide: bool) -> None:
+        """One line: Broker | Symbol | Signal | Status. Two lines: Broker | Symbol | Status, then Signal."""
+        broker_grp, symbol_grp, signal_grp, status_grp = self._filter_groups
+        for g in self._filter_groups:
+            g.grid_forget()
+        if wide:
+            order = ((broker_grp, 0, 0), (symbol_grp, 0, 1), (signal_grp, 0, 2), (status_grp, 0, 3))
+            if not signal_grp._divider.winfo_manager():
+                signal_grp._divider.pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=(0, 4),
+                                         before=signal_grp._label)
+        else:
+            order = ((broker_grp, 0, 0), (symbol_grp, 0, 1), (status_grp, 0, 2), (signal_grp, 1, 0))
+            signal_grp._divider.pack_forget()      # it starts its own line
+        for g, r, c in order:
+            g.grid(row=r, column=c, columnspan=(3 if r == 1 else 1), sticky="w", padx=(4, 0))
+        self._toolbar_wide = wide
+
+    def _on_toolbar_resize(self, event=None):
+        width = self._toolbar.winfo_width()
+        if width <= 1:
+            return
+        if self._toolbar_needed is None or self._toolbar_wide:
+            # The groups never change size, so measure while they sit on one line
+            self._toolbar_needed = sum(g.winfo_reqwidth() + 4 for g in self._filter_groups) + 12
+        wide = width >= self._toolbar_needed
+        if wide != self._toolbar_wide:
+            self._layout_filters(wide)
+
+    # ── KPI strip ─────────────────────────────────────────────────────────
+    def _build_stats_card(self):
+        self._stats_frame = stats_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        stats_frame.pack(fill=tk.X, padx=20, pady=2)
+
+        self.stats_labels = {}
+        self._kpi_names = []
+        stat_configs = [
+            ("Holdings",       "count",          ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ACCENT,
+             "Number of rows shown (a stock held at two brokers counts twice)"),
+            ("Invested",       "invested",       ModernStyle.PURPLE_FILL,    ModernStyle.TEXT_PURPLE,
+             "Money put into the shares you still hold (quantity × average cost)"),
+            ("Current Value",  "current",        ModernStyle.INFO_FILL,      ModernStyle.INFO,
+             "What the shares you hold are worth at the latest prices"),
+            ("Realised P&L",   "realized_pnl",   ModernStyle.SUCCESS_FILL,   ModernStyle.SUCCESS,
+             "Profit or loss already booked by selling shares"),
+            ("Unrealised P&L", "unrealized_pnl", ModernStyle.WARNING_FILL,   ModernStyle.SUCCESS,
+             "Profit or loss on the shares you still hold, at the latest prices"),
+            ("Total Fees",     "fees",           ModernStyle.ERROR_FILL,     ModernStyle.WARNING,
+             "All brokerage and charges paid on these holdings"),
+        ]
+        for col, (label, key, bar, color, tip) in enumerate(stat_configs):
+            stats_frame.grid_columnconfigure(col, weight=1, uniform="kpi")
+            pill = tk.Frame(stats_frame, bg=ModernStyle.BG_SECONDARY,
+                            highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1, bd=0)
+            pill.grid(row=0, column=col, sticky="nsew", padx=3, pady=3)
+            tk.Frame(pill, bg=bar, width=4).pack(side=tk.LEFT, fill=tk.Y)
+            content = tk.Frame(pill, bg=ModernStyle.BG_SECONDARY)
+            content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            name_lbl = tk.Label(content, text=label, bg=ModernStyle.BG_SECONDARY,
+                                fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_KPI_LABEL)
+            name_lbl.pack(pady=(5, 0), padx=8, anchor="w")
+            ToolTip(name_lbl, tip)
+            self._kpi_names.append(name_lbl)
+            val = tk.Label(content, text="—", bg=ModernStyle.BG_SECONDARY, fg=color,
+                           font=ModernStyle.FONT_KPI_VALUE, anchor="w")
+            val.pack(pady=(1, 5), padx=8, anchor="w")
+            self.stats_labels[key] = val
+        stats_frame.bind("<Configure>", lambda _e: self._fit_kpi_fonts())
+
+    def _fit_kpi_fonts(self):
+        """Use the big KPI fonts when every value fits, smaller ones in a narrow window."""
+        width = self._stats_frame.winfo_width()
+        if width <= 1:
+            return
+        room = width / max(1, len(self.stats_labels)) - 30
+        need = max(self._font_kpi_big.measure(lbl.cget("text")) for lbl in self.stats_labels.values())
+        need = max(need, max(self._font_kpi_label.measure(lbl.cget("text")) for lbl in self._kpi_names))
+        big = need <= room
+        if big != self._kpi_big:
+            self._kpi_big = big
+            value_font = ModernStyle.FONT_KPI_VALUE if big else ModernStyle.FONT_TITLE
+            name_font = ModernStyle.FONT_KPI_LABEL if big else ModernStyle.FONT_SMALL_BOLD
+            for lbl in self.stats_labels.values():
+                lbl.configure(font=value_font)
+            for lbl in self._kpi_names:
+                lbl.configure(font=name_font)
+
+    def _set_label(self, lbl: tk.Label, text: str, fg: Optional[str] = None) -> None:
+        """Configure a label only when something changed (each change redraws the window)."""
+        kw = {}
+        if lbl.cget("text") != text:
+            kw["text"] = text
+        if fg is not None and str(lbl.cget("fg")) != fg:
+            kw["fg"] = fg
+        if kw:
+            lbl.configure(**kw)
+
+    # ── Scope line, colour legend and Columns button ───────────────────────
+    def _build_info_bar(self):
+        BG = ModernStyle.BG_PRIMARY
+        bar = tk.Frame(self, bg=BG)
+        bar.pack(fill=tk.X, padx=23, pady=(2, 0))
+        bar.grid_columnconfigure(0, weight=1)    # in a narrow window the scope text gives way first
+
+        self._scope_lbl = tk.Label(bar, text="⏳ Loading holdings…", bg=BG,
+                                   fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD, anchor="w")
+        self._scope_lbl.grid(row=0, column=0, sticky="ew")
+        self._scope_tip = ToolTip(self._scope_lbl, "What the totals above and the table below cover")
+
+        measure = tkfont.Font(font=ModernStyle.FONT_SMALL_BOLD).measure
+        self._columns_btn = ModernButton(
+            bar, text="▤ Columns ▾", variant="soft", command=self._show_columns_menu_at_button,
+            bg=ModernStyle.PURPLE_FILL, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=BG,
+            width=measure("▤ Columns ▾") + 30, height=28, radius=12, font=ModernStyle.FONT_SMALL_BOLD,
         )
-        state_seg.pack(side=tk.LEFT, padx=(0, 10), pady=4, anchor=tk.CENTER)
+        self._columns_btn.grid(row=0, column=2, sticky="e")
+        ToolTip(self._columns_btn, "Choose which columns to show. You can also right-click the column headings.")
 
-        # ── SPACER + REFRESH ─────────────────────────────────────────────────
-        tk.Frame(filter_frame, bg=ModernStyle.BG_PRIMARY).pack(side=tk.LEFT, expand=True, fill=tk.X)
+        legend = tk.Frame(bar, bg=BG)
+        legend.grid(row=0, column=1, sticky="e", padx=(12, 12))
+        tk.Label(legend, text="Row colour:", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+                 font=ModernStyle.FONT_SMALL).pack(side=tk.LEFT, padx=(0, 6))
+        for fill, edge, text in (
+            (ModernStyle.SUCCESS_PALE, ModernStyle.SUCCESS, "In profit"),
+            (ModernStyle.ERROR_PALE, ModernStyle.ERROR, f"Down more than {abs(LOSS_TINT_PCT):.0f}%"),
+        ):
+            tk.Frame(legend, bg=fill, width=14, height=14, highlightthickness=1,
+                     highlightbackground=edge).pack(side=tk.LEFT, padx=(4, 4))
+            tk.Label(legend, text=text, bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+                     font=ModernStyle.FONT_SMALL).pack(side=tk.LEFT, padx=(0, 8))
+        ToolTip(legend, "Colour shows the gain or loss on the shares you still hold (the P&L % column). "
+                        "Rows with a smaller loss, and closed positions, have no colour.")
 
-        refresh_btn = ModernButton(
-            filter_frame,
-            text="⟳ Refresh",
-            command=self.refresh,
-            bg=ModernStyle.ACCENT_TERTIARY,
-            fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_PRIMARY,
-            width=100,
-            height=CTRL_HEIGHT,
-        )
-        refresh_btn.pack(side=tk.LEFT, padx=(4, 0), pady=4, anchor=tk.CENTER)
+    # ── Table ─────────────────────────────────────────────────────────────
+    def _build_table(self):
+        table_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=4)
+        inner = tk.Frame(table_frame, bg=ModernStyle.BG_PRIMARY)
+        inner.pack(fill=tk.BOTH, expand=True)
 
-        # Load brokers in the background
-        threading.Thread(target=self._load_brokers, daemon=True).start()
+        style = ttk.Style()
+        style.configure("Holdings.Treeview", font=ModernStyle.FONT_TABLE,
+                        rowheight=max(36, ModernStyle.TABLE_ROW_HEIGHT))
+        style.configure("Holdings.Treeview.Heading", font=ModernStyle.FONT_TABLE_BOLD,
+                        background=ModernStyle.TABLE_HEADER_BG, foreground=ModernStyle.TABLE_HEADER_FG,
+                        relief="flat")
+        style.map("Holdings.Treeview.Heading",
+                  background=[("active", ModernStyle.TABLE_HEADER_HOVER)],
+                  foreground=[("active", ModernStyle.TABLE_HEADER_FG)])
 
+        self.tree = ttk.Treeview(inner, columns=COLUMN_IDS, height=12, show="headings",
+                                 style="Holdings.Treeview")
+        HeadingTips(self.tree, COLUMN_HELP)
+        arrow_w = self._font_table_bold.measure(" ▼")
+        for cid, heading, sample, anchor in COLUMNS:
+            width = max(self._font_table.measure(sample), self._font_table_bold.measure(heading) + arrow_w) + 16
+            self.tree.heading(cid, text=heading, anchor=anchor, command=lambda c=cid: self._sort_and_remember(c))
+            if cid == "name":
+                self.tree.column(cid, width=width, minwidth=120, anchor=anchor, stretch=True)
+            else:
+                self.tree.column(cid, width=width, minwidth=40, anchor=anchor, stretch=False)
+        self._apply_displaycolumns()
 
+        # One tag per row: P&L tint, or a zebra stripe
+        self.tree.tag_configure("gain", background=ModernStyle.SUCCESS_PALE, foreground=ModernStyle.TEXT_PRIMARY)
+        self.tree.tag_configure("loss", background=ModernStyle.ERROR_PALE, foreground=ModernStyle.TEXT_PRIMARY)
+        self.tree.tag_configure("odd", background=ModernStyle.BG_SECONDARY)
+        self.tree.tag_configure("even", background=ModernStyle.TABLE_ROW_ALT)
+
+        vsb = ttk.Scrollbar(inner, orient=tk.VERTICAL, command=self.tree.yview)
+        hsb = ttk.Scrollbar(inner, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        inner.grid_rowconfigure(0, weight=1)
+        inner.grid_columnconfigure(0, weight=1)
+
+        # Empty / loading message shown over the table
+        self._empty_frame = tk.Frame(inner, bg=ModernStyle.BG_SECONDARY)
+        self._empty_icon = tk.Label(self._empty_frame, text="⏳", font=ModernStyle.FONT_EMPTY_STATE,
+                                    bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_TERTIARY)
+        self._empty_icon.pack(pady=(0, 4))
+        self._empty_title = tk.Label(self._empty_frame, text="Loading holdings…", font=ModernStyle.FONT_HEADING,
+                                     fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY)
+        self._empty_title.pack()
+        self._empty_hint = tk.Label(self._empty_frame, text="", font=ModernStyle.FONT_BODY,
+                                    fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY,
+                                    wraplength=520, justify="center")
+        self._empty_hint.pack()
+        self._empty_shown = None
+        self._show_empty("⏳", "Loading holdings…", "")
+
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Return>", lambda _e: self._open_drilldown_selected())
+        for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
+            self.tree.bind(seq, self._on_tree_right_click)
+
+    def _show_empty(self, icon: Optional[str], title: str = "", hint: str = "") -> None:
+        """Show a message over the table, or hide it when icon is None."""
+        state = (icon, title, hint)
+        if state == self._empty_shown:
+            return
+        self._empty_shown = state
+        if icon is None:
+            self._empty_frame.place_forget()
+            return
+        self._empty_icon.configure(text=icon)
+        self._empty_title.configure(text=title)
+        self._empty_hint.configure(text=hint)
+        self._empty_frame.place(relx=0.5, rely=0.5, anchor="center")
+
+    # ── Column chooser ────────────────────────────────────────────────────
+    def _load_hidden_columns(self) -> list:
+        try:
+            saved = load_settings().get(HIDDEN_COLUMNS_KEY)
+        except Exception:
+            log.warning("Holdings: could not read the column settings", exc_info=True)
+            saved = None
+        if not isinstance(saved, list):
+            return list(DEFAULT_HIDDEN)
+        return [c for c in saved if c in COLUMN_IDS and c not in ALWAYS_SHOWN]
+
+    def _apply_displaycolumns(self) -> None:
+        visible = [c for c in COLUMN_IDS if c not in self._hidden_cols]
+        self.tree.configure(displaycolumns=visible)
+
+    def _set_hidden_columns(self, hidden: list) -> None:
+        self._hidden_cols = [c for c in COLUMN_IDS if c in hidden and c not in ALWAYS_SHOWN]
+        self._apply_displaycolumns()
+        try:
+            save_settings({HIDDEN_COLUMNS_KEY: list(self._hidden_cols)})
+        except Exception:
+            log.exception("Holdings: could not save the column choice")
+            show_toast(self, "Couldn't save your column choice; it will reset next time.", type="warning")
+
+    def _columns_menu(self) -> tk.Menu:
+        menu = tk.Menu(self, tearoff=False)
+        shown = len(COLUMN_IDS) - len(self._hidden_cols)
+        menu.add_command(label=f"Show columns ({shown} of {len(COLUMN_IDS)} shown)", state="disabled")
+        menu.add_separator()
+        self._col_vars = {}
+        for cid in COLUMN_IDS:
+            if cid in ALWAYS_SHOWN:
+                continue
+            var = tk.BooleanVar(master=self, value=cid not in self._hidden_cols)
+            self._col_vars[cid] = var
+            menu.add_checkbutton(label=COLUMN_HELP.get(cid, HEADINGS[cid]), variable=var,
+                                 onvalue=True, offvalue=False,
+                                 command=lambda c=cid: self._toggle_column(c))
+        menu.add_separator()
+        menu.add_command(label="Show all columns", command=lambda: self._set_hidden_columns([]))
+        menu.add_command(label="Back to the standard columns",
+                         command=lambda: self._set_hidden_columns(list(DEFAULT_HIDDEN)))
+        return menu
+
+    def _toggle_column(self, cid: str) -> None:
+        var = self._col_vars.get(cid)
+        visible = bool(var.get()) if var is not None else cid in self._hidden_cols
+        hidden = [c for c in self._hidden_cols if c != cid]
+        if not visible:
+            hidden.append(cid)
+        self._set_hidden_columns(hidden)
+
+    def _show_columns_menu(self, x: int, y: int) -> None:
+        menu = self._columns_menu()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _show_columns_menu_at_button(self) -> None:
+        btn = self._columns_btn
+        self._show_columns_menu(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
+
+    # ── Sorting ───────────────────────────────────────────────────────────
     def _sort_and_remember(self, col: str):
-        """Sort the treeview by the given column and remember the state for re-apply after refresh."""
-        # Toggle direction if clicking the same column again
+        """Sort by a column; clicking the same column again reverses the order."""
         if self._sort_col == col:
             self._sort_reverse = not self._sort_reverse
         else:
             self._sort_col = col
             self._sort_reverse = False
-        treeview_sort_column(self.tree, col, self._sort_reverse)
-        # Re-bind heading command: treeview_sort_column replaces it with its own
-        # internal lambda which would bypass our state tracking on subsequent clicks
-        self.tree.heading(col, command=lambda c=col: self._sort_and_remember(c))
+        self._apply_sort()
 
-    def _build_stats_card(self):
-        stats_frame = tk.Frame(
-            self,
-            bg=ModernStyle.BG_PRIMARY,
-            highlightbackground=ModernStyle.BORDER_COLOR,
-            highlightthickness=0,
-        )
-        stats_frame.pack(fill=tk.X, padx=20, pady=2)
-        
-        self.stats_labels = {}
-        self.stats_sublabels = {}
-        
-        # Define colored pills for each stat
-        stat_configs = [
-            ("Holdings", "count", ModernStyle.ACCENT_PRIMARY, ModernStyle.ACCENT_PRIMARY_PALE),
-            ("Invested Value", "invested", ModernStyle.ACCENT_SECONDARY, ModernStyle.ACCENT_SECONDARY_PALE),
-            ("Current Value", "current", ModernStyle.INFO, ModernStyle.INFO_PALE),
-            ("Real P&L", "realized_pnl", ModernStyle.SUCCESS, ModernStyle.SUCCESS_PALE),
-            ("Unreal P&L", "unrealized_pnl", ModernStyle.WARNING, ModernStyle.WARNING_PALE),
-            ("Total Fees", "fees", ModernStyle.ERROR, ModernStyle.ERROR_PALE),
-        ]
-        
-        for label, key, color, pill_bg in stat_configs:
-            # Fallbacks for styles that might be missing locally
-            try: pill_bg_color = pill_bg if getattr(ModernStyle, pill_bg.split(".")[-1] if "." in pill_bg else pill_bg, None) else ModernStyle.BG_SECONDARY
-            except Exception: pill_bg_color = ModernStyle.BG_SECONDARY
-            
-            stat_pill = ModernCard(stats_frame, bg=ModernStyle.BG_SECONDARY, highlight_color=pill_bg_color, highlight_thickness=2, radius=8)
-            stat_pill.pack(side=tk.LEFT, padx=3, pady=3, expand=True, fill=tk.BOTH)
-            
-            tk.Label(stat_pill.content, text=label, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_KPI_LABEL).pack(pady=(4, 0))
-            
-            val_label = tk.Label(stat_pill.content, text="—", bg=ModernStyle.BG_SECONDARY, fg=color, font=ModernStyle.FONT_KPI_VALUE)
-            val_label.pack(pady=(2, 4))
-            
-            self.stats_labels[key] = val_label
+    def _apply_sort(self) -> None:
+        if self._sort_col:
+            treeview_sort_column(self.tree, self._sort_col, self._sort_reverse)
+        for cid in COLUMN_IDS:
+            # treeview_sort_column replaces the heading command; put ours back
+            text = HEADINGS[cid]
+            if cid == self._sort_col:
+                text += " ▼" if self._sort_reverse else " ▲"
+            self.tree.heading(cid, text=text, command=lambda c=cid: self._sort_and_remember(c))
+        self._retag_rows()
 
-        # Right-side actions (requested: at right end of Summary section)
-        tk.Frame(stats_frame, bg=ModernStyle.BG_PRIMARY).pack(side=tk.LEFT, expand=True, fill=tk.X)
-        actions = tk.Frame(stats_frame, bg=ModernStyle.BG_PRIMARY)
-        actions.pack(side=tk.RIGHT, padx=4, pady=3)
+    def _retag_rows(self) -> None:
+        """Number the rows 1..n in their current order and give each its one tag."""
+        for i, iid in enumerate(self.tree.get_children("")):
+            meta = self._row_meta.get(iid, {})
+            tag = meta.get("tint") or ("even" if i % 2 else "odd")
+            self.tree.item(iid, tags=(tag,))
+            self.tree.set(iid, "num", str(i + 1))
 
-        ModernButton(
-            actions,
-            text="Delete",
-            command=self._delete_selected_holding,
-            bg=ModernStyle.ERROR,
-            fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_PRIMARY,
-            width=100,
-            height=32,
-        ).pack(side=tk.LEFT)
-    
-    def _build_table(self):
-        """Build holdings table."""
-        table_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=4)
-
-        # Inner frame for the table grid (tree + scrollbars)
-        inner = tk.Frame(table_frame, bg=ModernStyle.BG_PRIMARY)
-        inner.pack(fill=tk.BOTH, expand=True)
-        
-        # Create treeview (match Flet column set)
-        columns = (
-            "#",
-            "Symbol",
-            "Name",
-            "Qty",
-            "Avg Price",
-            "Mkt Price",
-            "PE Ratio",
-            "Daily Chg %",
-            "Unreal PnL",
-            "Weight %",
-            "XIRR %",
-            "CAGR %",
-            "Real PnL",
-            "Net PnL",
-            "Fees",
-            "IV Signal",
-        )
-        self.tree = ttk.Treeview(inner, columns=columns, height=20, show="headings")
-        
-        # Define headings and column widths
-        widths = [40, 100, 160, 60, 90, 90, 70, 90, 100, 150, 70, 70, 100, 100, 80, 100]
-        # Track current sort state so we can re-apply after data refresh
-        self._sort_col = None
-        self._sort_reverse = False
-        
-        sortable_cols = ("Symbol", "PE Ratio", "Fees", "Real PnL", "Net PnL", "XIRR %", "CAGR %", "IV Signal")
-        for col, w in zip(columns, widths):
-            if col in sortable_cols:
-                self.tree.heading(col, text=f"{col} ↕", command=lambda c=col: self._sort_and_remember(c))
-            else:
-                self.tree.heading(col, text=col)
-            self.tree.column(col, width=w)
-
-        # Alternating rows - clean zebra stripe, no per-row color overrides
-        try:
-            style = ttk.Style()
-            style.configure("Holdings.Treeview", font=ModernStyle.FONT_TABLE, rowheight=30)
-            # Header: dark slate — clearly distinct from the blue row-selection colour
-            style.configure(
-                "Holdings.Treeview.Heading",
-                font=ModernStyle.FONT_TABLE_BOLD,
-                background=ModernStyle.SLATE_800,
-                foreground=ModernStyle.TEXT_ON_ACCENT,
-                relief="flat",
-            )
-            style.map(
-                "Holdings.Treeview.Heading",
-                background=[("active", ModernStyle.SLATE_700)],
-                foreground=[("active", ModernStyle.TEXT_ON_ACCENT)],
-            )
-            self.tree.configure(style="Holdings.Treeview")
-            
-            # Add right-click copy menu
-            add_treeview_copy_menu(self.tree)
-
-            # Only background zebra stripes — no foreground color tags on rows
-            self.tree.tag_configure("odd",  background=ModernStyle.BG_SECONDARY)
-            self.tree.tag_configure("even", background=ModernStyle.SLATE_50)
-            # Signal highlighting tags - using a more saturated green for visibility
-            self.tree.tag_configure("sig_accumulate", background="#d2fee2") 
-            self.tree.tag_configure("low_unrealized_pnl", background="#FEE2E2") 
-        except Exception:
-            pass
-        
-        # Scrollbars
-        vsb = ttk.Scrollbar(inner, orient=tk.VERTICAL, command=self.tree.yview)
-        hsb = ttk.Scrollbar(inner, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(yscroll=vsb.set, xscroll=hsb.set)
-        
-        # Grid
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        
-        inner.grid_rowconfigure(0, weight=1)
-        inner.grid_columnconfigure(0, weight=1)
-
-        # Empty-state overlay frame
-        self._empty_frame = tk.Frame(inner, bg=ModernStyle.BG_SECONDARY)
-        tk.Label(
-            self._empty_frame,
-            text="🪹",
-            font=ModernStyle.FONT_EMPTY_STATE,
-            bg=ModernStyle.BG_SECONDARY,
-        ).pack(pady=(0, 4))
-        tk.Label(
-            self._empty_frame,
-            text="No holdings match the current filter",
-            font=ModernStyle.FONT_HEADING,
-            fg=ModernStyle.TEXT_SECONDARY,
-            bg=ModernStyle.BG_SECONDARY,
-        ).pack()
-        tk.Label(
-            self._empty_frame,
-            text="Clear your search or add a new trade.",
-            font=ModernStyle.FONT_BODY,
-            fg=ModernStyle.TEXT_TERTIARY,
-            bg=ModernStyle.BG_SECONDARY,
-        ).pack()        # Open drilldown on double-click
-        try:
-            self.tree.bind("<Double-1>", lambda _e=None: self._open_drilldown_selected())
-        except Exception:
-            pass
-        
-        # Right-click context menu (Button-2 for macOS 3-button mouse, Button-3 for others)
-        try:
-            self.tree.bind("<Button-2>", self._show_holdings_context_menu)
-            self.tree.bind("<Button-3>", self._show_holdings_context_menu)
-        except Exception:
-            pass
+    # ── Copy ──────────────────────────────────────────────────────────────
+    def _visible_columns(self) -> list:
+        shown = list(self.tree["displaycolumns"])
+        return COLUMN_IDS if shown in (["#all"], []) else shown
 
     def _copy_selected(self) -> None:
-        try:
-            items = list(self.tree.selection() or [])
-        except Exception:
-            items = []
+        items = list(self.tree.selection() or [])
         if not items:
-            messagebox.showinfo("Holdings", "No rows selected.")
+            show_toast(self, "Select one or more rows first.", type="info")
             return
         self._copy_items(items)
 
     def _copy_all(self) -> None:
         items = list(self.tree.get_children() or [])
         if not items:
-            messagebox.showinfo("Holdings", "No data to copy.")
+            show_toast(self, "There are no rows to copy.", type="info")
             return
         self._copy_items(items)
 
-    def _copy_items(self, items: list[str]) -> None:
-        cols = list(self.tree["columns"])
-        lines = ["\t".join(cols)]
+    def _copy_items(self, items: list) -> None:
+        cols = self._visible_columns()
+        lines = ["\t".join(HEADINGS[c] for c in cols)]
         for iid in items:
-            vals = self.tree.item(iid, "values")
-            lines.append("\t".join(str(v).replace("₹", "").replace("¥", "").replace("$", "").replace(",", "").replace("%", "").strip() for v in vals))
-        text = "\n".join(lines)
+            lines.append("\t".join(_copy_cell(self.tree.set(iid, c)) for c in cols))
         try:
             self.clipboard_clear()
-            self.clipboard_append(text)
-            messagebox.showinfo("Holdings", f"Copied {len(items)} row(s) to clipboard.")
-        except Exception as e:
-            messagebox.showerror("Holdings", f"Failed to copy: {e}")
+            self.clipboard_append("\n".join(lines))
+            show_toast(self, f"Copied {len(items)} row{'s' if len(items) != 1 else ''} to the clipboard.")
+        except tk.TclError as e:
+            log.exception("Holdings: copy failed")
+            messagebox.showerror("Holdings", f"Couldn't copy: {e}")
+
+    # ── Right-click / double-click ────────────────────────────────────────
+    def _on_tree_right_click(self, event) -> str:
+        region = self.tree.identify_region(event.x, event.y)
+        if region in ("heading", "separator"):
+            self._show_columns_menu(event.x_root, event.y_root)
+        else:
+            self._show_holdings_context_menu(event)
+        return "break"
+
+    def _on_tree_double_click(self, event) -> None:
+        if self.tree.identify_region(event.x, event.y) in ("cell", "tree"):
+            self._open_drilldown_selected()
 
     def _show_holdings_context_menu(self, event) -> None:
-        """Show right-click context menu for holdings table."""
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        menu = tk.Menu(self.tree, tearoff=False)
+        menu.add_command(label="📊  View trades", command=self._open_drilldown_selected)
+        menu.add_command(label="➕  Add a trade…", command=lambda: self._open_add_trade_from_holding(iid))
+        menu.add_command(label="✏️  Edit holding…", command=lambda: self._edit_holding_properties(iid))
+        menu.add_separator()
+        menu.add_command(label="📋  Copy selected rows", command=self._copy_selected)
+        menu.add_command(label="📝  Copy all rows shown", command=self._copy_all)
+        menu.add_command(label="☰  Choose columns…", command=lambda: self._show_columns_menu(event.x_root, event.y_root))
+        menu.add_separator()
+        menu.add_command(label="🗑  Delete holding…", command=self._delete_selected_holding)
         try:
-            iid = self.tree.identify_row(event.y)
-            if not iid:
-                return
-            
-            # Select the clicked row if not already selected
-            if iid not in self.tree.selection():
-                self.tree.selection_set(iid)
-            
-            # Create context menu
-            menu = tk.Menu(self.tree, tearoff=False)
-            menu.add_command(label="Edit", command=lambda: self._edit_holding_properties(iid))
-            menu.add_command(label="View Trades", command=self._open_drilldown_selected)
-            menu.add_command(label="➕ Add Trade", command=lambda: self._open_add_trade_from_holding(iid))
-            menu.add_separator()
-            menu.add_command(label="Copy Selected", command=self._copy_selected)
-            menu.add_command(label="Copy All (Visible)", command=self._copy_all)
-            menu.add_separator()
-            menu.add_command(label="Delete", command=self._delete_selected_holding)
-            
-            # Display menu
             menu.tk_popup(event.x_root, event.y_root)
-        except Exception as e:
-            print(f"Context menu error: {e}")
+        finally:
+            menu.grab_release()
 
-    def _open_add_trade_from_holding(self, iid: str, *, keep_open: bool = False,
-                                      symbol: str = "", broker: str = "",
-                                      stock_name: str = "",
-                                      on_success=None) -> None:
-        """Open a quick Add Trade popup pre-filled with the holding's symbol and broker.
+    # ── After a change to the data ────────────────────────────────────────
+    def _invalidate_other_views(self) -> None:
+        """Ask every other page to reload next time it is shown, and refresh the sidebar."""
+        try:
+            app = getattr(self.winfo_toplevel(), "_ptracker_app", None)
+            if app is None:
+                return
+            for view in app.view_manager.views.values():
+                if view is not self and hasattr(view, "_data_loaded"):
+                    view._data_loaded = False
+            if hasattr(app, "sidebar") and hasattr(app.sidebar, "refresh_sidebar_data"):
+                app.sidebar.refresh_sidebar_data()
+        except Exception:
+            log.warning("Holdings: could not tell the other pages to reload", exc_info=True)
 
-        Args:
-            iid: Treeview row id (used to look up meta when symbol/broker not supplied).
-            keep_open: If True the window stays open after each save so the user
-                       can add multiple trades consecutively ("Add Trade & Continue").
-            symbol / broker / stock_name: Override values; if empty the row meta is used.
-            on_success: Optional callable invoked on the main thread after each
-                        successful save (e.g. to reload a drilldown table).
+    def _after_data_change(self, mark: list, then=None) -> None:
+        """Called after a pop-up changed trades. `mark` = [cache version before the change].
+
+        The shared pop-ups normally reload the cache themselves; if this one
+        did not (version unchanged), reload it here, once, in the background.
         """
-        import threading
-        from ui_utils import center_window
+        cache = self._cache()
 
-        # Resolve symbol / broker from the row if not overridden
-        if not symbol or not broker:
-            meta = self._row_meta.get(iid, {})
-            try:
-                values = self.tree.item(iid, "values") or ()
-                symbol = symbol or str(meta.get("symbol") or (values[1] if len(values) > 1 else "")).strip()
-            except Exception:
-                symbol = symbol or ""
-            broker = broker or str(meta.get("broker") or "").strip()
-            stock_name = stock_name or str(meta.get("stock_name") or "").strip()
+        def _done(_result=None):
+            mark[0] = cache.version
+            self._invalidate_other_views()
+            self.load_data(refresh=False)
+            if then:
+                then()
 
-        win = tk.Toplevel(self)
-        win.title("➕ Add Trade & Continue" if keep_open else "➕ Add Trade")
-        ModernStyle.style_modal(win)
-        win.configure(bg=ModernStyle.BG_PRIMARY)
-        win.resizable(False, False)
-        win.geometry("600x520" if keep_open else "600x500")
-        try:
-            win.transient(self.winfo_toplevel())
-            win.grab_set()
-        except Exception:
-            pass
-        try:
-            center_window(win, parent=self.winfo_toplevel())
-        except Exception:
-            pass
+        def _failed(exc):
+            show_toast(self, f"Couldn't reload the data: {exc}", type="error")
+            _done()
 
-        # ── Header ──────────────────────────────────────────────────────────────
-        hdr_color = ModernStyle.ACCENT_PRIMARY if keep_open else ModernStyle.SUCCESS
-        tk.Frame(win, bg=hdr_color, height=4).pack(fill="x")
+        if cache.version != mark[0]:
+            _done()
+        else:
+            app_state = self.app_state
+            run_in_background(lambda: _refresh_shared_cache(cache, app_state), on_done=_done,
+                              on_error=_failed, widget=self, name="holdings-cache-refresh")
 
-        header = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
-        header.pack(fill="x", padx=28, pady=(16, 0))
-
-        tk.Label(
-            header, text=symbol,
-            bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.ACCENT_PRIMARY,
-            font=ModernStyle.FONT_SYMBOL_LARGE,
-        ).pack(anchor="w")
-
-        self._add_h_stock_name_lbl = tk.Label(
-            header, text=stock_name if stock_name else "",
-            bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY,
-            font=ModernStyle.FONT_SUBHEADING,
+    # ── Add Trade (shared pop-up) ─────────────────────────────────────────
+    def _open_add_trade_from_holding(self, iid: str, *, keep_open: bool = False,
+                                     symbol: str = "", broker: str = "", stock_name: str = "",
+                                     currency: str = "", on_success=None) -> None:
+        """Open the shared Add Trade pop-up, filled in from the holding row."""
+        meta = self._row_meta.get(iid, {}) if iid else {}
+        symbol = symbol or str(meta.get("symbol") or "").strip()
+        broker = broker or str(meta.get("broker") or "").strip()
+        stock_name = stock_name or str(meta.get("stock_name") or "").strip()
+        currency = currency or str(meta.get("currency") or self._broker_currency.get(broker) or
+                                   self.currency_var.get() or "INR")
+        from views.shared_trade_edit import open_quick_add_trade_modal
+        mark = [self._cache().version]
+        open_quick_add_trade_modal(
+            self, lambda: self._after_data_change(mark, on_success),
+            symbol=symbol, broker=broker, stock_name=stock_name, keep_open=keep_open,
+            app_state=self.app_state, trade_type="BUY", currency=currency,
         )
-        self._add_h_stock_name_lbl.pack(anchor="w", pady=(0, 8))
 
-        mode_text = "➕  Quick Add Trade • Continue Mode" if keep_open else "➕  Quick Add Trade"
-        tk.Label(
-            header, text=mode_text,
-            bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY,
-            font=ModernStyle.FONT_BODY,
-        ).pack(anchor="w", pady=(0, 10))
+    # ── Edit Holding ──────────────────────────────────────────────────────
+    def _edit_holding_properties(self, iid: str) -> None:
+        """Edit a holding's stock name and total fees. Average cost is shown, not edited:
+        it is always worked out from the trades."""
+        meta = self._row_meta.get(iid)
+        if not meta or not meta.get("symbol") or not meta.get("broker"):
+            messagebox.showerror("Edit Holding", "Could not tell which holding this row is.")
+            return
+        symbol, broker = meta["symbol"], meta["broker"]
+        currency = meta.get("currency") or "INR"
+        old_name = meta.get("stock_name") or ""
+        old_fees = float(meta.get("total_fees") or 0.0)
+        avg_cost = float(meta.get("avg_price") or 0.0)
+        cur_sym = _cur_symbol(currency)
+        BG = ModernStyle.BG_SECONDARY
 
-        tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+        scale = ModernStyle.TEXT_SCALE
+        win = PremiumModal(self, title="Edit Holding", geometry=f"{round(580 * scale)}x{round(640 * scale)}", icon="✏️")
+        for text, fill in ((f"📈 {symbol}", ModernStyle.ACCENT_PRIMARY), (f"🏦 {broker}", ModernStyle.PURPLE_FILL),
+                           (f"💱 {currency}", ModernStyle.INFO_FILL)):
+            tk.Label(win.chips_row, text=text, bg=fill, fg=ModernStyle.TEXT_ON_ACCENT,
+                     font=ModernStyle.FONT_SMALL_BOLD, padx=8, pady=2).pack(side="left", padx=(0, 6), pady=(0, 6))
 
-        # ── Form ────────────────────────────────────────────────────────────────
-        card = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
-        card.pack(fill="both", expand=True, padx=24, pady=12)
+        form = win.content_frame
+        form.grid_columnconfigure(0, weight=1)
 
-        form = tk.Frame(card, bg=ModernStyle.BG_PRIMARY)
-        form.pack(fill="x")
-        for i in range(2):
-            form.grid_columnconfigure(i, weight=1)
+        def _title(row, emoji, text, hint=""):
+            lrow = tk.Frame(form, bg=BG)
+            lrow.grid(row=row, column=0, sticky="w", pady=(0, 4))
+            tk.Label(lrow, text=emoji, bg=BG, fg=ModernStyle.TEXT_ACCENT,
+                     font=ModernStyle.FONT_HEADING).pack(side="left", padx=(0, 6))
+            tk.Label(lrow, text=text, bg=BG, fg=ModernStyle.TEXT_PRIMARY,
+                     font=ModernStyle.FONT_SUBHEADING).pack(side="left")
+            if hint:
+                tk.Label(lrow, text=hint, bg=BG, fg=ModernStyle.TEXT_TERTIARY,
+                         font=ModernStyle.FONT_SMALL).pack(side="left", padx=(6, 0))
 
-        BG = ModernStyle.BG_PRIMARY
-        BORDER = "#E2E8F0"
-        FG = "#0F172A"
-
-        def _label(text, r, c):
-            tk.Label(form, text=text, bg=BG, fg=ModernStyle.TEXT_SECONDARY,
-                     font=ModernStyle.FONT_BODY_BOLD).grid(
-                row=r * 2, column=c, sticky="w",
-                pady=(8 if r > 0 else 0, 4), padx=(0, 12 if c == 0 else 0))
-
-        _qty_entry_ref = [None]
-
-        def _entry(r, c, var, *, is_date=False):
-            from views.base_view import _create_date_input
-            wrap = tk.Frame(form, bg=BORDER, padx=1, pady=1)
-            wrap.grid(row=r * 2 + 1, column=c, sticky="ew",
-                      pady=(0, 4), padx=(0, 12 if c == 0 else 0))
-            if is_date:
-                ent = _create_date_input(wrap, var)
-                ent.pack(fill="both", expand=True)
-            else:
-                ent = tk.Entry(wrap, textvariable=var, bg="#F8FAFC", fg=FG,
-                               font=ModernStyle.FONT_TABLE, relief=tk.FLAT,
-                               insertbackground=ModernStyle.SUCCESS, highlightthickness=0)
-                def _fi(e, w=wrap, i=ent): w.configure(bg=ModernStyle.SUCCESS); i.configure(bg="#FFFFFF")
-                def _fo(e, w=wrap, i=ent): w.configure(bg=BORDER); i.configure(bg="#F8FAFC")
-                ent.bind("<FocusIn>", _fi)
-                ent.bind("<FocusOut>", _fo)
-                ent.pack(fill="both", expand=True, ipady=6, padx=8)
+        def _entry(row, var):
+            # 1-px border frame (turns blue while typing) around an entry-coloured box
+            wrap = tk.Frame(form, bg=ModernStyle.BORDER_COLOR, padx=1, pady=1)
+            wrap.grid(row=row, column=0, sticky="ew", pady=(0, 4))
+            box = tk.Frame(wrap, bg=ModernStyle.ENTRY_BG)
+            box.pack(fill="both", expand=True)
+            ent = tk.Entry(box, textvariable=var, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
+                           font=ModernStyle.FONT_HEADING, relief=tk.FLAT, bd=0,
+                           insertbackground=ModernStyle.TEXT_ACCENT, highlightthickness=0)
+            ent.bind("<FocusIn>", lambda _e: wrap.configure(bg=ModernStyle.ACCENT_PRIMARY))
+            ent.bind("<FocusOut>", lambda _e: wrap.configure(bg=ModernStyle.BORDER_COLOR))
+            ent.pack(fill="both", expand=True, ipady=6, padx=10)
             return ent
 
-        from datetime import datetime as _DT
-        _add_broker_var  = tk.StringVar(value=broker)
-        _add_date_var    = tk.StringVar(value=_DT.now().strftime("%Y-%m-%d"))
-        _add_symbol_var  = tk.StringVar(value=symbol)
-        _add_type_var    = tk.StringVar(value="BUY")
-        _add_qty_var     = tk.StringVar(value="")
-        _add_price_var   = tk.StringVar(value="")
-        _add_fee_var     = tk.StringVar(value="0.0")
-        _add_currency_var = tk.StringVar(value="INR")
+        def _note(row, text):
+            tk.Label(form, text=text, bg=BG, fg=ModernStyle.TEXT_TERTIARY, font=ModernStyle.FONT_SMALL,
+                     wraplength=round(480 * scale), justify="left").grid(row=row, column=0, sticky="w", pady=(0, 10))
 
-        # Broker dropdown
-        _label("👑  Broker", 0, 0)
-        broker_wrap = tk.Frame(form, bg=BORDER, padx=1, pady=1)
-        broker_wrap.grid(row=1, column=0, sticky="ew", pady=(0, 4), padx=(0, 12))
-        try:
-            import model.crud as _crud
-            known_brokers = sorted(set(_crud.get_all_brokers()))
-        except Exception:
-            known_brokers = []
-        if broker and broker not in known_brokers:
-            known_brokers.insert(0, broker)
-        ttk.Combobox(broker_wrap, textvariable=_add_broker_var,
-                     values=known_brokers, font=ModernStyle.FONT_TABLE,
-                     state="normal").pack(fill="both", expand=True, ipady=4, padx=4)
+        stock_name_var = tk.StringVar(master=win, value=old_name)
+        total_fees_var = tk.StringVar(master=win, value=f"{old_fees:.2f}")
 
-        _label("📅  Date", 0, 1)
-        _entry(0, 1, _add_date_var, is_date=True)
+        _title(0, "💠", "Stock name", "(optional)")
+        name_entry = _entry(1, stock_name_var)
+        _note(2, "Shown for this stock at every broker.")
 
-        _label("📊  Quantity", 1, 0)
-        _qty_entry = _entry(1, 0, _add_qty_var)
-        _qty_entry_ref[0] = _qty_entry
-        _label("💰  Price", 1, 1)
-        _entry(1, 1, _add_price_var)
+        _title(3, "💎", "Average cost", f"({cur_sym})")
+        tk.Label(form, text=format_money(avg_cost, currency), bg=ModernStyle.BG_TERTIARY,
+                 fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING, anchor="w",
+                 padx=10, pady=6).grid(row=4, column=0, sticky="ew", pady=(0, 4))
+        _note(5, "Average cost is worked out from your trades. To change it, "
+                 "edit the trades (right-click the holding → View trades).")
 
-        _label("💸  Fees", 2, 0)
-        _entry(2, 0, _add_fee_var)
+        _title(6, "💙", "Total fees", f"({cur_sym})")
+        _entry(7, total_fees_var)
+        _note(8, "Changing this rewrites the fee on every trade of this holding. You'll be asked first.")
 
-        # Trade type + Currency on same row
-        tc_lbl_row = tk.Frame(form, bg=BG)
-        tc_lbl_row.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10, 4))
-        tk.Label(tc_lbl_row, text="🌲 Trade Type", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
-                 font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
-        tk.Frame(tc_lbl_row, width=16, bg=BG).pack(side="left")
-        tk.Label(tc_lbl_row, text="💱 Currency", bg=BG, fg=ModernStyle.TEXT_SECONDARY,
-                 font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+        def _close():
+            win.destroy()
 
-        tc_row = tk.Frame(form, bg=BG)
-        tc_row.grid(row=7, column=0, columnspan=2, sticky="w")
-        for val, color in [("BUY", "#059669"), ("SELL", "#DC2626")]:
-            tk.Radiobutton(tc_row, text=val, variable=_add_type_var, value=val,
-                           bg=BG, fg=color, font=ModernStyle.FONT_TABLE_BOLD,
-                           selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
-        tk.Frame(tc_row, bg=ModernStyle.DIVIDER_COLOR, width=2, height=20).pack(side="left", padx=16)
-        for val in ["INR", "JPY"]:
-            tk.Radiobutton(tc_row, text=val, variable=_add_currency_var, value=val,
-                           bg=BG, fg=ModernStyle.ACCENT_PRIMARY, font=ModernStyle.FONT_TABLE_BOLD,
-                           selectcolor=BG, activebackground=BG).pack(side="left", padx=(0, 24))
+        def _write(new_name, new_fees, fees_changed):
+            """Save in the background; returns a warning text or None."""
+            app_state = self.app_state
+            cache = self._cache()
 
-        # ── Actions ─────────────────────────────────────────────────────────────
-        tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=24, pady=(4, 0))
-
-        status_lbl = tk.Label(win, text="", bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY,
-                              font=ModernStyle.FONT_ITALIC, anchor="w")
-        status_lbl.pack(anchor="w", padx=28, pady=(6, 4), fill="x")
-
-        act = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
-        act.pack(fill="x", padx=24, pady=(0, 16))
-
-        # Counter label — always shown, updates after each "Add & Continue" save
-        _save_count = [0]
-        count_lbl = tk.Label(act, text="", bg=ModernStyle.BG_PRIMARY,
-                             fg=ModernStyle.ACCENT_PRIMARY, font=ModernStyle.FONT_BODY_BOLD)
-        count_lbl.pack(side="left")
-
-        def _do_save(close_after: bool):
-            """Validate, persist, and either close or reset the form."""
-            try:
-                b = _add_broker_var.get().strip()
-                if not b: raise ValueError("Broker is required")
-                d_str = _add_date_var.get().strip()
-                import datetime as _dt
-                _dt.datetime.strptime(d_str, "%Y-%m-%d")  # validates format
-                sym = _add_symbol_var.get().strip().upper()
-                if not sym: raise ValueError("Symbol is required")
-                t = _add_type_var.get().strip().upper()
-                qty = float(_add_qty_var.get().replace(",", "") or 0)
-                price = float(_add_price_var.get().replace(",", "").replace("₹", "").replace("¥", "").replace("$", "") or 0)
-                fee = float(_add_fee_var.get().replace(",", "").replace("₹", "").replace("¥", "").replace("$", "") or 0)
-                if qty <= 0: raise ValueError("Qty must be > 0")
-                if price <= 0: raise ValueError("Price must be > 0")
-            except Exception as ex:
-                status_lbl.configure(text=str(ex), fg=ModernStyle.ERROR)
-                return
-
-            status_lbl.configure(text="Saving…", fg=ModernStyle.TEXT_SECONDARY)
-
-            def _bg():
-                err = None
-                try:
-                    import model.crud as _crud2
-                    import uuid
-                    trade_id = str(uuid.uuid4())[:8]
-                    cur = _add_currency_var.get() or "INR"
-                    _crud2.add_trade(b, d_str, sym, t, qty, price, fee, trade_id, currency=cur)
+            def work():
+                from model.database import db_session
+                from model.engine import rebuild_holdings
+                if fees_changed:
+                    from model.backup import safety_backup
                     try:
-                        from model.engine import rebuild_holdings
-                        rebuild_holdings()
-                    except Exception:
-                        pass
-                    try:
-                        if self.app_state and hasattr(self.app_state, "refresh_data_cache"):
-                            self.app_state.refresh_data_cache()
-                    except Exception:
-                        pass
-                except Exception as ex2:
-                    err = str(ex2)
-
-                def _done():
-                    if err:
-                        status_lbl.configure(text=f"Error: {err}", fg=ModernStyle.ERROR)
-                        return
-                    # Always refresh the main holdings table in background
-                    try:
-                        self.load_data()
-                    except Exception:
-                        pass
-                    # Run the optional caller-supplied callback (e.g. reload drilldown)
-                    try:
-                        if on_success:
-                            on_success()
-                    except Exception:
-                        pass
-                    if close_after:
-                        try:
-                            win.destroy()
-                        except Exception:
-                            pass
-                    else:
-                        # Keep-open mode: reset transient fields, show success flash
-                        _save_count[0] += 1
-                        status_lbl.configure(
-                            text=f"✅ Trade saved!  ({_save_count[0]} trade{'s' if _save_count[0] != 1 else ''} added this session)",
-                            fg=ModernStyle.SUCCESS,
-                        )
-                        count_lbl.configure(text=f"📌 {_save_count[0]} added")
-                        _add_qty_var.set("")
-                        _add_price_var.set("")
-                        _add_fee_var.set("0.0")
-                        # Focus back to Qty for quick re-entry
-                        try:
-                            if _qty_entry_ref[0]:
-                                _qty_entry_ref[0].focus_set()
-                        except Exception:
-                            pass
-
-                self.after(0, _done)
-
-            threading.Thread(target=_bg, daemon=True).start()
-
-        from ui_widgets import ModernButton as _MB
-        # ✓ Add Trade — closes after save (rightmost)
-        _MB(act, text="✓ Add Trade", command=lambda: _do_save(close_after=True),
-            bg=ModernStyle.SUCCESS, fg="#ffffff", canvas_bg=BG,
-            width=150, height=40, radius=8, font=ModernStyle.FONT_SUBHEADING
-        ).pack(side="right")
-        # ⟳ Add & Continue — keeps window open, resets fields
-        _MB(act, text="⟳ Add & Continue", command=lambda: _do_save(close_after=False),
-            bg=ModernStyle.ACCENT_PRIMARY, fg="#ffffff", canvas_bg=BG,
-            width=165, height=40, radius=8, font=ModernStyle.FONT_SUBHEADING
-        ).pack(side="right", padx=(0, 10))
-        _MB(act, text="✕ Cancel", command=win.destroy,
-            bg=ModernStyle.TEXT_TERTIARY, fg="#ffffff", canvas_bg=BG,
-            width=110, height=40, radius=8, font=ModernStyle.FONT_SUBHEADING
-        ).pack(side="right", padx=(0, 10))
-
-    def _edit_holding_properties(self, iid: str) -> None:
-        """Edit holding properties: stock name, avg cost, and total fees."""
-        try:
-            meta = self._row_meta.get(iid, {})
-            values = self.tree.item(iid, "values") or ()
-            
-            symbol = str(meta.get("symbol") or (values[1] if len(values) > 1 else "")).strip()
-            broker = str(meta.get("broker") or "").strip()
-            stock_name = str(values[2] if len(values) > 2 else "—").replace("—", "").strip()
-            avg_cost = str(values[4] if len(values) > 4 else "0").replace("₹", "").replace("¥", "").replace("$", "").replace("£", "").replace(",", "").strip()
-            total_fees = str(meta.get("total_fees") or "0").replace("₹", "").replace("¥", "").replace("$", "").replace("£", "").replace(",", "").strip()
-            row_currency = str(meta.get("currency") or "INR").upper()
-            cur_sym = {"JPY": "¥", "USD": "$"}.get(row_currency, "₹")
-            
-            if not symbol or not broker:
-                messagebox.showerror("Edit Holding", "Could not determine symbol/broker for selected row.")
-                return
-            
-            # Create edit dialog using PremiumModal base class
-            win = PremiumModal(self, title="Edit Holding", geometry="500x500", icon="✏️")
-            
-            # Add chips for context
-            win.add_chip("📈", symbol, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.SLATE_300)
-            win.add_chip("🏦", broker, bg_color=ModernStyle.SLATE_800, fg_color=ModernStyle.SLATE_300)
-            
-            # Add top right close button manually to the top header
-            tk.Button(
-                win.inner_hdr, 
-                text="✕", 
-                command=win.destroy, 
-                bg=ModernStyle.BG_PRIMARY, 
-                fg=ModernStyle.ERROR, 
-                font=ModernStyle.FONT_SECTION_LABEL,
-                bd=0,
-                activebackground=ModernStyle.BG_PRIMARY,
-                activeforeground=ModernStyle.SALMON,
-                cursor="hand2"
-            ).pack(side="right", anchor="ne", padx=(0, 10))
-            
-            form = win.content_frame
-            form.grid_columnconfigure(0, weight=1)
-            
-            def _field(label: str, emoji: str, row: int, var: tk.StringVar, hint: str = ""):
-                # Label row
-                lrow = tk.Frame(form, bg=ModernStyle.SLATE_50)
-                lrow.grid(row=row, column=0, sticky="w", pady=(0, 4))
-                tk.Label(
-                    lrow, text=emoji,
-                    bg=ModernStyle.SLATE_50, fg=ModernStyle.ACCENT_PRIMARY,
-                    font=ModernStyle.FONT_HEADING
-                ).pack(side="left", padx=(0, 6))
-                tk.Label(
-                    lrow, text=label,
-                    bg=ModernStyle.SLATE_50, fg=ModernStyle.SLATE_900,
-                    font=ModernStyle.FONT_SUBHEADING
-                ).pack(side="left")
-                if hint:
-                    tk.Label(
-                        lrow, text=hint,
-                        bg=ModernStyle.SLATE_50, fg=ModernStyle.SLATE_400,
-                        font=ModernStyle.FONT_SMALL
-                    ).pack(side="left", padx=(6, 0))
-
-                # Entry wrap with focus ring effect
-                ent_wrap = tk.Frame(form, bg=ModernStyle.SLATE_300, padx=1, pady=1)
-                ent_wrap.grid(row=row + 1, column=0, sticky="ew", pady=(0, 18))
-                
-                ent = tk.Entry(
-                    ent_wrap,
-                    textvariable=var,
-                    bg=ModernStyle.BG_SECONDARY,
-                    fg=ModernStyle.SLATE_900,
-                    font=ModernStyle.FONT_HEADING,
-                    relief=tk.FLAT,
-                    insertbackground=ModernStyle.ACCENT_PRIMARY,
-                    highlightthickness=0
-                )
-                
-                def _on_focus_in(e, wrap=ent_wrap, inner=ent):
-                    wrap.configure(bg=ModernStyle.ACCENT_PRIMARY)
-                    inner.configure(bg=ModernStyle.BG_SECONDARY)
-                def _on_focus_out(e, wrap=ent_wrap, inner=ent):
-                    wrap.configure(bg=ModernStyle.SLATE_300)
-                    inner.configure(bg=ModernStyle.BG_SECONDARY)
-                
-                ent.bind("<FocusIn>", _on_focus_in)
-                ent.bind("<FocusOut>", _on_focus_out)
-                ent.pack(fill="both", expand=True, ipady=8, padx=12)
-                return ent
-            
-            stock_name_var = tk.StringVar(value=stock_name)
-            avg_cost_var = tk.StringVar(value=avg_cost)
-            total_fees_var = tk.StringVar(value=total_fees)
-            
-            _field("Stock Name", "💠", 0, stock_name_var, "(optional)")
-            _field("Avg Cost", "💎", 2, avg_cost_var, f"({cur_sym})")
-            _field("Total Fees", "💙", 4, total_fees_var, f"({cur_sym})")
-            
-            # We use PremiumModal's actions_frame
-            actions = win.actions_frame
-            
-            def _close():
-                try:
-                    win.destroy()
-                except Exception:
-                    pass
-            
-            def _save():
-                try:
-                    new_stock_name = (stock_name_var.get() or "").strip()
-                    new_avg_cost = float(avg_cost_var.get() or "0")
-                    new_total_fees = float(total_fees_var.get() or "0")
-                    
-                    if new_avg_cost < 0:
-                        raise ValueError("Avg Cost cannot be negative")
-                    if new_total_fees < 0:
-                        raise ValueError("Total Fees cannot be negative")
-                    
-                    win.set_status("⏳ Saving…")
-                    
-                    def _bg():
-                        err = None
-                        try:
-                            from model.engine import rebuild_holdings
-                            from model.database import db_session
-                            
-                            # Update stock name via crud
-                            crud.update_holding_properties(broker, symbol, new_stock_name, new_avg_cost, new_total_fees)
-                            
-                            # If total_fees changed, proportionally scale individual trade fees
-                            # so that rebuild_holdings() will recalculate the same total.
-                            old_total = float(total_fees or 0)
-                            if abs(new_total_fees - old_total) > 0.001 and old_total > 0:
-                                ratio = new_total_fees / old_total
-                                with db_session() as conn:
-                                    cur = conn.cursor()
-                                    cur.execute(
-                                        "UPDATE trades SET fee = ROUND(fee * ?, 2) WHERE broker = ? AND symbol = ?",
-                                        (ratio, broker, symbol)
-                                    )
-                            elif abs(new_total_fees - old_total) > 0.001 and old_total == 0:
-                                # Old total was 0 but new isn't — distribute evenly
-                                with db_session() as conn:
-                                    cur = conn.cursor()
-                                    cur.execute("SELECT COUNT(*) FROM trades WHERE broker = ? AND symbol = ?", (broker, symbol))
-                                    trade_count = cur.fetchone()[0]
-                                    if trade_count > 0:
-                                        per_trade = round(new_total_fees / trade_count, 2)
-                                        cur.execute(
-                                            "UPDATE trades SET fee = ? WHERE broker = ? AND symbol = ?",
-                                            (per_trade, broker, symbol)
-                                        )
-                            
-                            # Now rebuild holdings from the updated trades — this ensures
-                            # total_fees, avg_price, and PnL are all consistent
-                            rebuild_holdings()
-                            
-                            try:
-                                if self.app_state is not None and hasattr(self.app_state, "refresh_data_cache"):
-                                    self.app_state.refresh_data_cache()
-                            except Exception:
-                                pass
-                        except Exception as e:
-                            err = str(e)
-                        
-                        def _done():
-                            if err:
-                                win.set_status(f"❌ Save failed: {err}", is_error=True)
-                                return
-                            try:
-                                win.destroy()
-                            except Exception:
-                                pass
-                            self.load_data()
-                        
-                        self.after(0, _done)
-                    
-                    threading.Thread(target=_bg, daemon=True).start()
-                except Exception as e:
-                    win.set_status(str(e), is_error=True)
-            
-            ModernButton(actions, text="✕  Cancel", command=_close, bg=ModernStyle.SALMON, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.SLATE_50, width=130, height=38).pack(side="right")
-            ModernButton(actions, text="✔  Update", command=_save, bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.SLATE_50, width=130, height=38).pack(side="right", padx=(0, 10))
-        except Exception as e:
-            messagebox.showerror("Edit Holding", f"Error: {e}")
-
-    def _open_drilldown_selected(self) -> None:
-        try:
-            sel = list(self.tree.selection() or [])
-        except Exception:
-            sel = []
-        if not sel:
-            messagebox.showinfo("Drilldown", "Select a holding row first.")
-            return
-
-        iid = sel[0]
-        meta = self._row_meta.get(iid, {})
-        # Fallback: read symbol from displayed table
-        try:
-            values = self.tree.item(iid, "values")
-            symbol = str(values[1]) if len(values) > 1 else ""
-        except Exception:
-            symbol = ""
-
-        symbol = (meta.get("symbol") or symbol or "").strip()
-        if not symbol or symbol == "—":
-            messagebox.showerror("Drilldown", "Could not determine symbol for selected row.")
-            return
-
-        broker = (meta.get("broker") or "").strip()
-        stock_name_val = meta.get("stock_name")
-        stock_name = stock_name_val.strip() if isinstance(stock_name_val, str) else ""
-
-        top = PremiumModal(self, title="Trade Drilldown", geometry="980x640", icon="📊")
-
-        if stock_name:
-            top.title_lbl.config(text=f"{stock_name}", fg=ModernStyle.BRAND_GOLD, font=ModernStyle.FONT_DRILLDOWN_SYM)
-        else:
-            top.title_lbl.config(text=f"{symbol} Drilldown")
-
-        # Summary line displayed inline as chips
-        def _update_chips_ui(c_qty, c_avg, c_mkt, c_fees, c_pnl, c_currency):
-            for w in top.chips_row.winfo_children():
-                w.destroy()
-            
-            f_bold = ModernStyle.FONT_BODY_BOLD
-            
-            from ui_utils import format_money
-            
-            top.add_chip("📈", symbol, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.SLATE_300, font=f_bold)
-            top.add_chip("🏦", broker if broker else "All brokers", bg_color=ModernStyle.SLATE_800, fg_color=ModernStyle.SLATE_300, font=f_bold)
-            
-            pnl_color = ModernStyle.SUCCESS if c_pnl >= 0 else ModernStyle.ERROR
-            
-            # Format nicely. Added alongside chips to stay inline top
-            top.add_chip("📊", f"Qty: {c_qty:g}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.TEXT_PRIMARY, font=f_bold)
-            top.add_chip("💵", f"Avg: {format_money(c_avg, c_currency)}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.TEXT_PRIMARY, font=f_bold)
-            top.add_chip("💰", f"Mkt: {format_money(c_mkt, c_currency)}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.TEXT_PRIMARY, font=f_bold)
-            top.add_chip("📉", f"Fees: {format_money(c_fees, c_currency)}", bg_color=ModernStyle.BG_PRIMARY, fg_color=ModernStyle.WARNING, font=f_bold)
-            top.add_chip("🏆", f"P&L: {format_money(c_pnl, c_currency)}", bg_color=ModernStyle.BG_PRIMARY, fg_color=pnl_color, font=f_bold)
-
-        try:
-            qty = float(meta.get("qty", 0.0) or 0.0)
-            avg = float(meta.get("avg_price", 0.0) or 0.0)
-            mkt = float(meta.get("market_price", 0.0) or 0.0)
-            pnl = float(meta.get("running_pnl", 0.0) or 0.0)
-            fees = float(meta.get("total_fees", 0.0) or 0.0)
-            currency = str(meta.get("currency") or "INR")
-            _update_chips_ui(qty, avg, mkt, fees, pnl, currency)
-        except Exception:
-            pass
-
-        # ── Drilldown: mutable TV ref for reload callback ──────────────────────────
-        _dd_trade_tv_ref = [None]
-
-        def _reload_drilldown():
-            """Reload the drilldown trade table after a trade has been added."""
-            tv = _dd_trade_tv_ref[0]
-            if tv is None:
-                return
-            def _load_bg():
-                # fetch fresh holdings stats for chips
-                c_qty, c_avg, c_mkt, c_fees, c_pnl = 0.0, 0.0, 0.0, 0.0, 0.0
-                cur_currency = str(meta.get("currency") or "INR")
-                try:
-                    from model.database import _invalidate_thread_connection, db_session
-                    _invalidate_thread_connection()
+                        safety_backup("edit-fees")
+                    except Exception as e:
+                        raise RuntimeError(f"Couldn't save a backup first, so nothing was changed. ({e})") from e
+                # Name goes to marketdata; avg/fees written back unchanged here and
+                # recomputed from the trades by rebuild_holdings() below.
+                crud.update_holding_properties(broker, symbol, new_name, avg_cost, old_fees)
+                warning = None
+                if fees_changed:
                     with db_session() as conn:
                         cur = conn.cursor()
-                        if broker:
-                            cur.execute("SELECT h.qty, h.avg_price, m.current_price, h.total_fees, h.running_pnl, h.currency FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol WHERE h.symbol=? AND h.broker=?", (symbol, broker))
-                            row = cur.fetchone()
-                            if row:
-                                c_qty, c_avg, c_mkt, c_fees, c_pnl = map(lambda x: float(x or 0.0), row[:5])
-                                cur_currency = row[5] or "INR"
+                        if old_fees > 0:
+                            cur.execute("UPDATE trades SET fee = ROUND(fee * ?, 2) WHERE broker = ? AND symbol = ?",
+                                        (new_fees / old_fees, broker, symbol))
                         else:
-                            cur.execute("SELECT SUM(h.qty), SUM(h.qty*h.avg_price), MAX(m.current_price), SUM(h.total_fees), SUM(h.running_pnl), MAX(h.currency) FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol WHERE h.symbol=?", (symbol,))
-                            row = cur.fetchone()
-                            if row and row[0] is not None:
-                                c_qty = float(row[0])
-                                sum_cost = float(row[1] or 0.0)
-                                c_avg = sum_cost / c_qty if c_qty > 0 else 0.0
-                                c_mkt = float(row[2] or 0.0)
-                                c_fees = float(row[3] or 0.0)
-                                c_pnl = float(row[4] or 0.0)
-                                cur_currency = row[5] or "INR"
-                    self.after(0, lambda: _update_chips_ui(c_qty, c_avg, c_mkt, c_fees, c_pnl, cur_currency))
-                except Exception as e:
-                    pass
+                            cur.execute("SELECT COUNT(*) FROM trades WHERE broker = ? AND symbol = ?", (broker, symbol))
+                            n = cur.fetchone()[0] or 1
+                            cur.execute("UPDATE trades SET fee = ? WHERE broker = ? AND symbol = ?",
+                                        (round(new_fees / n, 2), broker, symbol))
+                    try:
+                        rebuild_holdings()
+                    except Exception as e:
+                        log.exception("Holdings: rebuild after a fee change failed")
+                        warning = f"Fees saved, but recalculating the holdings failed ({e}). Use ⟳ Refresh to try again."
+                _refresh_shared_cache(cache, app_state)
+                return warning
 
+            def done(warning):
                 try:
-                    cache = None
-                    if self.app_state is not None and hasattr(self.app_state, "data_cache"):
-                        cache = self.app_state.data_cache
-                    else:
-                        cache = self.data_cache
-                    try:
-                        cache.refresh_from_db()
-                    except Exception:
-                        pass
-                    f = TradeHistoryFilters(
-                        broker=(broker if broker else "All"),
-                        symbol_like=symbol,
-                        trade_type="All",
-                        start_date=None,
-                        end_date=None,
-                    )
-                    df, _sum = cache.get_tradehistory_filtered(f)
-                except Exception:
-                    df = pd.DataFrame()
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                if warning:
+                    show_toast(self, warning, type="warning")
+                else:
+                    show_toast(self, f"{symbol} ({broker}) updated.")
+                self._invalidate_other_views()
+                self.load_data(refresh=False)
 
-                def _apply():
-                    try:
-                        if not tv.winfo_exists():
-                            return
-                    except Exception:
-                        return
-                    _update_chips_ui(c_qty, c_avg, c_mkt, c_fees, c_pnl, cur_currency)
-                    for it in tv.get_children():
-                        tv.delete(it)
-                    if df is None or df.empty:
-                        return
-                    from ui_utils import format_money
-                    for i, r in enumerate(df.itertuples(index=False)):
-                        rtype = str(getattr(r, "type", "")).upper()
-                        qty_v = float(getattr(r, "qty", 0.0) or 0.0)
-                        price_v = float(getattr(r, "price", 0.0) or 0.0)
-                        fee_v = float(getattr(r, "fee", 0.0) or 0.0)
-                        run_qty_v = float(getattr(r, "run_qty", 0.0) or 0.0)
-                        avg_cost_v = float(getattr(r, "avg_cost", 0.0) or 0.0)
-                        rpnl_v = float(getattr(r, "running_pnl", 0.0) or 0.0)
-                        row_currency = str(getattr(r, "currency", cur_currency) or cur_currency)
-                        rpnl_disp = format_money(rpnl_v, row_currency) if rtype in {"SELL", "S"} else "—"
-                        type_disp = rtype
-                        type_tag = ""
-                        if rtype in {"BUY", "B"}:
-                            type_disp = "🌲 BUY"
-                            type_tag = "🌲 buy"
-                        elif rtype in {"SELL", "S"}:
-                            type_disp = "🔻 SELL"
-                            type_tag = "🔻 sell"
-                        raw_d = str(getattr(r, "date", ""))
-                        try:
-                            from datetime import datetime
-                            disp_d = datetime.strptime(raw_d, "%Y-%m-%d").strftime("%Y-%b-%d")
-                        except Exception:
-                            disp_d = raw_d
-                        vals = (
-                            str(i + 1),
-                            disp_d,
-                            str(getattr(r, "trade_id", "")),
-                            type_disp,
-                            f"{qty_v:g}",
-                            format_money(price_v, row_currency),
-                            format_money(fee_v, row_currency),
-                            f"{run_qty_v:g}",
-                            format_money(avg_cost_v, row_currency),
-                            rpnl_disp,
-                            str(getattr(r, "broker", "")),
-                        )
-                        tv.insert("", "end", values=vals, tags=(type_tag,))
+            def failed(exc):
+                try:
+                    win.set_status(f"❌ Save failed: {exc}", is_error=True)
+                except tk.TclError:
+                    show_toast(self, f"Save failed: {exc}", type="error")
 
-                self.after(0, _apply)
+            win.set_status("⏳ Saving…")
+            run_in_background(work, on_done=done, on_error=failed, widget=self, name="holdings-edit")
 
-            threading.Thread(target=_load_bg, daemon=True).start()
+        def _confirm_fees(new_name, new_fees, trade_count):
+            if trade_count <= 0:
+                win.set_status("This holding has no trades, so its fees can't be changed.", is_error=True)
+                return
+            plural = "s" if trade_count != 1 else ""
+            if old_fees > 0:
+                how = (f"Each trade's fee is multiplied by {new_fees / old_fees:.3f} "
+                       f"so that together they add up to {format_money(new_fees, currency)}.")
+            else:
+                how = f"Each trade gets the same fee of {format_money(new_fees / trade_count, currency)}."
+            ok = messagebox.askyesno(
+                "Change total fees?",
+                f"Change the total fees of {symbol} ({broker}) from {format_money(old_fees, currency)} "
+                f"to {format_money(new_fees, currency)}?\n\n"
+                f"This rewrites the fee on all {trade_count} trade{plural} of this holding. {how}\n\n"
+                "A backup is saved first, so you can undo this from Settings (Restore…).",
+                parent=win,
+            )
+            if ok:
+                _write(new_name, new_fees, True)
+            else:
+                win.set_status("Fees not changed.")
 
-        # ── Top-right action panel (floated with place, immune to chip crowding) ──
-        # Using place() on the Toplevel itself ensures the buttons always appear
-        # in the top-right corner regardless of how many chips are in inner_hdr.
-        _dd_iid = ""  # drilldown always uses explicit symbol/broker overrides
-        from ui_widgets import ModernButton as _DDBtn
+        def _save():
+            new_name = (stock_name_var.get() or "").strip()
+            raw = (total_fees_var.get() or "0").replace(",", "").replace(cur_sym.strip(), "").strip()
+            try:
+                new_fees = float(raw or 0)
+            except ValueError:
+                win.set_status("Total fees must be a number, e.g. 125.50", is_error=True)
+                return
+            if new_fees < 0:
+                win.set_status("Total fees cannot be negative.", is_error=True)
+                return
+            fees_changed = abs(new_fees - old_fees) > 0.005
+            name_changed = bool(new_name) and new_name != old_name
+            if not fees_changed and not name_changed:
+                win.destroy()
+                return
+            if not fees_changed:
+                _write(new_name, new_fees, False)
+                return
 
-        # Floating panel — rendered on top of everything, anchored to top-right
-        _action_panel = tk.Frame(top, bg=ModernStyle.BG_PRIMARY)
-        _action_panel.place(relx=1.0, rely=0.0, anchor="ne", x=-12, y=14)
+            win.set_status("⏳ Counting this holding's trades…")
 
-        # ➕ Add Trade (green) — left button in the panel
-        _DDBtn(
-            _action_panel,
-            text="➕ Add Trade",
-            command=lambda: self._open_add_trade_from_holding(
-                _dd_iid, keep_open=False,
-                symbol=symbol, broker=broker, stock_name=stock_name,
-                on_success=_reload_drilldown,
-            ),
-            bg=ModernStyle.SUCCESS, fg="#ffffff",
-            canvas_bg=ModernStyle.BG_PRIMARY,
-            width=130, height=30,
-        ).pack(side="left", padx=(0, 6))
+            def count():
+                from model.database import db_session
+                with db_session() as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) FROM trades WHERE broker = ? AND symbol = ?", (broker, symbol))
+                    return int(cur.fetchone()[0] or 0)
 
-        # ✕ Close (vivid red) — right button in the panel
-        _DDBtn(
-            _action_panel,
-            text="✕ Close",
-            command=top.destroy,
-            bg=ModernStyle.ERROR, fg="#ffffff",
-            canvas_bg=ModernStyle.BG_PRIMARY,
-            width=90, height=30,
-        ).pack(side="left")
+            run_in_background(count, on_done=lambda n: _confirm_fees(new_name, new_fees, n),
+                              on_error=lambda e: win.set_status(f"❌ {e}", is_error=True),
+                              widget=win, name="holdings-count-trades")
 
-        body = top.content_frame
+        actions = win.actions_frame
+        ModernButton(actions, text="✕  Cancel", command=_close, bg=ModernStyle.NEUTRAL_FILL,
+                     fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=BG, width=130, height=38).pack(side="right")
+        ModernButton(actions, text="✓  Save", command=_save, bg=ModernStyle.ACCENT_PRIMARY,
+                     fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=BG, width=130, height=38).pack(side="right", padx=(0, 10))
+        win.bind("<Escape>", lambda _e: _close())
+        name_entry.focus_set()
 
-        act = top.actions_frame
-        # Clear and hide the bottom actions bar — buttons are in the floating panel
-        for widget in act.winfo_children():
+    # ── Drill-down ────────────────────────────────────────────────────────
+    def _open_drilldown_selected(self) -> None:
+        sel = list(self.tree.selection() or [])
+        if not sel:
+            messagebox.showinfo("Trades", "Select a holding row first.")
+            return
+        meta = self._row_meta.get(sel[0])
+        if not meta or not meta.get("symbol"):
+            messagebox.showerror("Trades", "Could not tell which holding this row is.")
+            return
+        self._open_drilldown(meta)
+
+    def _open_drilldown(self, meta: dict) -> None:
+        symbol = meta["symbol"]
+        broker = meta.get("broker") or ""
+        stock_name = meta.get("stock_name") or ""
+        dd = {"currency": meta.get("currency") or "INR", "reload": lambda refresh=False: None}
+
+        def build_header_actions(parent):
+            modal = parent.winfo_toplevel()
+            ModernButton(
+                parent, text="+ Add Trade",
+                command=lambda: self._open_add_trade_from_holding(
+                    "", symbol=symbol, broker=broker, stock_name=stock_name,
+                    currency=dd["currency"], on_success=lambda: dd["reload"]()),
+                bg=ModernStyle.SUCCESS_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+                canvas_bg=parent.cget("bg"), width=130, height=30,
+            ).pack(side="left", padx=(0, 6))
+            ModernButton(
+                parent, text="✕ Close", command=modal.destroy,
+                bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+                canvas_bg=parent.cget("bg"), width=90, height=30,
+            ).pack(side="left")
+
+        top = PremiumModal(self, title="Trade Drilldown", geometry="1100x600", icon="📊",
+                           right_widget_func=build_header_actions)
+        top.header.set_title(f"📊  {stock_name or symbol}")
+        top.header.set_subtitle(symbol if stock_name else "Trades")
+        top.bind("<Escape>", lambda _e: top.destroy())
+
+        # Summary chips, created once and updated in place
+        chips = {}
+        for key, bg, fg in (
+            ("symbol", ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ON_ACCENT),
+            ("broker", ModernStyle.PURPLE_FILL, ModernStyle.TEXT_ON_ACCENT),
+            ("qty", ModernStyle.BG_SECONDARY, ModernStyle.TEXT_PRIMARY),
+            ("avg", ModernStyle.BG_SECONDARY, ModernStyle.TEXT_PRIMARY),
+            ("mkt", ModernStyle.BG_SECONDARY, ModernStyle.TEXT_PRIMARY),
+            ("fees", ModernStyle.BG_SECONDARY, ModernStyle.WARNING),
+            ("pnl", ModernStyle.BG_SECONDARY, ModernStyle.SUCCESS),
+        ):
+            lbl = tk.Label(top.chips_row, text="", bg=bg, fg=fg, font=ModernStyle.FONT_SMALL_BOLD,
+                           padx=8, pady=2, highlightthickness=1, highlightbackground=ModernStyle.BORDER_COLOR)
+            lbl.pack(side="left", padx=(0, 6))
+            chips[key] = lbl
+
+        def set_chips(info: dict) -> None:
+            cur = info.get("currency") or dd["currency"]
+            dd["currency"] = cur
+            pnl = float(info.get("pnl") or 0.0)
+            texts = {
+                "symbol": f"📈 {symbol}",
+                "broker": f"🏦 {broker or 'All brokers'}",
+                "qty": f"Qty: {_qty_text(float(info.get('qty') or 0))}",
+                "avg": f"Avg: {format_money(info.get('avg') or 0, cur)}",
+                "mkt": f"Price: {format_money(info.get('mkt') or 0, cur)}",
+                "fees": f"Fees: {format_money(info.get('fees') or 0, cur)}",
+                "pnl": f"Total P&L: {_pnl_text(pnl, cur)}",
+            }
+            for key, text in texts.items():
+                self._set_label(chips[key], text)
+            self._set_label(chips["pnl"], texts["pnl"], ModernStyle.SUCCESS if pnl >= 0 else ModernStyle.ERROR)
+
+        set_chips({"qty": meta.get("qty"), "avg": meta.get("avg_price"), "mkt": meta.get("market_price"),
+                   "fees": meta.get("total_fees"), "pnl": meta.get("running_pnl"), "currency": dd["currency"]})
+
+        # Hide the bottom action bar (buttons are in the header) and give the table the room
+        for widget in top.actions_frame.winfo_children():
             widget.destroy()
-        act.pack_forget()
-        table = tk.Frame(body, bg=ModernStyle.BG_SECONDARY)
+        top.actions_frame.pack_forget()
+        top.body_card.pack_configure(padx=8, pady=(0, 8))
+        top.content_frame.pack_configure(padx=8, pady=(12, 8))
+
+        table = tk.Frame(top.content_frame, bg=ModernStyle.BG_SECONDARY)
         table.pack(fill="both", expand=True)
         table.grid_rowconfigure(0, weight=1)
         table.grid_columnconfigure(0, weight=1)
 
-        # Configure style for the drilldown table (matching Trade History view font size)
         style = ttk.Style()
-        style.configure("Drilldown.Treeview", font=ModernStyle.FONT_TABLE, rowheight=32)
-        style.configure("Drilldown.Treeview.Heading", font=ModernStyle.FONT_TABLE_BOLD)
-        
-        # Determine symbol for headers
-        _sym_map = {"INR": "₹", "JPY": "¥", "USD": "$", "GBP": "£", "CNY": "¥"}
-        sym_disp = _sym_map.get(str(meta.get("currency", "INR")).upper(), "₹")
+        style.configure("HoldingsTrades.Treeview", font=ModernStyle.FONT_TABLE,
+                        rowheight=ModernStyle.TABLE_ROW_HEIGHT)
+        style.configure("HoldingsTrades.Treeview.Heading", font=ModernStyle.FONT_TABLE_BOLD,
+                        background=ModernStyle.TABLE_HEADER_BG, foreground=ModernStyle.TABLE_HEADER_FG)
+        style.map("HoldingsTrades.Treeview.Heading",
+                  background=[("active", ModernStyle.TABLE_HEADER_HOVER)],
+                  foreground=[("active", ModernStyle.TABLE_HEADER_FG)])
 
-        cols = ("#", "Date", "Trade ID", "Type", "Qty", f"Price {sym_disp}", f"Fees {sym_disp}", "Running Qty", f"AvgCost {sym_disp}", f"Running PnL {sym_disp}", "Broker")
-        trade_tv = ttk.Treeview(table, columns=cols, show="headings", height=16, style="Drilldown.Treeview")
-        _dd_trade_tv_ref[0] = trade_tv  # expose to reload callback
-        widths = [40, 90, 90, 60, 70, 90, 80, 80, 95, 100, 100]
-        for c, w in zip(cols, widths):
-            trade_tv.heading(c, text=c)
-            trade_tv.column(c, width=w, anchor="w", stretch=True)
-        
-        # Configure coloring tags
-        trade_tv.tag_configure("🌲 buy", foreground=ModernStyle.SUCCESS, font=ModernStyle.FONT_TABLE)
-        trade_tv.tag_configure("🔻 sell", foreground=ModernStyle.ERROR, font=ModernStyle.FONT_TABLE)
+        s = _cur_symbol(dd["currency"]).strip()
+        cols = (("num", "#", 44, "center"), ("date", "Date", 110, "w"), ("tid", "Trade ID", 100, "w"),
+                ("type", "Type", 80, "w"), ("qty", "Qty", 70, "e"), ("price", f"Price {s}", 100, "e"),
+                ("fee", f"Fees {s}", 90, "e"), ("runqty", "Running Qty", 105, "e"),
+                ("avg", f"Avg Cost {s}", 110, "e"), ("rpnl", f"Running P&L {s}", 130, "e"),
+                ("broker", "Broker", 110, "w"))
+        trade_tv = ttk.Treeview(table, columns=[c[0] for c in cols], show="headings", height=14,
+                                style="HoldingsTrades.Treeview")
+        for cid, heading, width, anchor in cols:
+            trade_tv.heading(cid, text=heading, anchor=anchor,
+                             command=lambda c=cid: treeview_sort_column(trade_tv, c, False))
+            trade_tv.column(cid, width=width, anchor=anchor, stretch=True)
+        trade_tv.tag_configure("buy", foreground=ModernStyle.SUCCESS)
+        trade_tv.tag_configure("sell", foreground=ModernStyle.ERROR)
+        trade_tv.tag_configure("odd", background=ModernStyle.BG_SECONDARY)
+        trade_tv.tag_configure("even", background=ModernStyle.TABLE_ROW_ALT)
 
         vsb = ttk.Scrollbar(table, orient="vertical", command=trade_tv.yview)
-        trade_tv.configure(yscrollcommand=vsb.set)
-
+        hsb = ttk.Scrollbar(table, orient="horizontal", command=trade_tv.xview)
+        trade_tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         trade_tv.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
-        
-        # Add right click copy menu to the popup table
-        add_treeview_copy_menu(trade_tv)
+        hsb.grid(row=1, column=0, sticky="ew")
 
-        # Context Menus and Double click for Edit / Delete
-        trade_tv.bind("<Button-2>", lambda e: self._show_drilldown_context_menu(e, trade_tv, _reload_drilldown))
-        trade_tv.bind("<Button-3>", lambda e: self._show_drilldown_context_menu(e, trade_tv, _reload_drilldown))
-        trade_tv.bind("<Double-1>", lambda e: self._edit_trade_focus_handler(trade_tv, _reload_drilldown))
+        status = tk.Label(top.content_frame, text="⏳ Loading trades…", bg=ModernStyle.BG_SECONDARY,
+                          fg=ModernStyle.TEXT_TERTIARY, font=ModernStyle.FONT_SMALL, anchor="w")
+        status.pack(fill="x", pady=(6, 0))
 
-        # Load trades from cache (in background)
-        def _load():
-            try:
-                # Prefer app_state cache if present to stay consistent with other views
-                cache = None
-                if self.app_state is not None and hasattr(self.app_state, "data_cache"):
-                    cache = self.app_state.data_cache
-                else:
-                    cache = self.data_cache
+        cache = self._cache()
 
-                f = TradeHistoryFilters(
-                    broker=(broker if broker else "All"),
-                    symbol_like=symbol,
-                    trade_type="All",
-                    start_date=None,
-                    end_date=None,
-                )
-                df, _sum = cache.get_tradehistory_filtered(f)
-            except Exception:
-                df = pd.DataFrame()
+        def work():
+            tdf, _ = cache.get_tradehistory_filtered(TradeHistoryFilters(
+                broker=(broker or "All"), symbol_like=symbol, trade_type="All"))
+            if tdf is not None and not tdf.empty:
+                tdf = tdf[tdf["symbol"].astype(str).str.upper() == symbol.upper()]   # exact, not "contains"
+            hdf, _ = cache.get_holdings_filtered(HoldingsFilters(broker=(broker or "All"), symbol_like=symbol))
+            info = None
+            if hdf is not None and not hdf.empty:
+                hdf = hdf[hdf["symbol"].astype(str).str.upper() == symbol.upper()]
+                if not hdf.empty:
+                    qty = float(hdf["qty"].sum())
+                    cost = float((hdf["qty"] * hdf["avg_price"]).sum())
+                    info = {
+                        "qty": qty, "avg": cost / qty if qty > 0 else 0.0,
+                        "mkt": float(hdf["market_price"].max() or 0.0),
+                        "fees": float(hdf["total_fees"].sum()), "pnl": float(hdf["running_pnl"].sum()),
+                        "currency": str(hdf["currency"].iloc[0] or "INR").upper(),
+                    }
+            fallback = (info or {}).get("currency") or dd["currency"]
+            return info, _trade_rows(tdf, fallback)
 
-            def _apply():
-                for it in trade_tv.get_children():
-                    trade_tv.delete(it)
-                if df is None or df.empty:
-                    return
-                running_tpnl = 0.0
-                from ui_utils import format_money
-                for i, r in enumerate(df.itertuples(index=False)):
-                    rtype = str(getattr(r, "type", "")).upper()
-                    qty = float(getattr(r, "qty", 0.0) or 0.0)
-                    price = float(getattr(r, "price", 0.0) or 0.0)
-                    fee = float(getattr(r, "fee", 0.0) or 0.0)
-                    run_qty = float(getattr(r, "run_qty", 0.0) or 0.0)
-                    avg_cost = float(getattr(r, "avg_cost", 0.0) or 0.0)
-                    tpnl = float(getattr(r, "trade_pnl", 0.0) or 0.0)
-                    running_tpnl += tpnl
-                    row_cur = str(getattr(r, "currency", meta.get("currency", "INR")) or "INR")
-                    rpnl_disp = format_money(running_tpnl, row_cur) if rtype in {"SELL", "S"} else "—"
-                    type_disp = rtype
-                    type_tag = ""
-                    if rtype in {"BUY", "B"}:
-                        type_disp = "🌲 BUY"
-                        type_tag = "🌲 buy"
-                    elif rtype in {"SELL", "S"}:
-                        type_disp = "🔻 SELL"
-                        type_tag = "🔻 sell"
+        def apply(result):
+            info, rows = result
+            if info:
+                set_chips(info)
+            trade_tv.delete(*trade_tv.get_children())
+            if rows:   # trade ids can be long (e.g. PT_1783826722_23): make them fit
+                longest = max(self._font_table.measure(str(v[2])) for v, _t in rows)
+                trade_tv.column("tid", width=max(100, longest + 20))
+            for i, (vals, tag) in enumerate(rows):
+                trade_tv.insert("", "end", values=vals, tags=(tag, "even" if i % 2 else "odd"))
+            n = len(rows)
+            status.configure(text=(f"{n} trade{'s' if n != 1 else ''}. Double-click a trade to edit it; "
+                                   "right-click for more.") if n else "No trades found for this holding.")
 
-                    raw_d = str(getattr(r, "date", ""))
-                    try:
-                        from datetime import datetime
-                        disp_d = datetime.strptime(raw_d, "%Y-%m-%d").strftime("%Y-%b-%d")
-                    except Exception:
-                        disp_d = raw_d
-                    vals = (
-                        str(i + 1),
-                        disp_d,
-                        str(getattr(r, "trade_id", "")),
-                        type_disp,
-                        f"{qty:g}",
-                        format_money(price, row_cur),
-                        format_money(fee, row_cur),
-                        f"{run_qty:g}",
-                        format_money(avg_cost, row_cur),
-                        rpnl_disp,
-                        str(getattr(r, "broker", "")),
-                    )
-                    trade_tv.insert("", "end", values=vals, tags=(type_tag,))
+        def reload(refresh: bool = False):
+            app_state = self.app_state
 
-            self.after(0, _apply)
+            def _work():
+                if refresh:
+                    _refresh_shared_cache(cache, app_state)
+                return work()
+            run_in_background(_work, on_done=apply,
+                              on_error=lambda e: status.configure(text=f"❌ Couldn't load the trades: {e}",
+                                                                  fg=ModernStyle.ERROR),
+                              widget=trade_tv, name="holdings-drilldown")
 
-        threading.Thread(target=_load, daemon=True).start()
+        dd["reload"] = reload
+        trade_tv.bind("<Double-1>", lambda e: self._edit_trade_focus_handler(trade_tv, reload))
+        for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
+            trade_tv.bind(seq, lambda e: self._show_drilldown_context_menu(e, trade_tv, reload))
+        reload()
 
-    def _delete_selected_holding(self) -> None:
-        try:
-            sel = list(self.tree.selection() or [])
-        except Exception:
-            sel = []
-        if not sel:
-            messagebox.showinfo("Delete Holding", "Select a holding row first.")
-            return
-
-        iid = sel[0]
-        meta = self._row_meta.get(iid, {})
-        symbol = str(meta.get("symbol") or "").strip()
-        broker = str(meta.get("broker") or "").strip()
-
-        if not symbol:
-            try:
-                values = self.tree.item(iid, "values")
-                symbol = str(values[1]) if len(values) > 1 else ""
-            except Exception:
-                symbol = ""
-
-        if not symbol:
-            messagebox.showerror("Delete Holding", "Could not determine selected symbol.")
-            return
-        if not broker:
-            messagebox.showerror("Delete Holding", "Could not determine broker for selected holding.")
-            return
-
-        if not messagebox.askyesno(
-            "Delete Holding",
-            f"Delete holding {symbol} ({broker}) and ALL its underlying trades?\n\nThis cannot be undone.",
-        ):
-            return
-
-        def _bg():
-            try:
-                crud.delete_holding_and_trades(broker, symbol)
-            except Exception as e:
-                err = str(e)
-                self.after(0, lambda e=err: messagebox.showerror("Delete Holding", f"Failed to delete: {e}"))
-                return
-
-            try:
-                from model.engine import rebuild_holdings
-                rebuild_holdings()
-            except Exception:
-                pass
-
-            try:
-                self.data_cache.refresh_from_db()
-            except Exception:
-                pass
-            try:
-                if self.app_state is not None and hasattr(self.app_state, "data_cache"):
-                    self.app_state.data_cache.refresh_from_db()
-            except Exception:
-                pass
-
-            self.after(0, self.load_data)
-
-        threading.Thread(target=_bg, daemon=True).start()
-    
-    def _on_broker_selected(self):
-        """Auto-select currency based on selected broker."""
-        broker = self.broker_var.get()
-        if broker != "All":
-            try:
-                df = self.data_cache._holdings_df
-                if df is not None and not df.empty and "currency" in df.columns:
-                    b_df = df[df["broker"] == broker]
-                    if not b_df.empty:
-                        currency = str(b_df["currency"].iloc[0]).strip().upper()
-                        if currency in ["INR", "JPY"]:
-                            self.currency_var.set(currency)
-            except Exception as e:
-                print(f"Error auto-selecting currency: {e}")
-        self.on_filter_change()
-
-    def _load_brokers(self):
-        """Load broker list in background."""
-        try:
-            brokers = ["All"]
-            import model.crud as crud
-            brokers.extend(crud.get_all_brokers())
-            
-            # Update combo box
-            if hasattr(self, 'broker_combo'):
-                self.after(0, lambda: self.broker_combo.configure(values=brokers))
-        except Exception as e:
-            print(f"Error loading brokers: {e}")
-    
-    def _on_symbol_search(self, event=None):
-        """Handle symbol search with debouncing."""
-        if self._search_timer:
-            self.after_cancel(self._search_timer)
-        
-        # Debounce: wait 200ms before searching
-        self._search_timer = self.after(200, self.on_filter_change)
-    
     def _edit_trade_focus_handler(self, trade_tv, reload_cb):
         iid = trade_tv.focus()
-        if not iid: return
-        vals = trade_tv.item(iid, 'values')
-        if not vals or len(vals) < 11: return
-        
+        if not iid:
+            return
+        vals = trade_tv.item(iid, "values")
+        if not vals or len(vals) < 11:
+            return
         broker = str(vals[10]).strip()
         trade_id = str(vals[2]).strip()
-        
-        # Fetch ALL editable fields from the DB directly — never use display-formatted
-        # treeview values (which may be stale, formatted with ₹/commas, or truncated)
+
+        # Read the editable fields from the database (one row by key: instant),
+        # never from the formatted table cells.
         from model.database import db_session
         try:
             with db_session() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT symbol, date, type, qty, price, fee, currency FROM trades WHERE broker=? AND trade_id=?", (broker, trade_id))
+                cur.execute("SELECT symbol, date, type, qty, price, fee, currency FROM trades "
+                            "WHERE broker=? AND trade_id=?", (broker, trade_id))
                 row = cur.fetchone()
-                if not row:
-                    return
-                symbol, date, ttype, qty, price, fee = row[0], row[1], row[2], str(row[3]), str(row[4]), str(row[5])
-                currency = str(row[6] or 'INR').strip().upper()
-        except Exception:
+        except Exception as e:
+            log.exception("Holdings: could not read trade %s", trade_id)
+            messagebox.showerror("Edit Trade", f"Couldn't read this trade: {e}", parent=trade_tv.winfo_toplevel())
             return
+        if not row:
+            messagebox.showinfo("Edit Trade", "This trade no longer exists. The list will be reloaded.",
+                                parent=trade_tv.winfo_toplevel())
+            if reload_cb:
+                reload_cb()
+            return
+        symbol, date, ttype = row[0], row[1], row[2]
+        qty, price, fee = str(row[3]), str(row[4]), str(row[5])
+        currency = str(row[6] or "INR").strip().upper()
 
         from views.shared_trade_edit import open_edit_trade_modal
-        
-        def _on_edit_complete():
-            if reload_cb: reload_cb()
-            # Use on_filter_change() which runs load_data in a background thread
-            # with a fresh DB connection, avoiding stale WAL reads on the main thread
-            self.on_filter_change()
-            
-        open_edit_trade_modal(self, _on_edit_complete, broker, trade_id, date, symbol, ttype, qty, price, fee, currency, getattr(self, "app_state", None))
+        mark = [self._cache().version]
+        open_edit_trade_modal(self, lambda: self._after_data_change(mark, reload_cb), broker, trade_id, date,
+                              symbol, ttype, qty, price, fee, currency, self.app_state)
 
-    def _show_drilldown_context_menu(self, event, trade_tv, reload_cb) -> None:
+    def _show_drilldown_context_menu(self, event, trade_tv, reload_cb) -> str:
+        iid = trade_tv.identify_row(event.y)
+        if not iid:
+            return "break"
+        if iid not in trade_tv.selection():
+            trade_tv.selection_set(iid)
+        trade_tv.focus(iid)
+        headings = [trade_tv.heading(c, "text") for c in trade_tv["columns"]]
+
+        def _copy(items):
+            lines = ["\t".join(headings)] + ["\t".join(_copy_cell(v) for v in trade_tv.item(it, "values"))
+                                             for it in items]
+            try:
+                self.clipboard_clear()
+                self.clipboard_append("\n".join(lines))
+                show_toast(trade_tv.winfo_toplevel(), f"Copied {len(items)} row{'s' if len(items) != 1 else ''}.")
+            except tk.TclError:
+                log.exception("Holdings: copy from drill-down failed")
+
+        menu = tk.Menu(trade_tv, tearoff=False)
+        menu.add_command(label="📋  Copy selected rows", command=lambda: _copy(list(trade_tv.selection())))
+        menu.add_command(label="📝  Copy all rows", command=lambda: _copy(list(trade_tv.get_children())))
+        menu.add_separator()
+        menu.add_command(label="✏️  Edit trade…", command=lambda: self._edit_trade_focus_handler(trade_tv, reload_cb))
+        menu.add_separator()
+        menu.add_command(label="🗑  Delete trade…", command=lambda: self._delete_trade_from_drilldown(trade_tv, iid, reload_cb))
         try:
-            iid = trade_tv.identify_row(event.y)
-            if not iid: return
-            if iid not in trade_tv.selection():
-                trade_tv.selection_set(iid)
-                
-            def _copy_row():
-                try:
-                    vals = trade_tv.item(iid, "values")
-                    text = "\t".join(str(v).replace("₹", "").replace("¥", "").replace("$", "").replace(",", "").replace("%", "").strip() for v in vals)
-                    self.clipboard_clear()
-                    self.clipboard_append(text)
-                except Exception: pass
-
-            def _copy_all():
-                try:
-                    cols = [trade_tv.heading(c, "text") for c in trade_tv["columns"]]
-                    lines = ["\t".join(cols)]
-                    for it in trade_tv.get_children():
-                        vals = trade_tv.item(it, "values")
-                        lines.append("\t".join(str(v).replace("₹", "").replace("¥", "").replace("$", "").replace(",", "").replace("%", "").strip() for v in vals))
-                    self.clipboard_clear()
-                    self.clipboard_append("\n".join(lines))
-                except Exception: pass
-                    
-            menu = tk.Menu(trade_tv, tearoff=False)
-            menu.add_command(label="📋 Copy Selected Row", command=_copy_row)
-            menu.add_command(label="📝 Copy All Rows", command=_copy_all)
-            menu.add_separator()
-            menu.add_command(label="✏️ Update Trade", command=lambda: self._edit_trade_focus_handler(trade_tv, reload_cb))
-            menu.add_separator()
-            menu.add_command(label="🗑  Delete Trade", command=lambda: self._delete_trade_from_drilldown(trade_tv, iid, reload_cb))
             menu.tk_popup(event.x_root, event.y_root)
-        except Exception as e:
-            print(f"Drilldown Context menu error: {e}")
+        finally:
+            menu.grab_release()
+        return "break"
 
-    def _delete_trade_from_drilldown(self, trade_tv, iid, reload_cb):
-        from tkinter import messagebox
-        
-        selected = list(trade_tv.selection())
-        if not selected:
-            if iid:
-                selected = [iid]
-            else:
-                return
-                
-        count = len(selected)
-        if count == 1:
-            vals = trade_tv.item(selected[0], "values")
-            trade_id = str(vals[2]).strip() if len(vals) > 2 else "Unknown"
-            msg = f"Are you sure you want to delete trade {trade_id}?\n\nThis action cannot be undone."
-            title = "Delete Trade"
-        else:
-            msg = f"Are you sure you want to delete {count} selected trades?\n\nThis action cannot be undone."
-            title = f"Delete {count} Trades"
-            
-        if not messagebox.askyesno(title, msg, parent=trade_tv.winfo_toplevel()):
+    # ── Delete ────────────────────────────────────────────────────────────
+    def _delete_selected_holding(self) -> None:
+        sel = list(self.tree.selection() or [])
+        if not sel:
+            messagebox.showinfo("Delete Holding", "Select a holding row first.")
             return
-        
-        try:
-            import model.crud as crud
-            from model.engine import rebuild_holdings
-            
-            for item in selected:
-                vals = trade_tv.item(item, "values")
-                if not vals or len(vals) < 11:
-                    continue
-                trade_id = str(vals[2]).strip()
-                broker = str(vals[10]).strip()
-                crud.delete_trade(broker, trade_id)
-                
-            rebuild_holdings()
-            if self.app_state and hasattr(self.app_state, "refresh_data_cache"):
-                self.app_state.refresh_data_cache()
-            
-            if reload_cb: reload_cb()
-            self.load_data()
-        except Exception as e:
-            messagebox.showerror("Delete Trade", f"Failed to delete trade: {e}", parent=trade_tv.winfo_toplevel())
+        meta = self._row_meta.get(sel[0], {})
+        symbol = str(meta.get("symbol") or "").strip()
+        broker = str(meta.get("broker") or "").strip()
+        if not symbol or not broker:
+            messagebox.showerror("Delete Holding", "Could not tell which holding this row is.")
+            return
+        if not messagebox.askyesno(
+            "Delete Holding",
+            f"Delete holding {symbol} ({broker}) and ALL its underlying trades?\n\n"
+            "A backup is saved first, so you can undo this from Settings (Restore…).",
+        ):
+            return
 
-    def on_filter_change(self):
-        """Handle filter changes."""
-        threading.Thread(target=self.load_data, daemon=True).start()
-    
-    def load_data(self):
-        """Load and display holdings data."""
-        try:
-            # Always refresh the cache from DB so we pick up any changes from
-            # rebuild_holdings() that ran in a background thread (e.g. after bulk import).
+        cache, app_state = self._cache(), self.app_state
+
+        def work():
+            from model.backup import safety_backup
             try:
-                from model.database import _invalidate_thread_connection
-                _invalidate_thread_connection()
-                
-                cache = None
-                if self.app_state is not None and hasattr(self.app_state, "data_cache"):
-                    cache = self.app_state.data_cache
-                else:
-                    cache = self.data_cache
-                cache.refresh_from_db()
-                # Keep both caches in sync
-                self.data_cache = cache
-            except Exception:
-                pass
-
-            # Get filter values
-            broker = self.broker_var.get() if hasattr(self, 'broker_var') else "All"
-            symbol = self.symbol_entry.get_value() if hasattr(self, 'symbol_entry') else ""
-            signal_label = self.signal_var.get() if hasattr(self, 'signal_var') else "All"
-            # Map display labels → actual DB values
-            _signal_map = {
-                "Accumulate": "ACCUMULATE",
-                "Reduce":     "REDUCE",
-                "None":       "N/A",
-                "All":        "All",
-            }
-            signal = _signal_map.get(signal_label, signal_label)
-            # Parse Segmented Control
-            h_state = self.holding_state_var.get() if hasattr(self, 'holding_state_var') else "Active"
-            exclude_zero = (h_state == "Active")
-            zero_only = (h_state == "Closed")
-            
-            # Query cache
-            filters = HoldingsFilters(
-                broker=broker or "All",
-                symbol_like=symbol.upper(),
-                iv_signal=signal or "All",
-                exclude_zero_qty=exclude_zero,
-                zero_qty_only=zero_only
-            )
-            
-            df, summary = self.data_cache.get_holdings_filtered(filters)
-            
-            # Get real portfolio total (ignoring symbol/signal filters) to keep Weight% accurate
-            base_filters = HoldingsFilters(broker=broker or "All", exclude_zero_qty=exclude_zero, zero_qty_only=zero_only)
-            _, base_summary = self.data_cache.get_holdings_filtered(base_filters)
-            total_portfolio_val = float(base_summary.get('current', 0))
-            
-            self.current_df = df
-            
-            # Update UI in main thread
-            self.after(0, lambda: self._update_display(df, summary, total_portfolio_val))
-        
-        except Exception as e:
-            print(f"Error loading data: {e}")
-    
-    def _update_display(self, df: pd.DataFrame, summary: dict, total_portfolio_val: float = 0.0):
-        """Update table and stats display."""
-        self._row_meta = {}
-        # Clear table
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        
-        if df is None or getattr(df, "empty", True):
+                safety_backup("delete-holding")
+            except Exception as e:
+                raise RuntimeError(f"Couldn't save a backup first, so nothing was deleted. ({e})") from e
             try:
-                self._empty_frame.place(relx=0.5, rely=0.5, anchor="center")
-            except Exception:
-                pass
-        else:
+                crud.delete_holding_and_trades(broker, symbol)
+            except Exception as e:
+                raise RuntimeError(f"Failed to delete: {e}") from e
+            warning = None
             try:
-                self._empty_frame.place_forget()
-            except Exception:
-                pass
-        
-        # Update stats — these are cross-currency aggregates, so label as "Value"
-        self.stats_labels["count"].config(text=f"{len(df)}")
-        
-        currency_val = getattr(self, "currency_var", None)
-        c_val = currency_val.get() if currency_val else "All"
-        sym = {"JPY": "¥", "USD": "$"}.get(c_val, "₹")
-        
-        # Invested and current values are the aggregates stored in the summary
-        from ui_utils import format_money
-        self.stats_labels["invested"].config(text=f"{sym} {float(summary.get('invested', 0)):,.0f}")
-        self.stats_labels["current"].config(text=f"{sym} {float(summary.get('current', 0)):,.0f}")
-        
-        pnl = float(summary.get('pnl', 0))
-        
-        from model.engine import get_exchange_rate
-        if not df.empty:
-            unique_currencies = [str(c).strip().upper() for c in df["currency"].dropna().unique()] if "currency" in df.columns else []
-            rates = {c: get_exchange_rate(c) for c in unique_currencies}
-            
-            def _get_rate(c):
-                if pd.isna(c):
-                    return 1.0
-                if c_val != "All":
-                    return 1.0
-                return rates.get(str(c).strip().upper(), 1.0)
-            
-            rates_series = df["currency"].apply(_get_rate) if "currency" in df.columns else pd.Series(1.0, index=df.index)
-        else:
-            rates_series = pd.Series(dtype=float)
-        
-        try:
-            if not df.empty and "realized_pnl" in df.columns:
-                total_real = float((df["realized_pnl"] * rates_series).sum())
-            else:
-                total_real = 0.0
-                
-            total_unreal = pnl - total_real
-            
-            real_color = ModernStyle.SUCCESS if total_real >= 0 else ModernStyle.ERROR
-            unreal_color = ModernStyle.SUCCESS if total_unreal >= 0 else ModernStyle.ERROR
-            
-            if "realized_pnl" in self.stats_labels:
-                self.stats_labels["realized_pnl"].config(text=f"{sym} {total_real:,.0f}", fg=real_color)
-            if "unrealized_pnl" in self.stats_labels:
-                self.stats_labels["unrealized_pnl"].config(text=f"{sym} {total_unreal:,.0f}", fg=unreal_color)
-        except Exception:
-            pass
-        
-        try:
-            if not df.empty and "total_fees" in df.columns:
-                total_fees = float((df["total_fees"] * rates_series).sum())
-            else:
-                total_fees = 0.0
-            self.stats_labels["fees"].config(text=f"{sym} {total_fees:,.0f}")
-        except Exception:
-            self.stats_labels["fees"].config(text=f"{sym} 0")
-        
-        # Precompute total current value for Weight% 
-        # (Use total_portfolio_val passed from load_data to keep weight accurate during filtering)
-        if total_portfolio_val > 0:
-            total_val = total_portfolio_val
-        else:
-            if not df.empty:
-                total_val = float((df["current_value"] * rates_series).sum())
-            else:
-                total_val = 0.0
-
-        # Sort DataFrame alphabetically by symbol
-        if not df.empty and 'symbol' in df.columns:
-            df = df.sort_values(by='symbol', ascending=True)
-
-        # Populate table (match Flet computations)
-        for idx, row in enumerate(df.itertuples(index=False)):
-            qty = float(getattr(row, 'qty', 0) or 0)
-            avg_price = float(getattr(row, 'avg_price', 0) or 0)
-            mkt_price = float(getattr(row, 'market_price', 0) or 0)
-            prev_close = float(getattr(row, 'previous_close', 0) or 0)
-            running_pnl = float(getattr(row, 'running_pnl', 0) or 0)
-            realized_pnl = float(getattr(row, 'realized_pnl', 0) or 0)
-            total_fees = float(getattr(row, 'total_fees', 0) or 0)
-            pe_ratio = float(getattr(row, 'pe_ratio', 0) or 0)
-            xirr = float(getattr(row, 'xirr', 0) or 0)
-            cagr = float(getattr(row, 'cagr', 0) or 0)
-            current_value = float(getattr(row, 'current_value', 0) or 0)
-            signal = getattr(row, 'action_signal', None) or getattr(row, 'iv_signal', None) or "N/A"
-
-            # PE Ratio formatting
-            pe_disp = f"{pe_ratio:.2f}" if pe_ratio > 0 else "—"
-
-            # Daily change % — arrow prefix for sign clarity (no row color tag)
-            if prev_close > 0 and mkt_price > 0:
-                daily_pct = ((mkt_price - prev_close) / prev_close) * 100.0
-                arrow = "🌲" if daily_pct >= 0 else "🔻"
-                daily_disp = f"{arrow} {daily_pct:+.2f}%"
-            else:
-                daily_disp = "—"
-
-            from ui_utils import format_money
-            currency = str(getattr(row, 'currency', 'INR')).strip().upper()
-            
-            # Flash PnL — arrow prefix for sign clarity
-            if mkt_price > 0:
-                flash_pnl = (mkt_price - avg_price) * qty
-                arrow = "🌲" if flash_pnl >= 0 else "🔻"
-                flash_disp = f"{arrow} {format_money(flash_pnl, currency).split('.')[0]}" # no decimals for PnL
-            else:
-                flash_disp = "—"
-
-            # Real PnL — arrow prefix
-            rpnl_arrow = "🌲" if running_pnl >= 0 else "🔻"
-            rpnl_disp = f"{rpnl_arrow} {format_money(running_pnl, currency).split('.')[0]}"
-            
-            # Realized PnL
-            if realized_pnl == 0:
-                realized_disp = "—"
-            else:
-                realized_arrow = "🌲" if realized_pnl > 0 else "🔻"
-                realized_disp = f"{realized_arrow} {format_money(realized_pnl, currency).split('.')[0]}"
-
-            # Weight% with Pro-Gradient 5-Block Scale (4% per block, 20% max)
-            if total_val > 0:
-                rate = get_exchange_rate(currency)
-                current_value_inr = current_value * rate
-                weight_pct = (current_value_inr / total_val) * 100.0
-                # Scale: each block is 4% (5 blocks = 20% max)
-                num_blocks = 5
-                filled = min(num_blocks, int(max(1, weight_pct / 4.0)) if weight_pct > 0.5 else 0)
-                empty = num_blocks - filled
-                
-                # Pro-Gradient: different colors per block as it builds up
-                bar_chars = ["🟩", "🟦", "🟨", "🟧", "🟥"]
-                bar = "".join(bar_chars[:filled]) + ("⬜" * empty)
-                weight_disp = f"{bar}  {weight_pct:.1f}%"
-            else:
-                weight_disp = "⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 0.0%"
-
-            xirr_disp = "—" if float(xirr) == -100 else (f"{xirr:.2f}%" if qty > 0 else "—")
-            cagr_disp = f"{cagr:.2f}%" if qty > 0 else "—"
-
-            # stock_name can be NaN (float) from pandas; normalize before slicing.
-            stock_name = getattr(row, 'stock_name', '—')
-            try:
-                if stock_name is None or (isinstance(stock_name, float) and pd.isna(stock_name)):
-                    stock_name = '—'
-            except Exception:
-                pass
-            try:
-                stock_name = str(stock_name)
-            except Exception:
-                stock_name = '—'
-            stock_name = (stock_name or '—').strip() or '—'
-
-            # Signal display — rich emoji badge per signal type
-            sig_norm = str(signal).strip().upper()
-            if sig_norm in {"ACCUMULATE", "BUY", "ADD"}:
-                signal_disp = f"🌲 ACCUMULATE"
-            elif sig_norm in {"REDUCE", "SELL", "TRIM"}:
-                signal_disp = f"♦️ REDUCE"
-            elif sig_norm in {"HOLD", "WAIT"}:
-                signal_disp = f"🔸 HOLD"
-            elif sig_norm in {"N/A", "NA", ""}:
-                signal_disp = "🔘 N/A"
-            else:
-                signal_disp = f"🔹 {signal}"
-
-            values = (
-                str(idx + 1),
-                getattr(row, 'symbol', '—'),
-                stock_name[:28],
-                f"{qty:,.0f}",
-                format_money(avg_price, currency),
-                format_money(mkt_price, currency) if mkt_price > 0 else "—",
-                pe_disp,
-                daily_disp,
-                flash_disp,
-                weight_disp,
-                xirr_disp,
-                cagr_disp,
-                realized_disp,
-                rpnl_disp,
-                format_money(total_fees, currency),
-                signal_disp,
-            )
-
-            # Tags: signal and highlight overrides take priority over zebra stripe
-            stripe_tag = "even" if (idx % 2 == 0) else "odd"
-            if running_pnl < -10000:
-                row_tags = ("low_unrealized_pnl",)
-            elif sig_norm in {"ACCUMULATE", "BUY", "ADD"}:
-                row_tags = ("sig_accumulate",)
-            else:
-                row_tags = (stripe_tag,)
-                
-            iid = self.tree.insert("", "end", values=values, tags=row_tags)
-            try:
-                self._row_meta[str(iid)] = {
-                    "broker": getattr(row, "broker", ""),
-                    "symbol": getattr(row, "symbol", ""),
-                    "stock_name": getattr(row, "stock_name", ""),
-                    "qty": qty,
-                    "avg_price": avg_price,
-                    "market_price": mkt_price,
-                    "running_pnl": running_pnl,
-                    "total_fees": total_fees,
-                }
-            except Exception:
-                pass
-        
-        # Re-apply the remembered sort after repopulating
-        if self._sort_col:
-            try:
-                treeview_sort_column(self.tree, self._sort_col, self._sort_reverse)
-            except Exception:
-                pass
-    
-    def refresh(self):
-        self._data_loaded = False
-        def _force_rebuild():
-            try:
-                from model.engine import rebuild_holdings, fetch_and_update_market_data
-                from model.database import db_session
-                try:
-                    with db_session() as conn:
-                        c = conn.cursor()
-                        # Manual refresh: fetch all historical trades + all watchlist symbols
-                        c.execute("""
-                            SELECT DISTINCT symbol FROM trades
-                            UNION
-                            SELECT DISTINCT symbol FROM watchlist
-                        """)
-                        symbols = [r[0] for r in c.fetchall() if r[0]]
-                    if symbols:
-                        fetch_and_update_market_data(symbols)
-                except Exception as e:
-                    print(f"Market fetch failed: {e}")
-
+                from model.engine import rebuild_holdings
                 rebuild_holdings()
             except Exception as e:
-                print(f"Force rebuild failed: {e}")
-            self.load_data()
-        threading.Thread(target=_force_rebuild, daemon=True).start()
+                log.exception("Holdings: rebuild after deleting %s/%s failed", broker, symbol)
+                warning = f"Deleted, but recalculating the holdings failed ({e}). Use ⟳ Refresh to try again."
+            _refresh_shared_cache(cache, app_state)
+            return warning
 
-    def _clear_filters(self):
-        try:
-            self.broker_var.set("All")
-        except Exception:
-            pass
-        try:
-            self.signal_var.set("All")
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "symbol_entry"):
-                self.symbol_entry.delete(0, tk.END)
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "holding_state_var"):
-                self.holding_state_var.set("All")
-        except Exception:
-            pass
+        def done(warning):
+            show_toast(self, warning or f"Deleted {symbol} ({broker}).", type="warning" if warning else "success")
+            self._invalidate_other_views()
+            self.load_data(refresh=False)
+
+        run_in_background(work, on_done=done,
+                          on_error=lambda e: messagebox.showerror("Delete Holding", str(e)),
+                          widget=self, name="holdings-delete")
+
+    def _delete_trade_from_drilldown(self, trade_tv, iid, reload_cb):
+        selected = list(trade_tv.selection()) or ([iid] if iid else [])
+        if not selected:
+            return
+        trades = []
+        for item in selected:
+            vals = trade_tv.item(item, "values")
+            if vals and len(vals) >= 11:
+                trades.append((str(vals[10]).strip(), str(vals[2]).strip()))
+        if not trades:
+            return
+        parent = trade_tv.winfo_toplevel()
+        if len(trades) == 1:
+            title, msg = "Delete Trade", f"Are you sure you want to delete trade {trades[0][1]}?"
+        else:
+            title, msg = f"Delete {len(trades)} Trades", f"Are you sure you want to delete {len(trades)} selected trades?"
+        msg += "\n\nA backup is saved first, so you can undo this from Settings (Restore…)."
+        if not messagebox.askyesno(title, msg, parent=parent):
+            return
+
+        cache, app_state = self._cache(), self.app_state
+
+        def work():
+            from model.backup import safety_backup
+            try:
+                safety_backup("delete-trade")
+            except Exception as e:
+                raise RuntimeError(f"Couldn't save a backup first, so nothing was deleted. ({e})") from e
+            for broker, trade_id in trades:
+                crud.delete_trade(broker, trade_id)
+            warning = None
+            try:
+                from model.engine import rebuild_holdings
+                rebuild_holdings()
+            except Exception as e:
+                log.exception("Holdings: rebuild after deleting trades failed")
+                warning = f"Deleted, but recalculating the holdings failed ({e}). Use ⟳ Refresh to try again."
+            _refresh_shared_cache(cache, app_state)
+            return warning
+
+        def done(warning):
+            n = len(trades)
+            show_toast(self, warning or f"Deleted {n} trade{'s' if n != 1 else ''}.",
+                       type="warning" if warning else "success")
+            self._invalidate_other_views()
+            if reload_cb:
+                reload_cb()
+            self.load_data(refresh=False)
+
+        def failed(exc):
+            try:
+                messagebox.showerror("Delete Trade", f"Failed to delete: {exc}", parent=parent)
+            except tk.TclError:
+                messagebox.showerror("Delete Trade", f"Failed to delete: {exc}")
+
+        run_in_background(work, on_done=done, on_error=failed, widget=self, name="holdings-delete-trade")
+
+    # ── Filters ───────────────────────────────────────────────────────────
+    def _on_broker_selected(self):
+        """Picking a broker switches to that broker's currency."""
+        broker = self.broker_var.get()
+        if broker != "All":
+            currency = str(self._broker_currency.get(broker) or "").upper()
+            if currency in ("INR", "JPY") and currency != self.currency_var.get():
+                self.currency_var.set(currency)      # its trace schedules the reload
+        elif self.currency_var.get() == "JPY":
+            self.currency_var.set("INR")
         self.on_filter_change()
+
+    def _load_brokers(self):
+        """Kept for older callers: the broker list now arrives with each background load."""
+        self.load_data(refresh=False)
+
+    def _on_symbol_search(self, event=None):
+        self.on_filter_change()
+
+    def on_filter_change(self):
+        """A filter changed: reload once the user pauses for FILTER_DEBOUNCE_MS."""
+        if self._filter_timer is not None:
+            try:
+                self.after_cancel(self._filter_timer)
+            except tk.TclError:
+                pass
+        self._filter_timer = self.after(FILTER_DEBOUNCE_MS, self._run_filter_change)
+
+    def _run_filter_change(self):
+        self._filter_timer = None
+        if (not self._load_running and self._read_filters() == self._shown_params
+                and self._cache().version == self._shown_version):
+            return       # nothing changed (e.g. the search box just lost focus)
+        self.load_data(refresh=False)
+
+    def _read_filters(self) -> dict:
+        """Plain filter values, read from the Tk variables on the Tk thread."""
+        return {
+            "broker": self.broker_var.get() or "All",
+            "currency": self.currency_var.get() or "INR",
+            "symbol": (self._symbol_bar.get() or "").strip(),
+            "signal": SIGNAL_FILTERS.get(self.signal_var.get(), "All"),
+            "signal_label": self.signal_var.get(),
+            "state": self.holding_state_var.get() or "Active",
+        }
+
+    # ── Loading ───────────────────────────────────────────────────────────
+    def _first_load_if_needed(self):
+        if self._shown_version is None and not self._load_running:
+            self.load_data()
+
+    def on_show(self):
+        """Called by main.py when this page is shown."""
+        self._is_active = True
+        cache = self._cache()
+        if not self._data_loaded or not cache.loaded:
+            self.load_data()
+        elif cache.version != self._shown_version:
+            self.load_data(refresh=False)     # another page reloaded the cache: just re-filter
+        # else: the table already shows the latest data
+
+    def load_data(self, refresh: Optional[bool] = None):
+        """Rebuild the table for the current filters, in the background.
+
+        refresh=True reloads the shared cache from the database first;
+        refresh=False only re-filters what is in memory; None decides: reload
+        when the cache is empty, or when another page set _data_loaded = False
+        without reloading the cache itself.
+        """
+        cache = self._cache()
+        if refresh is None:
+            asked_again = (not self._data_loaded and self._shown_version is not None
+                           and cache.version == self._shown_version)
+            refresh = (not cache.loaded) or asked_again
+        self._data_loaded = True
+        self._want_refresh = self._want_refresh or bool(refresh)
+        self._load_gen += 1
+        if not self._load_running:
+            self._start_load()
+        # else: the running load sees a newer generation when it finishes and loads again
+
+    def _start_load(self):
+        gen = self._load_gen
+        refresh, self._want_refresh = self._want_refresh, False
+        params = self._read_filters()
+        cache, app_state = self._cache(), self.app_state
+        self._load_running = True
+        if refresh and not self._refreshing:
+            self._set_label(self._scope_lbl, "⏳ Loading holdings…")
+
+        def work():
+            if refresh or not cache.loaded:
+                _refresh_shared_cache(cache, app_state)
+            version = cache.version
+            result = _compute_holdings(cache, params)
+            result["version"] = version
+            result["brokers"], result["broker_currency"] = _broker_info(app_state)
+            return result
+
+        run_in_background(work, on_done=lambda res: self._on_load_done(gen, params, res),
+                          on_error=lambda exc: self._on_load_failed(gen, exc),
+                          widget=self, name="holdings-load")
+
+    def _on_load_done(self, gen: int, params: dict, res: dict) -> None:
+        self._load_running = False
+        if gen != self._load_gen:
+            self._start_load()        # filters changed meanwhile: these rows are stale
+            return
+        self._apply_result(params, res)
+
+    def _on_load_failed(self, gen: int, exc: Exception) -> None:
+        self._load_running = False
+        if gen != self._load_gen:
+            self._start_load()
+            return
+        self._data_loaded = False      # try again next time the page is shown
+        self._set_label(self._scope_lbl, "❌ Couldn't load holdings", ModernStyle.ERROR)
+        if not self.tree.get_children():
+            self._show_empty("⚠️", "Couldn't load holdings", str(exc))
+        show_toast(self, f"Couldn't load holdings: {exc}", type="error")
+
+    def _apply_result(self, params: dict, res: dict) -> None:
+        """Put a finished load into the table and the totals (Tk thread)."""
+        self._shown_version = res["version"]
+        self._shown_params = params
+        self._broker_currency = res.get("broker_currency") or {}
+        brokers = ["All"] + [b for b in (res.get("brokers") or []) if b]
+        if brokers != self._brokers:
+            self._brokers = brokers
+            self.broker_combo.configure(values=brokers)
+
+        # Rows (keep the selection when the same holdings are still there)
+        selected = {(m["broker"], m["symbol"]) for m in (self._row_meta.get(i) for i in self.tree.selection()) if m}
+        self.tree.delete(*self.tree.get_children())
+        self._row_meta = {}
+        reselect = []
+        for i, (values, meta) in enumerate(res["rows"]):
+            iid = f"h{i}"
+            self.tree.insert("", "end", iid=iid, values=values)
+            self._row_meta[iid] = meta
+            if (meta["broker"], meta["symbol"]) in selected:
+                reselect.append(iid)
+        self._apply_sort()
+        if reselect:
+            self.tree.selection_set(reselect)
+
+        self._update_totals(params, res)
+
+        n = len(res["rows"])
+        if n:
+            self._show_empty(None)
+        else:
+            hint = "Clear the symbol search, or pick “All” for Signal and Status."
+            broker_cur = str(self._broker_currency.get(params["broker"]) or "").upper()
+            if params["broker"] != "All" and broker_cur and broker_cur != params["currency"]:
+                hint = f"{params['broker']} holds {broker_cur} shares: switch the currency at the top right to {broker_cur}."
+            self._show_empty("🪹", "No holdings match these filters", hint)
+
+    def _update_totals(self, params: dict, res: dict) -> None:
+        cur = params["currency"] if params["currency"] != "All" else "INR"
+        n = len(res["rows"])
+        self._set_label(self.stats_labels["count"], str(n))
+        self._set_label(self.stats_labels["invested"], _money0(res["invested"], cur))
+        self._set_label(self.stats_labels["current"], _money0(res["current"], cur))
+        for key, value in (("realized_pnl", res["realised"]), ("unrealized_pnl", res["unrealised"])):
+            self._set_label(self.stats_labels[key], _pnl_text(value, cur),
+                            ModernStyle.SUCCESS if value >= 0 else ModernStyle.ERROR)
+        self._set_label(self.stats_labels["fees"], _money0(res["fees"], cur))
+        self._fit_kpi_fonts()
+
+        parts = [f"📌 {_cur_symbol(cur).strip()} {cur}",
+                 "All brokers" if params["broker"] == "All" else params["broker"]]
+        if params["signal"] != "All":
+            parts.append(f"Signal: {params['signal_label']}")
+        if params["symbol"]:
+            parts.append(f"“{params['symbol'].upper()}”")
+        noun = STATUS_TEXT.get(params["state"], "holding")
+        if n != 1:
+            noun = noun.replace("holding", "holdings").replace("position", "positions")
+        parts.append(f"{n} {noun}")
+        text = "  ·  ".join(parts)
+        self._set_label(self._scope_lbl, text, ModernStyle.TEXT_SECONDARY)
+        self._scope_tip.text = f"The totals above and the table below cover: {text.replace('📌 ', '')}"
+
+    # ── ⟳ Refresh: latest prices, then recalculate ────────────────────────
+    def refresh(self):
+        if self._refreshing:
+            return
+        self._refreshing = True          # also stops a second click from starting another run
+        btn = getattr(self, "_refresh_btn", None)
+        if btn is not None:
+            btn.set_palette(bg=ModernStyle.NEUTRAL_FILL)
+            btn.set_text("⏳ Refreshing…")
+        self._set_label(self._scope_lbl, "⏳ Fetching the latest prices… this can take a minute.",
+                        ModernStyle.TEXT_ACCENT)
+        cache, app_state = self._cache(), self.app_state
+
+        def work():
+            from model.database import db_session
+            from model.engine import fetch_and_update_market_data, rebuild_holdings
+            price_error = None
+            symbols = []
+            try:
+                with db_session() as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT DISTINCT symbol FROM trades UNION SELECT DISTINCT symbol FROM watchlist")
+                    symbols = [r[0] for r in c.fetchall() if r[0]]
+                if symbols:
+                    fetch_and_update_market_data(list(symbols))
+            except Exception as e:
+                log.exception("Holdings: fetching prices failed")
+                price_error = str(e)
+            rebuild_holdings()
+            _refresh_shared_cache(cache, app_state)
+            return len(symbols), price_error
+
+        def finish():
+            self._refreshing = False
+            if btn is not None:
+                btn.set_palette(bg=ModernStyle.ACCENT_PRIMARY)
+                btn.set_text("↻ Refresh")
+
+        def done(result):
+            count, price_error = result
+            finish()
+            if price_error:
+                show_toast(self, f"Couldn't fetch new prices ({price_error}). Holdings were recalculated "
+                                 "with the last saved prices.", type="warning")
+            else:
+                show_toast(self, f"Prices updated for {count} stocks and holdings recalculated.")
+            self._invalidate_other_views()
+            self.load_data(refresh=False)
+
+        def failed(exc):
+            finish()
+            self._set_label(self._scope_lbl, "❌ Refresh failed", ModernStyle.ERROR)
+            show_toast(self, f"Refresh failed: {exc}", type="error")
+            self.load_data(refresh=False)
+
+        run_in_background(work, on_done=done, on_error=failed, widget=self, name="holdings-refresh")

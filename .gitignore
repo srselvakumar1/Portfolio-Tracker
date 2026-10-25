@@ -117,3 +117,8 @@ venv.bak/
 
 # Project specific
 flet_page_docs.txt
+
+# Build outputs and personal data that must never be pushed
+*.pkg
+dashboard_cache.json
+*.local.md

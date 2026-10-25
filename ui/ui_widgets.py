@@ -7,7 +7,7 @@ import tkinter as tk
 from typing import Callable, Optional
 from pathlib import Path
 
-from ui_theme import ModernStyle
+from .ui_theme import ModernStyle
 
 
 class ModernEntry(tk.Entry):
@@ -15,7 +15,7 @@ class ModernEntry(tk.Entry):
 
     def __init__(self, parent, placeholder="", numeric_only=False, currency_format=False, **kwargs):
         # Default text color (blue) for input, muted for placeholder
-        fg = kwargs.pop("fg", ModernStyle.ACCENT_PRIMARY)
+        fg = kwargs.pop("fg", ModernStyle.TEXT_ACCENT)
         # Subtle default border — callers can override
         kwargs.setdefault("highlightthickness", 1)
         kwargs.setdefault("highlightbackground", ModernStyle.BORDER_COLOR)
@@ -40,14 +40,39 @@ class ModernEntry(tk.Entry):
         self.highlight_color = kwargs.get("highlightcolor", ModernStyle.ACCENT_PRIMARY)
         self.highlight_bg_color = kwargs.get("highlightbackground", ModernStyle.BORDER_COLOR)
         
+        self.config(fg=self.normal_color)
+
+        # The placeholder is a grey label drawn inside the entry, NOT text in the
+        # entry: inserted text also landed in the textvariable, so a hint such as
+        # "SYMBOL *" could be saved as if the user had typed it.
+        self._ph_label = None
         if placeholder:
-            self.insert(0, placeholder)
-            self.config(fg=self.default_color)
-        else:
-            self.config(fg=self.normal_color)
-        
-        self.bind('<FocusIn>', self._on_focus_in)
-        self.bind('<FocusOut>', self._on_focus_out)
+            self._ph_label = tk.Label(self, text=placeholder, fg=self.default_color,
+                                      bg=self.bg_color, font=self.cget("font"), anchor="w", padx=2)
+            self._ph_label.bind("<Button-1>", lambda e: self.focus_set())
+            tv = kwargs.get("textvariable")
+            if tv is not None:
+                try:
+                    tv.trace_add("write", lambda *a: self._update_placeholder())
+                except Exception:
+                    pass
+            self.bind('<KeyRelease>', lambda e: self._update_placeholder(), add="+")
+            self.after_idle(self._update_placeholder)
+
+        self.bind('<FocusIn>', self._on_focus_in, add="+")
+        self.bind('<FocusOut>', self._on_focus_out, add="+")
+
+    def _update_placeholder(self) -> None:
+        if self._ph_label is None:
+            return
+        try:
+            show = not self.get() and self.focus_get() is not self
+        except (tk.TclError, KeyError):
+            show = not self.get()
+        if show and not self._ph_label.winfo_ismapped():
+            self._ph_label.place(x=2, rely=0.5, anchor="w")
+        elif not show and self._ph_label.winfo_ismapped():
+            self._ph_label.place_forget()
         
     def _validate_numeric(self, P):
         if P == "" or P == self.placeholder:
@@ -79,11 +104,11 @@ class ModernEntry(tk.Entry):
         pass  # handled by ClearableEntry
     
     def _on_focus_in(self, event=None):
-        # 1. Handle Placeholder / Unformatting
+        # 1. Hide the placeholder / remove formatting for editing
+        if self._ph_label is not None:
+            self._ph_label.place_forget()
         val = self.get()
-        if val == self.placeholder:
-            self.delete(0, tk.END)
-        elif self.currency_format and val:
+        if self.currency_format and val:
             # Strip formatting to edit
             self.delete(0, tk.END)
             self.insert(0, val.replace(',', ''))
@@ -93,7 +118,7 @@ class ModernEntry(tk.Entry):
         
         # 2. Smooth border fading via ui_utils
         try:
-            from ui_utils import fade_color_transition
+            from .ui_utils import fade_color_transition
             fade_color_transition(self, self.highlight_bg_color, self.highlight_color, attr='highlightcolor', duration_ms=100)
         except Exception:
             pass
@@ -101,9 +126,8 @@ class ModernEntry(tk.Entry):
     def _on_focus_out(self, event=None):
         val = self.get().strip()
         if not val:
-            self.insert(0, self.placeholder)
-            self.config(fg=self.default_color)
-        elif self.currency_format and val != self.placeholder:
+            self._update_placeholder()
+        elif self.currency_format:
             try:
                 # Add thousands separators
                 fval = float(val)
@@ -114,14 +138,11 @@ class ModernEntry(tk.Entry):
         self._check_clear_btn()
     
     def get_value(self):
-        """Get entry value, ignoring placeholder and formatting."""
+        """Get entry value, without thousands separators when currency-formatted."""
         val = self.get()
-        if val == self.placeholder:
-            return ""
         if self.currency_format:
             return val.replace(',', '')
         return val
-
 
 
 class ClearableEntry(tk.Frame):
@@ -157,7 +178,7 @@ class ClearableEntry(tk.Frame):
         self._clear_lbl = tk.Label(
             self, text="✕",
             fg=ModernStyle.TEXT_TERTIARY, bg=bg,
-            font=("Helvetica", 11), cursor="hand2",
+            font=ModernStyle.FONT_SMALL, cursor="hand2",
             padx=4,
         )
         self._clear_lbl.bind("<Button-1>", self._on_clear)
@@ -204,112 +225,6 @@ class ClearableEntry(tk.Frame):
         self._sync_clear()
 
 
-class MaterialEntry(tk.Canvas):
-    """A premium form input with a floating Material-style label."""
-    def __init__(self, parent, placeholder: str, width: int = 20, numeric_only=False, currency_format=False, **kwargs):
-        self.bg_color = kwargs.pop("bg", ModernStyle.BG_PRIMARY)
-        self.accent_color = kwargs.pop("accent", ModernStyle.ACCENT_PRIMARY)
-        
-        super().__init__(parent, bg=self.bg_color, highlightthickness=0, width=width*10, height=50, **kwargs)
-        
-        self.placeholder = placeholder
-        self.is_focused = False
-        self.has_text = False
-        
-        # Internal Entry Widget
-        self.entry = ModernEntry(
-            self, placeholder="",
-            numeric_only=numeric_only, currency_format=currency_format,
-            bg=self.bg_color, fg=ModernStyle.TEXT_PRIMARY,
-            font=ModernStyle.FONT_BODY,
-            bd=0, highlightthickness=0, relief=tk.FLAT,
-            insertbackground=ModernStyle.TEXT_PRIMARY
-        )
-        # Link variable if provided
-        if "textvariable" in kwargs:
-            self.entry.config(textvariable=kwargs["textvariable"])
-        
-        # Position slightly down to leave room for the floating text
-        self.entry_window = self.create_window(0, 24, window=self.entry, anchor="nw", width=width*10)
-        
-        # Floating Label Text
-        self.label_id = self.create_text(
-            4, 24,  # Start at same height as entry text
-            text=self.placeholder,
-            fill=ModernStyle.TEXT_TERTIARY,
-            font=ModernStyle.FONT_BODY,
-            anchor="nw"
-        )
-        
-        # Underline
-        self.line_id = self.create_line(0, 48, width*10, 48, fill=ModernStyle.BORDER_COLOR, width=1)
-        
-        # Bind events
-        self.entry.bind("<FocusIn>", self._on_focus_in, add="+")
-        self.entry.bind("<FocusOut>", self._on_focus_out, add="+")
-        self.entry.bind("<KeyRelease>", self._check_state, add="+")
-        self.bind("<Button-1>", lambda e: self.entry.focus_set())
-        
-        self.bind("<Configure>", self._on_resize)
-        
-    def _on_resize(self, event=None):
-        w = event.width if event else self.winfo_width()
-        self.itemconfig(self.entry_window, width=w)
-        self.coords(self.line_id, 0, 48, w, 48)
-
-    def _anim_float(self, target_y: float, target_font: tuple, target_color: str):
-        # Extremely simplified animation logic
-        current_y = self.coords(self.label_id)[1]
-        step_y = (target_y - current_y) / 5.0
-        
-        def _step(count):
-            if count > 5:
-                self.itemconfig(self.label_id, font=target_font, fill=target_color)
-                self.coords(self.label_id, 4, target_y)
-                return
-            self.move(self.label_id, 0, step_y)
-            self.after(16, _step, count+1)
-        _step(1)
-
-    def _on_focus_in(self, event=None):
-        self.is_focused = True
-        self.itemconfig(self.line_id, fill=self.accent_color, width=2)
-        self._sync_label()
-
-    def _on_focus_out(self, event=None):
-        self.is_focused = False
-        self.itemconfig(self.line_id, fill=ModernStyle.BORDER_COLOR, width=1)
-        self._sync_label()
-
-    def _check_state(self, event=None):
-        new_state = len(self.entry.get()) > 0
-        if new_state != self.has_text:
-            self.has_text = new_state
-            self._sync_label()
-
-    def _sync_label(self):
-        if self.is_focused or self.has_text:
-            # Float UP
-            color = self.accent_color if self.is_focused else ModernStyle.TEXT_SECONDARY
-            self._anim_float(4, ModernStyle.FONT_SMALL_BOLD, color)
-        else:
-            # Float DOWN
-            self._anim_float(24, ModernStyle.FONT_BODY, ModernStyle.TEXT_TERTIARY)
-            
-    # Proxy core tk.Entry methods
-    def get(self): return self.entry.get_value()
-    def insert(self, idx, text):
-        self.entry.insert(idx, text)
-        self._check_state()
-    def delete(self, first, last=None):
-        self.entry.delete(first, last)
-        self._check_state()
-    def config(self, **kwargs):
-        if 'textvariable' in kwargs:
-            self.entry.config(textvariable=kwargs.pop('textvariable'))
-        super().config(**kwargs)
-
-
 class ModernButton(tk.Canvas):
     """Canvas-based button with hover/press effects.
 
@@ -337,6 +252,7 @@ class ModernButton(tk.Canvas):
         text_anchor: str = "c",
         text_padx: int = 14,
         disabled: bool = False,
+        variant: str = "solid",
         **kwargs,
     ):
         if canvas_bg is None:
@@ -372,8 +288,17 @@ class ModernButton(tk.Canvas):
         
         self._canvas_bg = canvas_bg
 
+        # Secondary actions can be "soft": a pale tint of their colour with darker
+        # coloured text, so each page has one solid main button.
+        soft_hover = None
+        if variant == "soft":
+            accent = bg
+            bg = self._blend(accent, canvas_bg, 0.13)
+            soft_hover = self._blend(accent, canvas_bg, 0.24)
+            fg = self._blend("#000000", accent, 0.22)   # a shade darker: readable on the tint
+
         self._bg_normal = bg
-        self._bg_hover = self._lighten_color(bg, 18)
+        self._bg_hover = soft_hover or self._lighten_color(bg, 18)
         self._bg_pressed = self._darken_color(bg, 18)
         self._fg = fg
 
@@ -400,6 +325,19 @@ class ModernButton(tk.Canvas):
         if not disabled:
             self._bind_events()
 
+    def destroy(self) -> None:
+        try:
+            if self._press_invoke_after_id:
+                self.after_cancel(self._press_invoke_after_id)
+            if self._reset_after_id:
+                self.after_cancel(self._reset_after_id)
+            if self._hover_suppress_id:
+                self.after_cancel(self._hover_suppress_id)
+            self._cancel_fade()
+        except Exception:
+            pass
+        super().destroy()
+
     def set_disabled(self, disabled: bool) -> None:
         self._disabled = disabled
         self.configure(cursor="arrow" if disabled else "hand2")
@@ -417,6 +355,7 @@ class ModernButton(tk.Canvas):
         hover_bg: str | None = None,
         pressed_bg: str | None = None,
     ) -> None:
+        self._cancel_fade()
         if bg is not None:
             self._bg_normal = bg
             self._bg_hover = self._lighten_color(bg, 18)
@@ -433,6 +372,16 @@ class ModernButton(tk.Canvas):
         self._text = text
         self._redraw(self._bg_normal)
 
+    def set_font(self, font) -> None:
+        self._font = font
+        if "text" in self._canvas_ids:
+            self.itemconfig(self._canvas_ids["text"], font=self._font)
+
+    def set_canvas_bg(self, color: str) -> None:
+        self._canvas_bg = color
+        self.config(bg=color)
+        self._redraw(self._bg_normal)
+
     def set_size(self, *, width: int | None = None, height: int | None = None) -> None:
         if width is not None:
             self._width = int(width)
@@ -446,19 +395,27 @@ class ModernButton(tk.Canvas):
                 self.configure(height=self._height)
             except Exception:
                 pass
+        # Rebuild the shape at the new size (recolouring alone left clipped,
+        # square corners on the collapsed sidebar buttons)
+        self._canvas_ids = {}
         self._redraw(self._bg_normal)
 
     def _bind_events(self) -> None:
-        self.bind("<Enter>", self._on_hover)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", self._on_press)
-        self.bind("<ButtonRelease-1>", self._on_release)
+        # Bound once, with add="+" so other bindings on the button (tooltips) survive.
+        # While disabled, the handlers simply ignore the events. (Re-binding without
+        # add="+" on every enable used to wipe the sidebar tooltips on each page switch.)
+        if getattr(self, "_events_bound", False):
+            return
+        self._events_bound = True
+        self.bind("<Enter>", self._on_hover, add="+")
+        self.bind("<Leave>", self._on_leave, add="+")
+        self.bind("<Button-1>", self._on_press, add="+")
+        self.bind("<ButtonRelease-1>", self._on_release, add="+")
 
     def _unbind_events(self) -> None:
-        self.unbind("<Enter>")
-        self.unbind("<Leave>")
-        self.unbind("<Button-1>")
-        self.unbind("<ButtonRelease-1>")
+        """Called when the button is disabled: stop anything still pending."""
+        self._is_pressed = False
+        self._cancel_fade()
 
         # Cancel any pending callbacks.
         try:
@@ -520,7 +477,9 @@ class ModernButton(tk.Canvas):
         self._current_fill = fill
         # Surface fill logic
         if self._disabled:
-            fill = self._blend(fill, ModernStyle.BG_PRIMARY, 0.55)
+            # A plain grey button with readable grey text (a faded colour fill
+            # with tertiary text was unreadable)
+            fill = ModernStyle.BG_TERTIARY
         text_fill = ModernStyle.TEXT_TERTIARY if self._disabled else self._fg
 
         # ── INITIAL BUILD ─────────────────────────────────────────────────────
@@ -603,10 +562,14 @@ class ModernButton(tk.Canvas):
             self._fade_to_color(self._bg_hover)
 
     def _on_leave(self, event=None):
+        if self._disabled:
+            return
         if not self._is_pressed:
             self._fade_to_color(self._bg_normal)
 
     def _on_press(self, event=None):
+        if self._disabled:
+            return
         self._is_pressed = True
         self._click_invoked = False
 
@@ -673,6 +636,9 @@ class ModernButton(tk.Canvas):
         self._redraw(self._bg_normal)
 
     def _on_release(self, event=None):
+        if self._disabled:
+            self._is_pressed = False
+            return
         was_pressed = self._is_pressed
         self._is_pressed = False
 
@@ -693,7 +659,11 @@ class ModernButton(tk.Canvas):
         self._reset_after_id = None
         
         self._redraw(self._bg_hover)
-        if was_pressed and self._command and not self._click_invoked:
+        # Only a release over the button counts as a click (drag away to cancel)
+        inside = True
+        if event is not None:
+            inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
+        if was_pressed and inside and self._command and not self._click_invoked:
             self._click_invoked = True
             # Suppress hover redraws for 600ms so deferred after(0,...) UI callbacks can run.
             self._suppress_hover()
@@ -731,12 +701,15 @@ class ModernButton(tk.Canvas):
 
     @staticmethod
     def _lighten_color(color: str, amount: int) -> str:
+        """Hover colour: lighter, or a little darker for near-white buttons
+        (lightening white changes nothing, so their hover was invisible)."""
         try:
             c = color.lstrip("#")
-            r = min(255, int(c[0:2], 16) + amount)
-            g = min(255, int(c[2:4], 16) + amount)
-            b = min(255, int(c[4:6], 16) + amount)
-            return f"#{r:02x}{g:02x}{b:02x}"
+            r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+            if min(r, g, b) > 230:
+                d = max(8, amount // 2)
+                return f"#{max(0, r - d):02x}{max(0, g - d):02x}{max(0, b - d):02x}"
+            return f"#{min(255, r + amount):02x}{min(255, g + amount):02x}{min(255, b + amount):02x}"
         except Exception:
             return color
 
@@ -753,228 +726,154 @@ class ModernButton(tk.Canvas):
 
     @staticmethod
     def _blend(fg_hex: str, bg_hex: str, alpha: float) -> str:
-        """Alpha blend fg over bg (both #RRGGBB)."""
+        """Alpha blend fg over bg (both #RRGGBB). A named colour (e.g. a macOS
+        system colour inherited from the parent) can't be blended: return bg."""
         alpha = max(0.0, min(1.0, float(alpha)))
-        f = fg_hex.lstrip("#")
-        b = bg_hex.lstrip("#")
-        fr, fg, fb = int(f[0:2], 16), int(f[2:4], 16), int(f[4:6], 16)
-        br, bg, bb = int(b[0:2], 16), int(b[2:4], 16), int(b[4:6], 16)
+        f = str(fg_hex).lstrip("#")
+        b = str(bg_hex).lstrip("#")
+        try:
+            fr, fg, fb = int(f[0:2], 16), int(f[2:4], 16), int(f[4:6], 16)
+            br, bg, bb = int(b[0:2], 16), int(b[2:4], 16), int(b[4:6], 16)
+        except ValueError:
+            return bg_hex if len(b) == 6 else fg_hex
         r = int((fr * alpha) + (br * (1 - alpha)))
         g = int((fg * alpha) + (bg * (1 - alpha)))
         bl = int((fb * alpha) + (bb * (1 - alpha)))
         return f"#{r:02x}{g:02x}{bl:02x}"
 
 
-class DatePicker(tk.Frame):
-    """Modern calendar date picker widget."""
+class GradientHeader(tk.Canvas):
+    """A reusable banner with the theme's indigo-to-pink gradient background.
+    Supports a title, subtitle, and an optional right-aligned widget container.
+    """
+    _BANDS = 64  # colour bands; smooth enough, and far fewer items than 1 per 4 px
 
-    def __init__(self, parent, on_date_selected=None, **kwargs):
-        super().__init__(parent, bg=ModernStyle.BG_SECONDARY, **kwargs)
-        self.on_date_selected = on_date_selected
-        
-        from datetime import datetime, timedelta
-        import calendar as cal_module
-        
-        self.selected_date = datetime.now()
-        
-        # Header with month navigation
-        header = tk.Frame(self, bg=ModernStyle.BG_SECONDARY)
-        header.pack(fill=tk.X, padx=8, pady=8)
-        
-        tk.Button(
-            header, text="◀", font=ModernStyle.FONT_BODY_BOLD,
-            bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
-            relief=tk.FLAT, bd=0, padx=6, pady=2,
-            command=self._prev_month
-        ).pack(side=tk.LEFT)
-        
-        self.month_label = tk.Label(
-            header, font=ModernStyle.FONT_SUBHEADING,
-            bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY
+    def __init__(self, parent, title: str, subtitle: str, height: int = 75, right_widget_func=None, **kwargs):
+        super().__init__(parent, bg=ModernStyle.BG_PRIMARY, highlightthickness=0, height=height, **kwargs)
+        self.height = height
+
+        self.grad_start = ModernStyle.HEADER_GRAD_START
+        self.grad_end = ModernStyle.HEADER_GRAD_END
+
+        self.right_frame = None
+        self._drawn_size = None
+        self._sync_after_id = None
+
+        # Draw Title & Subtitle directly on the canvas for true 100% transparent background
+        self.title_id = self.create_text(
+            20, max(22, int(height * 0.3)),
+            text=title,
+            fill=ModernStyle.HEADER_FG,
+            font=ModernStyle.FONT_PAGE_TITLE if height >= 75 else ModernStyle.FONT_SECTION_LABEL,
+            anchor="w",
+            tags="header_content"
         )
-        self.month_label.pack(side=tk.LEFT, expand=True)
-        
-        tk.Button(
-            header, text="▶", font=ModernStyle.FONT_BODY_BOLD,
-            bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
-            relief=tk.FLAT, bd=0, padx=6, pady=2,
-            command=self._next_month
-        ).pack(side=tk.LEFT)
-        
-        # Weekday labels
-        weekdays = tk.Frame(self, bg=ModernStyle.BG_SECONDARY)
-        weekdays.pack(fill=tk.X, padx=4, pady=(0, 4))
-        for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
-            tk.Label(
-                weekdays, text=day, font=ModernStyle.FONT_TINY_BOLD,
-                bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY,
-                width=4, pady=4
-            ).pack(side=tk.LEFT, padx=1)
-        
-        # Calendar grid
-        self.grid_frame = tk.Frame(self, bg=ModernStyle.BG_SECONDARY)
-        self.grid_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        
-        self.day_buttons = []
-        self._update_calendar()
-    
-    def _prev_month(self):
-        from datetime import timedelta
-        self.selected_date = (self.selected_date.replace(day=1) - timedelta(days=1)).replace(day=1)
-        self._update_calendar()
-    
-    def _next_month(self):
-        from datetime import timedelta
-        last_day = (self.selected_date.replace(day=1) - timedelta(days=1)).day if self.selected_date.month == 1 else (self.selected_date.replace(day=1) + timedelta(days=32)).replace(day=1).day
-        self.selected_date = (self.selected_date.replace(day=1) + timedelta(days=32)).replace(day=1)
-        self._update_calendar()
-    
-    def _update_calendar(self):
-        import calendar as cal_module
-        from datetime import datetime
-        
-        # Update header
-        self.month_label.config(text=self.selected_date.strftime("%B %Y"))
-        
-        # Clear grid completely
-        for child in self.grid_frame.winfo_children():
-            child.destroy()
-        self.day_buttons = []
-        
-        # Get calendar for this month
-        month_cal = cal_module.monthcalendar(self.selected_date.year, self.selected_date.month)
-        
-        for week in month_cal:
-            week_frame = tk.Frame(self.grid_frame, bg=ModernStyle.BG_SECONDARY)
-            week_frame.pack(fill=tk.X)
-            
-            for day in week:
-                if day == 0:
-                    tk.Label(week_frame, text="", bg=ModernStyle.BG_SECONDARY, width=4).pack(side=tk.LEFT, padx=1, pady=2)
-                else:
-                    is_today = (
-                        day == datetime.now().day and
-                        self.selected_date.month == datetime.now().month and
-                        self.selected_date.year == datetime.now().year
-                    )
-                    
-                    btn = tk.Button(
-                        week_frame, text=str(day), font=ModernStyle.FONT_TINY,
-                        bg=ModernStyle.ACCENT_PRIMARY if is_today else ModernStyle.BG_PRIMARY,
-                        fg=ModernStyle.TEXT_ON_ACCENT if is_today else ModernStyle.TEXT_PRIMARY,
-                        relief=tk.FLAT, bd=0, width=4, padx=0, pady=2,
-                        command=lambda d=day: self._select_day(d)
-                    )
-                    btn.pack(side=tk.LEFT, padx=1, pady=2)
-                    self.day_buttons.append(btn)
-    
-    def _select_day(self, day):
-        from datetime import datetime
-        selected = self.selected_date.replace(day=day)
-        if self.on_date_selected:
-            self.on_date_selected(selected.date())
-        # Don't close here; let parent handle it
+        if subtitle:
+            self.subtitle_id = self.create_text(
+                20, max(48, int(height * 0.68)),
+                text=subtitle,
+                fill=ModernStyle.HEADER_SUBTLE_FG,
+                font=ModernStyle.FONT_BODY if height >= 75 else ModernStyle.FONT_SMALL,
+                anchor="w",
+                tags="header_content"
+            )
 
+        self.bind("<Configure>", self._draw_header_gradient)
 
-class DatePickerButton(tk.Frame):
-    """Button that opens a date picker popup."""
-    
-    def __init__(self, parent, on_date_selected=None, initial_date=None, **kwargs):
-        bg = kwargs.pop("bg", ModernStyle.BG_PRIMARY)
-        super().__init__(parent, bg=bg, **kwargs)
-        self.on_date_selected = on_date_selected
-        self.selected_date = initial_date if initial_date else None
-        self.popup = None
-        
-        # Display frame
-        display = tk.Frame(self, bg=ModernStyle.BG_SECONDARY, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1)
-        display.pack(fill=tk.X, padx=0, pady=0)
-        
-        self.date_label = tk.Label(
-            display, text=self.selected_date.strftime("%Y-%m-%d") if self.selected_date else "Select Date",
-            font=ModernStyle.FONT_SMALL,
-            bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY,
-            padx=8, pady=6
-        )
-        self.date_label.pack(side=tk.LEFT, expand=True, fill=tk.X)
-        
-        tk.Button(
-            display, text="📅", font=ModernStyle.FONT_BODY,
-            bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.ACCENT_PRIMARY,
-            relief=tk.FLAT, bd=0, padx=6, pady=4,
-            command=self._open_picker
-        ).pack(side=tk.RIGHT)
-    
-    def _open_picker(self):
-        if self.popup is None or not self.popup.winfo_exists():
-            self.popup = tk.Toplevel(self)
-            self.popup.title("Select Date")
-            ModernStyle.style_modal(self.popup)
-            
-            # Position the popup below the button
-            x = self.winfo_rootx()
-            y = self.winfo_rooty() + self.winfo_height()
-            self.popup.geometry(f"280x320+{x}+{y}")
-            self.popup.resizable(False, False)
-            
-            # Try to make it look like a dropdown without OS chrome if possible
+        if right_widget_func:
+            self.right_frame = tk.Frame(self, bg=self._color_at(1.0))
+            right_widget_func(self.right_frame)
+            self.create_window(
+                0, int(height / 2), window=self.right_frame, anchor="e", tags=("header_content", "right_hdr")
+            )
+
+    def set_title(self, text: str):
+        self.itemconfig(self.title_id, text=text)
+
+    def set_subtitle(self, text: str):
+        if hasattr(self, 'subtitle_id'):
+            self.itemconfig(self.subtitle_id, text=text)
+
+    def _color_at(self, t: float) -> str:
+        """Gradient colour at position t (0 = left edge, 1 = right edge)."""
+        t = max(0.0, min(1.0, t))
+        mid = getattr(ModernStyle, "HEADER_GRAD_MID", None)
+        if mid:  # three stops: indigo → violet → pink, like the Dashboard
+            a_, b2, t = (self.grad_start, mid, t * 2) if t < 0.5 else (mid, self.grad_end, t * 2 - 1)
+        else:
+            a_, b2 = self.grad_start, self.grad_end
+        r, g, b = (int(a + (b_ - a) * t) for a, b_ in zip(a_, b2))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_header_gradient(self, event=None):
+        w = event.width if event else self.winfo_width()
+        h = event.height if event else self.winfo_height()
+        if w < 10 or (w, h) == self._drawn_size:
+            return  # Tk sends many <Configure> events with the same size
+        self._drawn_size = (w, h)
+
+        self.delete("gradient")
+        steps = self._BANDS
+        for i in range(steps):
+            x0 = int(i * w / steps)
+            x1 = int((i + 1) * w / steps) + 1
+            self.create_rectangle(x0, 0, x1, h, fill=self._color_at(i / (steps - 1)),
+                                  outline="", tags="gradient")
+        # Rounded corners: paint the page colour outside a 14 px quarter circle
+        import math
+        r = 14
+        for ox, oy, sx, sy in ((0, 0, 1, 1), (w, 0, -1, 1), (0, h, 1, -1), (w, h, -1, -1)):
+            pts = [(ox, oy)] + [(ox + sx * (r - r * math.cos(math.radians(d))),
+                                 oy + sy * (r - r * math.sin(math.radians(d)))) for d in range(0, 91, 10)]
+            self.create_polygon(*pts, fill=str(self.cget("bg")), outline="", tags="gradient")
+
+        if self.right_frame:
+            # Re-position right frame to right edge, then match its widgets' backgrounds
+            # to the gradient once the layout has settled (only the last resize counts).
+            self.coords("right_hdr", w - 20, int(h / 2))
+            if self._sync_after_id:
+                self.after_cancel(self._sync_after_id)
+            self._sync_after_id = self.after(60, lambda: self._sync_right_bg(w))
+
+        self.tag_raise("header_content")
+
+    def _sync_right_bg(self, w: int) -> None:
+        self._sync_after_id = None
+
+        def _sync(widget):
             try:
-                if sys.platform == "win32":
-                    self.popup.overrideredirect(True)
-                elif sys.platform == "darwin":
-                    self.popup.wm_attributes("-type", "dropdown")
-                else:
-                    self.popup.wm_attributes("-type", "popup_menu")
-            except Exception:
+                if getattr(widget, '_ignore_sync_bg', False):
+                    return
+                # Exact gradient colour at the widget's horizontal centre
+                w_x = widget.winfo_rootx() - self.winfo_rootx() + (widget.winfo_width() / 2)
+                t = (w - 70) / max(1, w) if (w_x < 0 or widget.winfo_width() <= 1) else w_x / max(1, w)
+                local_color = self._color_at(t)
+
+                if hasattr(widget, 'sync_gradient_bg'):
+                    widget.sync_gradient_bg(local_color)
+                elif widget.__class__.__name__ == 'ModernButton':
+                    if hasattr(widget, 'set_canvas_bg'):
+                        widget.set_canvas_bg(local_color)
+                elif widget.__class__.__name__ not in ['ttk.Combobox', 'ModernDropdown']:
+                    if widget.cget("bg") != local_color:
+                        widget.config(bg=local_color)
+            except tk.TclError:
                 pass
-            
-            # Configure popup style
-            self.popup.configure(bg=ModernStyle.BG_SECONDARY)
-            
-            picker = DatePicker(self.popup, on_date_selected=self._on_date_selected)
-            picker.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-            
-            # Buttons
-            btn_frame = tk.Frame(self.popup, bg=ModernStyle.BG_SECONDARY)
-            btn_frame.pack(fill=tk.X, padx=4, pady=4)
-            
-            tk.Button(
-                btn_frame, text="OK", font=ModernStyle.FONT_BODY,
-                bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
-                relief=tk.FLAT, bd=0, padx=12, pady=6,
-                command=self.popup.destroy
-            ).pack(side=tk.RIGHT, padx=2)
-            
-            tk.Button(
-                btn_frame, text="Cancel", font=ModernStyle.FONT_BODY,
-                bg=ModernStyle.ACCENT_SECONDARY, fg=ModernStyle.TEXT_ON_ACCENT,
-                relief=tk.FLAT, bd=0, padx=12, pady=6,
-                command=self.popup.destroy
-            ).pack(side=tk.RIGHT, padx=2)
-            
-            # Focus handling for closing
-            self.popup.focus_set()
-    
-    def _on_date_selected(self, date):
-        self.selected_date = date
-        self.date_label.config(text=date.strftime("%Y-%m-%d"))
-        if self.on_date_selected:
-            self.on_date_selected(date)
-    
-    def get_date(self):
-        return self.selected_date
-    
-    def set_date(self, date):
-        self.selected_date = date
-        if date:
-            self.date_label.config(text=date.strftime("%Y-%m-%d"))
+
+            if not hasattr(widget, 'sync_gradient_bg'):
+                for child in widget.winfo_children():
+                    _sync(child)
+
+        if self.right_frame is not None and self.right_frame.winfo_exists():
+            _sync(self.right_frame)
+
 
 class PremiumModal(tk.Toplevel):
     """
     A unified base class for all popup modals.
     Provides standard window styling, centering, and a clean light/modern aesthetic.
     """
-    def __init__(self, parent, title: str, geometry: str = "500x520", icon: str = "✨"):
+    def __init__(self, parent, title: str, geometry: str = "500x520", icon: str = "✨", right_widget_func=None):
         super().__init__(parent)
         self.title(f"{title}")
         self.configure(bg=ModernStyle.BG_PRIMARY)
@@ -994,40 +893,19 @@ class PremiumModal(tk.Toplevel):
             pass
             
         try:
-            from ui_utils import center_window
+            from .ui_utils import center_window
             center_window(self, parent=parent.winfo_toplevel())
         except Exception:
             pass
             
-        # ── Premium header with accent gradient bar ──
-        self.header = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        # ── Unified Gradient Header ──
+        self.header = GradientHeader(self, title=f"{icon}  {title}" if icon else title, subtitle="", height=55, right_widget_func=right_widget_func)
         self.header.pack(fill="x")
-
-        # Thin accent gradient bar at very top
-        tk.Frame(self.header, bg=ModernStyle.ACCENT_PRIMARY, height=3).pack(fill="x")
-
-        self.inner_hdr = tk.Frame(self.header, bg=ModernStyle.BG_PRIMARY)
-        self.inner_hdr.pack(fill="x", padx=28, pady=(18, 16))
-
-        # Left block: icon + title
-        if icon:
-            tk.Label(
-                self.inner_hdr, text=icon, bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_PRIMARY,
-                font=ModernStyle.FONT_MODAL_ICON
-            ).pack(side="left", padx=(0, 12))
-
-        self.title_col = tk.Frame(self.inner_hdr, bg=ModernStyle.BG_PRIMARY)
-        self.title_col.pack(side="left", fill="y")
-        self.title_lbl = tk.Label(
-            self.title_col, text=title,
-            bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_PRIMARY,
-            font=ModernStyle.FONT_SECTION_LABEL
-        )
-        self.title_lbl.pack(anchor="w")
         
-        # Area for child classes to put chips/badges under the title.
-        self.chips_row = tk.Frame(self.title_col, bg=ModernStyle.BG_PRIMARY)
-        self.chips_row.pack(anchor="w", pady=(4, 0))
+        # Area for child classes to put chips/badges. We'll use a frame right under the header
+        self.chips_row = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        self.chips_row.pack(fill="x", padx=20, pady=(10, 0))
+        self.inner_hdr = self.chips_row  # Alias for backward compatibility if anyone attached to inner_hdr
 
         # ── Scrolling content card (Main Body) ──
         self.body_card = tk.Frame(self, bg=ModernStyle.BG_SECONDARY, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1)
@@ -1068,6 +946,7 @@ class PremiumModal(tk.Toplevel):
             padx=8, pady=2
         ).pack()
 
+
 class LoadingOverlay(tk.Frame):
     """
     A unified, non-blocking loading overlay to provide feedback during data fetching.
@@ -1103,216 +982,12 @@ class LoadingOverlay(tk.Frame):
     def set_text(self, text: str):
         self.lbl.configure(text=text)
 
-class ModernToggle(tk.Canvas):
-    """Modern rounded toggle switch."""
-    def __init__(self, parent, variable, on_value=True, off_value=False, command=None, 
-                 width=44, height=24, bg=ModernStyle.BG_PRIMARY, **kwargs):
-        super().__init__(parent, width=width, height=height, bg=bg, highlightthickness=0, bd=0, **kwargs)
-        self.variable = variable
-        self.on_value = on_value
-        self.off_value = off_value
-        self.command = command
-        self._width_px = width
-        self._height_px = height
-        self._r = height // 2
-        
-        self.bind("<Button-1>", self.toggle)
-        
-        # Draw base
-        self._bg_id = self._rounded_rect(2, 2, self._width_px - 2, self._height_px - 2, self._r - 2, fill=ModernStyle.SLATE_700)
-        self._knob_id = self.create_oval(4, 4, self._height_px - 4, self._height_px - 4, fill="#FFFFFF", outline="")
-        
-        self._animating = False
-        self._knob_pos = 4
-        self.update_visual()
-        
-        if self.variable is not None:
-            # Trace variable if possible
-            try:
-                self.variable.trace_add("write", lambda *args: self.update_visual())
-            except Exception:
-                pass
-
-    def _rounded_rect(self, x1, y1, x2, y2, r, fill):
-        ids = []
-        ids.append(self.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, fill=fill, outline=fill))
-        ids.append(self.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, fill=fill, outline=fill))
-        ids.append(self.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90, fill=fill, outline=fill))
-        ids.append(self.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, fill=fill, outline=fill))
-        ids.append(self.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=""))
-        ids.append(self.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=""))
-        return ids
-
-    def toggle(self, event=None):
-        if self._animating: return
-        val = self.variable.get()
-        new_val = self.off_value if val == self.on_value else self.on_value
-        if self.variable:
-            try:
-                self.variable.set(new_val)
-            except Exception:
-                pass
-        self._animate(new_val == self.on_value)
-        if self.command:
-            self.command()
-            
-    def update_visual(self):
-        try:
-            is_on = (self.variable.get() == self.on_value)
-            target_x = self._width_px - self._height_px + 4 if is_on else 4
-            self.coords(self._knob_id, target_x, 4, target_x + self._height_px - 8, self._height_px - 4)
-            self._knob_pos = target_x
-            
-            fill_color = ModernStyle.SUCCESS if is_on else ModernStyle.SLATE_700
-            for i in self._bg_id:
-                self.itemconfig(i, fill=fill_color, outline=fill_color)
-        except Exception:
-            pass
-            
-    def _animate(self, is_on):
-        self._animating = True
-        target_x = self._width_px - self._height_px + 4 if is_on else 4
-        fill_color = ModernStyle.SUCCESS if is_on else ModernStyle.SLATE_700
-        
-        # Color change immediately
-        for i in self._bg_id:
-            self.itemconfig(i, fill=fill_color, outline=fill_color)
-            
-        def step():
-            dist = target_x - self._knob_pos
-            if abs(dist) < 1:
-                self.coords(self._knob_id, target_x, 4, target_x + self._height_px - 8, self._height_px - 4)
-                self._knob_pos = target_x
-                self._animating = False
-                return
-            
-            self._knob_pos += dist * 0.4 # ease out
-            self.coords(self._knob_id, self._knob_pos, 4, self._knob_pos + self._height_px - 8, self._height_px - 4)
-            self.after(16, step)
-            
-        step()
-
-class ModernDropdown(tk.Frame):
-    """Custom dropdown using a canvas button and a borderless Toplevel."""
-    def __init__(self, parent, textvariable=None, values=None, width=160, height=36, font=None, command=None, bg=ModernStyle.BG_SECONDARY, list_bg=ModernStyle.BG_SECONDARY, **kwargs):
-        super().__init__(parent, bg=bg, **kwargs)
-        self.textvariable = textvariable
-        self.values = values or []
-        self.command = command
-        self._width_px = width
-        self._height_px = height
-        self.list_bg = list_bg
-        
-        # The button that looks like a dropdown
-        self.btn = ModernButton(
-            self, text=self.textvariable.get() if self.textvariable else "Select...",
-            bg=bg, fg=ModernStyle.TEXT_PRIMARY,
-            width=width, height=height, radius=6,
-            text_anchor="w", text_padx=12,
-            command=self._toggle_popup,
-            font=font or ModernStyle.FONT_BODY,
-            canvas_bg=bg
-        )
-        self.btn.pack(fill=tk.BOTH, expand=True)
-        
-        # Add a little chevron
-        self.chevron = tk.Label(self.btn, text="▼", bg=bg, fg=ModernStyle.TEXT_TERTIARY, font=ModernStyle.FONT_TINY)
-        self.chevron.place(relx=1.0, rely=0.5, anchor="e", x=-10)
-        
-        # Update text when variable changes
-        if self.textvariable is not None:
-            try:
-                self.textvariable.trace_add("write", self._on_var_change)
-            except Exception:
-                pass
-                
-        self.popup = None
-
-    def _on_var_change(self, *args):
-        if self.textvariable is not None:
-             val = self.textvariable.get()
-             self.btn.set_text(val)
-             
-    def configure_values(self, values):
-        self.values = values
-             
-    def _toggle_popup(self):
-        import sys
-        if self.popup and self.popup.winfo_exists():
-            self.popup.destroy()
-            self.popup = None
-            return
-            
-        self.popup = tk.Toplevel(self)
-        ModernStyle.style_modal(self.popup)
-        self.popup.config(bg=ModernStyle.BORDER_COLOR)
-        try:
-            if sys.platform == "win32":
-                self.popup.overrideredirect(True)
-            elif sys.platform == "darwin":
-                self.popup.wm_attributes("-type", "dropdown")
-            else:
-                 self.popup.overrideredirect(True)
-        except Exception:
-            pass
-            
-        self.update_idletasks()
-        x = self.btn.winfo_rootx()
-        y = self.btn.winfo_rooty() + self.btn.winfo_height() + 2
-        w = max(self.btn.winfo_width(), 100)
-        h_popup = min(200, len(self.values)*30 + 4)
-        self.popup.geometry(f"{w}x{h_popup}+{x}+{y}")
-        
-        listbox_frame = tk.Frame(self.popup, bg=self.list_bg, padx=1, pady=1)
-        listbox_frame.pack(fill=tk.BOTH, expand=True)
-
-        listbox = tk.Listbox(
-            listbox_frame, bg=self.list_bg, fg=ModernStyle.TEXT_PRIMARY,
-            selectbackground=ModernStyle.ACCENT_PRIMARY_PALE,
-            selectforeground=ModernStyle.ACCENT_PRIMARY,
-            font=ModernStyle.FONT_BODY,
-            relief=tk.FLAT, bd=0, highlightthickness=0,
-            activestyle="none"
-        )
-        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2, pady=2)
-        
-        from tkinter import ttk
-        scrollbar = ttk.Scrollbar(listbox_frame, orient="vertical", command=listbox.yview)
-        if len(self.values)*30 > 200:
-            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        listbox.config(yscrollcommand=scrollbar.set)
-        
-        for val in self.values:
-            listbox.insert(tk.END, val)
-            
-        def _on_select(event):
-            try:
-                sel = listbox.curselection()
-                if sel:
-                    val = listbox.get(sel[0])
-                    if self.textvariable:
-                        self.textvariable.set(val)
-                    if self.command:
-                        self.command(event)
-                self.popup.destroy()
-                self.popup = None
-            except Exception:
-                pass
-                
-        def _on_focus_out(event):
-            if self.popup and self.popup.winfo_exists():
-                # Give a small delay so click events process
-                self.popup.after(150, lambda: self.popup.destroy() if self.popup else None)
-                
-        listbox.bind("<<ListboxSelect>>", _on_select)
-        self.popup.bind("<FocusOut>", _on_focus_out)
-        self.popup.focus_set()
 
 class ModernCard(tk.Canvas):
     """A card layout with actual rounded corners."""
     def __init__(self, parent, width=0, height=0, radius=12, bg=ModernStyle.BG_SECONDARY,
                  highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1,
-                 canvas_bg=ModernStyle.BG_PRIMARY, expand_height=False, **kwargs):
+                 canvas_bg=ModernStyle.BG_PRIMARY, expand_height=False, shadow=False, **kwargs):
         super().__init__(parent, width=width, height=height, bg=canvas_bg, highlightthickness=0, bd=0, **kwargs)
         self.radius = radius
         self.bg_color = bg
@@ -1325,9 +1000,17 @@ class ModernCard(tk.Canvas):
         self.bind("<Configure>", self._on_resize)
 
         self.content = tk.Frame(self, bg=bg)
-        self.content_id = self.create_window(self.highlight_thickness, self.highlight_thickness, window=self.content, anchor="nw")
+        # Inset the content a little more than the border so its square corners
+        # sit inside the rounded shape (otherwise the corners and border look square).
+        self._inset = max(self.highlight_thickness, int(radius * 0.3) + self.highlight_thickness)
+        self.content_id = self.create_window(self._inset, self._inset, window=self.content, anchor="nw")
         self._bg_items = []
-        self._sync_pending = False  # debounce flag prevents event-loop cascade
+        self._shadow = 3 if shadow else 0   # px of soft shadow under the card
+        self._shadow_items = []
+        self._arc_items = []      # rounded corners: fill + outline
+        self._fill_items = []     # straight fill rectangles
+        self._edge_items = []     # straight border lines
+        self._drawn_size = None
         self._hover_active = False
         self._original_highlight = highlight_color
         # Sync canvas size whenever inner content changes or card first appears
@@ -1340,11 +1023,10 @@ class ModernCard(tk.Canvas):
         self.content.bind("<Leave>", self._on_card_leave)
 
     def _on_card_enter(self, event=None):
-        if self._hover_active:
+        if self._hover_active or self._shadow:   # shadowed cards stay calm on hover
             return
         self._hover_active = True
-        self.highlight_color = ModernStyle.ACCENT_PRIMARY
-        self._on_resize()
+        self._set_border(ModernStyle.ACCENT_PRIMARY)
 
     def _on_card_leave(self, event=None):
         # Only reset if the mouse actually left the card entirely
@@ -1356,19 +1038,53 @@ class ModernCard(tk.Canvas):
         except Exception:
             pass
         self._hover_active = False
-        self.highlight_color = self._original_highlight
-        self._on_resize()
+        self._set_border(self._original_highlight)
+
+    def _set_border(self, color: str) -> None:
+        """Recolour the border in place (re-creating the shapes made hover slow)."""
+        self.highlight_color = color
+        for i in self._arc_items:
+            self.itemconfig(i, outline=color)
+        for i in self._edge_items:
+            self.itemconfig(i, fill=color)
+        if self.radius <= 0:
+            for i in self._bg_items:
+                self.itemconfig(i, outline=color)
+
+    def set_fill(self, color: str) -> None:
+        """Change the card's background colour (e.g. a KPI tint) without rebuilding it.
+
+        Only the card shape and its content frame change; widgets inside the
+        content frame keep their own backgrounds, so set those too.
+        """
+        if color == self.bg_color:
+            return
+        self.bg_color = color
+        try:
+            self.content.configure(bg=color)
+        except tk.TclError:
+            pass
+        for i in self._arc_items:
+            self.itemconfig(i, fill=color)
+        for i in self._fill_items:
+            self.itemconfig(i, fill=color)
+            if self.highlight_thickness > 0:
+                self.itemconfig(i, outline=color)
+        if self.radius <= 0:
+            for i in self._bg_items:
+                self.itemconfig(i, fill=color)
 
     def _sync_size(self, event=None):
         """Grow canvas to fit content perfectly. Executed synchronously to avoid macOS event loop sleeping bugs."""
         t = self.highlight_thickness
+        t = self._inset
         req_w = self.content.winfo_reqwidth() + 2 * t
-        req_h = self.content.winfo_reqheight() + 2 * t
+        req_h = self.content.winfo_reqheight() + 2 * t + self._shadow
         kw = {}
         # Only grow — never shrink. Geometry manager handles stretching.
         if self._explicit_width == 0 and self.winfo_width() < req_w:
             kw["width"] = req_w
-        if not self._expand_height and self._explicit_height == 0 and self.winfo_height() < req_h:
+        if self._explicit_height == 0 and self.winfo_height() < req_h:
             kw["height"] = req_h
             
         if kw:
@@ -1377,125 +1093,397 @@ class ModernCard(tk.Canvas):
     def _on_resize(self, event=None):
         w = getattr(event, "width", self.winfo_width()) if event else self.winfo_width()
         h = getattr(event, "height", self.winfo_height()) if event else self.winfo_height()
-        if w < 10 or h < 10:
-            return
-        for i in self._bg_items:
+        if w < 10 or h < 10 or (w, h) == self._drawn_size:
+            return  # Tk sends many <Configure> events with an unchanged size
+        self._drawn_size = (w, h)
+        for i in self._bg_items + self._shadow_items:
             self.delete(i)
+        self._arc_items, self._fill_items, self._edge_items = [], [], []
+        sh = self._shadow
+        self._shadow_items = []
+        if sh:
+            t0 = self.highlight_thickness
+            col = ModernButton._blend("#000000", str(self.cget("bg")), 0.45 if ModernStyle.IS_DARK else 0.09)
+            self._shadow_items = self._rounded_rect(t0 + 1, t0 + sh, w - t0 - 1, h - t0 - 1,
+                                                    self.radius, fill=col, outline=col, width=0)
+            self._arc_items, self._fill_items, self._edge_items = [], [], []
         self._bg_items = self._rounded_rect(
             self.highlight_thickness, self.highlight_thickness,
-            w - self.highlight_thickness - 1, h - self.highlight_thickness - 1,
+            w - self.highlight_thickness - 1, h - self.highlight_thickness - 1 - sh,
             self.radius, fill=self.bg_color, outline=self.highlight_color, width=self.highlight_thickness
         )
         for i in self._bg_items:
             self.tag_lower(i)
+        for i in self._shadow_items:
+            self.tag_lower(i)
         t = self.highlight_thickness
+        t = self._inset
         item_kw = {"width": max(1, w - 2 * t)}
         if self._expand_height:
-            item_kw["height"] = max(1, h - 2 * t)
+            item_kw["height"] = max(1, h - 2 * t - sh)
         self.itemconfig(self.content_id, **item_kw)
         
     def _rounded_rect(self, x1, y1, x2, y2, r, fill, outline, width):
         ids = []
         if r > 0:
-            ids.append(self.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, fill=fill, outline=outline, width=width))
-            ids.append(self.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, fill=fill, outline=outline, width=width))
-            ids.append(self.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90, fill=fill, outline=outline, width=width))
-            ids.append(self.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, fill=fill, outline=outline, width=width))
-            
+            arcs = [
+                self.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, fill=fill, outline=outline, width=width),
+                self.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, fill=fill, outline=outline, width=width),
+                self.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90, fill=fill, outline=outline, width=width),
+                self.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, fill=fill, outline=outline, width=width),
+            ]
+            self._arc_items.extend(arcs)
+            ids.extend(arcs)
+
             if width > 0:
-                ids.append(self.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=fill))
-                ids.append(self.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=fill))
-                
+                rects = [
+                    self.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=fill),
+                    self.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=fill),
+                ]
                 # Draw the actual straight borders
-                ids.append(self.create_line(x1 + r, y1, x2 - r, y1, fill=outline, width=width))
-                ids.append(self.create_line(x1 + r, y2, x2 - r, y2, fill=outline, width=width))
-                ids.append(self.create_line(x1, y1 + r, x1, y2 - r, fill=outline, width=width))
-                ids.append(self.create_line(x2, y1 + r, x2, y2 - r, fill=outline, width=width))
+                edges = [
+                    self.create_line(x1 + r, y1, x2 - r, y1, fill=outline, width=width),
+                    self.create_line(x1 + r, y2, x2 - r, y2, fill=outline, width=width),
+                    self.create_line(x1, y1 + r, x1, y2 - r, fill=outline, width=width),
+                    self.create_line(x2, y1 + r, x2, y2 - r, fill=outline, width=width),
+                ]
+                self._edge_items.extend(edges)
             else:
-                ids.append(self.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=""))
-                ids.append(self.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=""))
+                rects = [
+                    self.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline=""),
+                    self.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline=""),
+                ]
+                edges = []
+            self._fill_items.extend(rects)
+            ids.extend(rects + edges)
         else:
             ids.append(self.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline, width=width))
         return ids
 
-class ModernSegmentedControl(tk.Frame):
-    """
-    A segmented control (button group) for mutually exclusive options.
-    Replaces radio buttons with a modern pill-like horizontal layout.
 
-    per_option_colors: optional dict mapping option name -> (active_bg, active_fg)
-    to allow each segment to have its own highlight color when selected.
-    """
-    def __init__(self, parent, options, variable=None, command=None,
-                 bg=ModernStyle.BG_SECONDARY,
-                 fg=ModernStyle.TEXT_SECONDARY,
-                 active_bg=ModernStyle.ACCENT_PRIMARY,
-                 active_fg=ModernStyle.TEXT_ON_ACCENT,
-                 font=ModernStyle.FONT_BODY,
-                 container_bg=ModernStyle.BG_PRIMARY,
-                 per_option_colors=None,
-                 height=32, **kwargs):
-        super().__init__(parent, bg=container_bg, **kwargs)
-
-        self.options = options
-        self.variable = variable if variable else tk.StringVar(value=options[0])
-        self.command = command
-
-        self._bg = bg
-        self._fg = fg
-        self._active_bg = active_bg
-        self._active_fg = active_fg
-        self._per_option_colors = per_option_colors or {}  # {opt: (bg, fg)}
-
-        self._buttons = {}
-
-        # Inner frame to hold buttons
-        self.inner = tk.Frame(self, bg=container_bg)
-        self.inner.pack(fill=tk.BOTH, expand=True)
-
-        for i, opt in enumerate(options):
-            # Create a frame for each button
-            btn_frame = tk.Frame(self.inner, bg=bg, height=height)
-            # Apply padding on the right, except for the last item
-            pad_right = 4 if i < len(options) - 1 else 0
-            btn_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, pad_right))
-
-            # The actual clickable label
-            lbl = tk.Label(
-                btn_frame, text=opt, font=font,
-                bg=bg, fg=fg, cursor="hand2", padx=16
-            )
-            lbl.pack(fill=tk.BOTH, expand=True)
-
-            # Bindings
-            lbl.bind("<Button-1>", lambda e, v=opt: self._select(v))
-
-            self._buttons[opt] = (btn_frame, lbl)
-
-        # Initial state setup
-        if self.variable:
-            self.variable.trace_add("write", self._on_var_changed)
-            self._update_ui()
-
-    def _select(self, value):
-        if self.variable:
-            self.variable.set(value)
-
-    def _on_var_changed(self, *args):
-        self._update_ui()
-        if self.command:
-            self.command()
-
-    def _update_ui(self):
-        selected = self.variable.get()
-        for opt, (frame, lbl) in self._buttons.items():
-            if opt == selected:
-                # Use per-option color if defined, otherwise fall back to active_bg
-                opt_bg, opt_fg = self._per_option_colors.get(
-                    opt, (self._active_bg, self._active_fg)
-                )
-                frame.config(bg=opt_bg)
-                lbl.config(bg=opt_bg, fg=opt_fg)
+class PopupDatePicker(tk.Toplevel):
+    """A custom Date Picker widget that opens exactly where the user clicks."""
+    
+    def __init__(self, master, target_var: tk.StringVar, on_select=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.withdraw()
+        self.transient(master)
+        
+        # Try to make it look like a popup without OS chrome
+        import sys
+        try:
+            if sys.platform == "win32":
+                self.overrideredirect(True)
+            elif sys.platform == "darwin":
+                # Tk 9 ignores "-type dropdown" on macOS (it opened as a normal titled
+                # window); a "plain" window has no title bar but still gets clicks and keys.
+                try:
+                    self.tk.call("::tk::unsupported::MacWindowStyle", "style", self._w, "plain", "none")
+                except tk.TclError:
+                    self.wm_attributes("-type", "dropdown")
             else:
-                frame.config(bg=self._bg)
-                lbl.config(bg=self._bg, fg=self._fg)
+                self.wm_attributes("-type", "popup_menu")
+        except Exception:
+            pass
+
+        self.config(bg=ModernStyle.BG_PRIMARY, highlightthickness=1, highlightbackground=ModernStyle.ACCENT_PRIMARY, padx=0, pady=0)
+        
+        self.target_var = target_var
+        self.on_select = on_select
+        
+        import calendar as _cal
+        from datetime import datetime as _DT
+        self._cal = _cal
+        self._datetime = _DT
+        
+        # Initialize current date from target_var
+        current_val = target_var.get().strip()
+        try:
+            self.current_date = self._datetime.strptime(current_val, "%Y-%m-%d")
+        except Exception:
+            self.current_date = self._datetime.now()
+            
+        self.view_year = self.current_date.year
+        self.view_month = self.current_date.month
+        
+        self._navigating = False  # Guard flag to prevent dismissal during navigation
+        
+        self._build_ui()
+        self._position_popup()
+        self.deiconify()
+        
+        # If a parent dialog holds a grab (modal), steal it so the popup
+        # can receive events, and restore it when the popup is destroyed.
+        self._prev_grab = None
+        try:
+            current_grab = self.grab_current()
+            if current_grab is not None and current_grab != self:
+                self._prev_grab = current_grab
+                current_grab.grab_release()
+                self.grab_set()
+            else:
+                self.grab_set()
+        except tk.TclError:
+            pass
+        
+        self.focus_set()
+        
+        # Allow pressing Escape to close
+        self.bind("<Escape>", lambda e: self.destroy())
+        
+        # Close on outside click — only bind on the main window, NOT on self,
+        # to avoid dismissing the popup when clicking its own nav buttons.
+        self._main_window = self.master.winfo_toplevel()
+        self._main_window_bind_id = self._main_window.bind("<Button-1>", self._check_click_outside, add="+")
+        
+        self.bind("<FocusOut>", self._on_focus_out)
+        self.bind("<Destroy>", self._on_destroy)
+
+    def _on_destroy(self, event):
+        if event.widget == self:
+            if hasattr(self, "_main_window") and self._main_window and hasattr(self, "_main_window_bind_id"):
+                try:
+                    self._main_window.unbind("<Button-1>", self._main_window_bind_id)
+                    self._main_window = None
+                except Exception:
+                    pass
+            # Restore the grab to the previous modal dialog
+            if hasattr(self, "_prev_grab") and self._prev_grab is not None:
+                try:
+                    if self._prev_grab.winfo_exists():
+                        self._prev_grab.grab_set()
+                except Exception:
+                    pass
+                self._prev_grab = None
+
+    def _check_click_outside(self, event):
+        if self._navigating:
+            return
+        try:
+            x, y = self.winfo_rootx(), self.winfo_rooty()
+            w, h = self.winfo_width(), self.winfo_height()
+        except tk.TclError:
+            return  # Widget already destroyed
+        if not (x <= event.x_root <= x + w and y <= event.y_root <= y + h):
+            self.destroy()
+
+    def _on_focus_out(self, event):
+        # Only destroy if the focus out is for the main popup window itself, 
+        # and focus is not moving to one of its children.
+        # Use after_idle to let focus settle after widget rebuilds.
+        if event.widget == self:
+            self.after_idle(self._deferred_focus_check)  
+
+    def _deferred_focus_check(self):
+        """Check focus after the event loop has settled."""
+        if self._navigating:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+            focus_widget = self.focus_get()
+            if focus_widget and (focus_widget == self or str(focus_widget).startswith(str(self))):
+                return
+        except Exception:
+            pass
+        self.destroy()
+        
+    def _position_popup(self):
+        self.update_idletasks()
+        
+        # Track mouse coordinates
+        px = self.winfo_pointerx()
+        py = self.winfo_pointery()
+        
+        # Get dimensions
+        w = self.winfo_reqwidth()
+        h = self.winfo_reqheight()
+        
+        # Get screen dimensions
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        
+        # Edge detection
+        x = px
+        y = py
+        
+        if x + w > sw:
+            x = sw - w
+        if y + h > sh:
+            y = sh - h
+            
+        # Ensure it doesn't go off the top/left edge
+        x = max(0, x)
+        y = max(0, y)
+            
+        self.geometry(f"+{x}+{y}")
+        
+    def _build_ui(self):
+        # Header & Navigation
+        header_frame = tk.Frame(self, bg=ModernStyle.ACCENT_PRIMARY)
+        header_frame.pack(fill=tk.X, pady=(0, 4), ipadx=4, ipady=4)
+        
+        # Helper for custom label-buttons (macOS safe)
+        def make_nav_btn(parent, text, cmd, side):
+            lbl = tk.Label(
+                parent, text=text, font=ModernStyle.FONT_BODY_BOLD,
+                bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
+                cursor="hand2", padx=4, pady=2
+            )
+            def _on_click(e, _cmd=cmd):
+                _cmd()
+                return "break"  # Prevent event propagation
+            lbl.bind("<Button-1>", _on_click)
+            lbl.bind("<Enter>", lambda e: lbl.config(bg=ModernStyle.ACCENT_PRIMARY_PALE, fg=ModernStyle.ACCENT_PRIMARY))
+            lbl.bind("<Leave>", lambda e: lbl.config(bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT))
+            lbl.pack(side=side, padx=1)
+            return lbl
+        
+        make_nav_btn(header_frame, "«", self._prev_year, tk.LEFT)
+        make_nav_btn(header_frame, "‹", self._prev_month, tk.LEFT)
+        
+        self.lbl_month = tk.Label(header_frame, bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT, font=ModernStyle.FONT_SMALL_BOLD)
+        self.lbl_month.pack(side=tk.LEFT, expand=True)
+        
+        make_nav_btn(header_frame, "›", self._next_month, tk.RIGHT)
+        make_nav_btn(header_frame, "»", self._next_year, tk.RIGHT)
+        
+        # Weekday Labels
+        days_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        days_frame.pack(fill=tk.X, padx=6)
+        
+        for i, d in enumerate(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]):
+            is_weekend = i >= 5
+            lbl = tk.Label(
+                days_frame, text=d, bg=ModernStyle.BG_PRIMARY, 
+                fg=ModernStyle.ACCENT_TERTIARY if is_weekend else ModernStyle.TEXT_SECONDARY, 
+                font=ModernStyle.FONT_TINY_BOLD if is_weekend else ModernStyle.FONT_TINY,
+                width=3
+            )
+            lbl.grid(row=0, column=i, pady=(2, 2))
+            days_frame.columnconfigure(i, weight=1)
+            
+        # Dynamic Calendar Grid
+        self.grid_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        self.grid_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        
+        self._build_grid()
+        
+    def _prev_year(self):
+        self._navigating = True
+        self.view_year -= 1
+        self._build_grid()
+        self.after_idle(self._clear_navigating)
+        
+    def _next_year(self):
+        self._navigating = True
+        self.view_year += 1
+        self._build_grid()
+        self.after_idle(self._clear_navigating)
+        
+    def _prev_month(self):
+        self._navigating = True
+        if self.view_month == 1:
+            self.view_month = 12
+            self.view_year -= 1
+        else:
+            self.view_month -= 1
+        self._build_grid()
+        self.after_idle(self._clear_navigating)
+        
+    def _next_month(self):
+        self._navigating = True
+        if self.view_month == 12:
+            self.view_month = 1
+            self.view_year += 1
+        else:
+            self.view_month += 1
+        self._build_grid()
+        self.after_idle(self._clear_navigating)
+    
+    def _clear_navigating(self):
+        """Reset the navigation guard and reclaim focus after grid rebuild."""
+        try:
+            if self.winfo_exists():
+                self.focus_set()
+                self._navigating = False
+        except tk.TclError:
+            pass
+        
+    def _build_grid(self):
+        for widget in self.grid_frame.winfo_children():
+            widget.destroy()
+            
+        dt = self._datetime(self.view_year, self.view_month, 1)
+        self.lbl_month.config(text=dt.strftime("%B %Y"))
+        
+        weeks = self._cal.monthcalendar(self.view_year, self.view_month)
+        for r, week in enumerate(weeks):
+            self.grid_frame.rowconfigure(r, weight=1)
+            for c, day in enumerate(week):
+                self.grid_frame.columnconfigure(c, weight=1)
+                if day > 0:
+                    is_selected = (
+                        day == self.current_date.day and 
+                        self.view_month == self.current_date.month and 
+                        self.view_year == self.current_date.year
+                    )
+                    
+                    is_today = (
+                        day == self._datetime.now().day and 
+                        self.view_month == self._datetime.now().month and 
+                        self.view_year == self._datetime.now().year
+                    )
+                    
+                    is_weekend = c >= 5
+                    
+                    if is_selected:
+                        bg = ModernStyle.ACCENT_PRIMARY
+                        fg = ModernStyle.TEXT_ON_ACCENT
+                        hover_bg = ModernStyle.ACCENT_PRIMARY
+                    elif is_today:
+                        bg = ModernStyle.ACCENT_PRIMARY_PALE
+                        fg = ModernStyle.TEXT_ACCENT
+                        hover_bg = ModernStyle.ACCENT_PRIMARY
+                    else:
+                        bg = ModernStyle.BG_PRIMARY
+                        fg = ModernStyle.WARNING if is_weekend else ModernStyle.TEXT_PRIMARY
+                        hover_bg = ModernStyle.BG_SECONDARY
+                        
+                    btn = tk.Label(
+                        self.grid_frame, text=str(day), 
+                        font=ModernStyle.FONT_SMALL_BOLD if is_today or is_selected else ModernStyle.FONT_TINY,
+                        bg=bg, fg=fg, cursor="hand2"
+                    )
+                    btn.bind("<Button-1>", lambda e, d=day: self._select_day(d))
+                    # Square button via uniform padding, slightly smaller
+                    btn.grid(row=r, column=c, padx=0, pady=0, sticky="nsew", ipadx=0, ipady=1)
+                    
+                    # Hover effects for unselected days
+                    if not is_selected and not is_today:
+                        _bg, _hbg = bg, hover_bg
+                        btn.bind("<Enter>", lambda e, b=btn, hb=_hbg: b.config(bg=hb))
+                        btn.bind("<Leave>", lambda e, b=btn, ob=_bg: b.config(bg=ob))
+                    elif is_today and not is_selected:
+                        # accent hover for today
+                        _bg, _hbg = bg, hover_bg
+                        btn.bind("<Enter>", lambda e, b=btn, hb=_hbg: b.config(bg=hb, fg=ModernStyle.TEXT_ON_ACCENT))
+                        btn.bind("<Leave>", lambda e, b=btn, ob=_bg, of=fg: b.config(bg=ob, fg=of))
+                else:
+                    # Empty space for days outside the month
+                    spacer = tk.Frame(self.grid_frame, bg=ModernStyle.BG_PRIMARY)
+                    spacer.grid(row=r, column=c, padx=2, pady=2, sticky="nsew")
+                    
+    def _select_day(self, day):
+        # Format the selected date
+        val = f"{self.view_year:04d}-{self.view_month:02d}-{day:02d}"
+        
+        # Update the injected tk.StringVar
+        self.target_var.set(val)
+        
+        # Optionally trigger an on_select callback
+        if self.on_select:
+            self.on_select()
+            
+        # Destroy the CTkToplevel (tk.Toplevel) window
+        self.destroy()

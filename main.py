@@ -5,7 +5,6 @@ Modern Tkinter Implementation with Premium Aesthetic
 """
 
 import tkinter as tk
-from tkinter import ttk
 import sys
 import os
 import threading
@@ -13,12 +12,29 @@ from pathlib import Path
 from typing import Dict, Callable
 import atexit
 
+# ── PyInstaller frozen-app SSL fix ────────────────────────────────────────────
+# When bundled with PyInstaller, the certifi CA bundle is extracted to _MEIPASS.
+# urllib3/requests won't find it unless we point the env vars there.
+if getattr(sys, 'frozen', False):
+    _cert_file = os.path.join(sys._MEIPASS, 'certifi', 'cacert.pem')
+    if os.path.exists(_cert_file):
+        os.environ.setdefault('SSL_CERT_FILE', _cert_file)
+        os.environ.setdefault('REQUESTS_CA_BUNDLE', _cert_file)
+        os.environ.setdefault('CURL_CA_BUNDLE', _cert_file)
+
 from PIL import Image, ImageTk, ImageDraw, ImageEnhance
+from model.applog import log, setup_logging
 from model.state import AppState
-from model.database import initialize_database, close_all_connections
-from ui_theme import ModernStyle
-from ui_widgets import ModernButton, ModernCard
-from ui_utils import center_window
+from model.database import close_all_connections
+from ui.ui_theme import ModernStyle
+from ui.ui_widgets import ModernButton
+from ui.ui_utils import center_window, call_on_ui, run_in_background, show_toast, start_ui_dispatcher, install_row_hover
+
+
+def _asset_path(*parts) -> Path:
+    """Path to a bundled asset, both when frozen (PyInstaller) and from source."""
+    base = Path(sys._MEIPASS) if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
+    return base.joinpath("assets", *parts)
 
 def _install_macos_openpanel_stderr_filter() -> None:
     if sys.platform != "darwin":
@@ -94,19 +110,38 @@ class ViewManager:
         self.app_state = app_state
         self.views: Dict[str, tk.Frame] = {}
         self.current_view: str = None
-        self.view_classes: Dict[str, type] = {}
-        self._fade_id = None
+        self.view_classes: Dict[str, object] = {}  # str path OR type
     
-    def register_view(self, name: str, view_class: type):
-        """Register a view class for lazy loading."""
-        self.view_classes[name] = view_class
+    def register_view(self, name: str, view_spec):
+        """Register a view class or a 'module.ClassName' string for lazy import."""
+        self.view_classes[name] = view_spec
     
+    def _resolve_class(self, name: str) -> type:
+        """Return the view class, importing the module on first call."""
+        spec = self.view_classes.get(name)
+        if spec is None:
+            raise ValueError(f"View '{name}' not registered")
+        if isinstance(spec, str):
+            # Lazy import: 'views.dashboard_view.DashboardView'
+            module_path, cls_name = spec.rsplit(".", 1)
+            import importlib
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, cls_name)
+            # Cache the resolved class so subsequent navigations are instant
+            self.view_classes[name] = cls
+            return cls
+        return spec
+
     def show_view(self, name: str):
-        """Show a view with a subtle fade-in transition."""
+        """Swap the visible view.
+
+        Tk draws the new view on its own as soon as this returns. Forcing
+        update()/update_idletasks() here made each click wait for every redraw
+        (on a Retina Mac each full-window redraw costs about 0.1 s), and a
+        fade overlay added one more redraw, so they are gone.
+        """
         if name not in self.views:
-            view_class = self.view_classes.get(name)
-            if not view_class:
-                raise ValueError(f"View {name} not registered")
+            view_class = self._resolve_class(name)
             try:
                 self.views[name] = view_class(self.container, app_state=self.app_state)
             except TypeError:
@@ -118,50 +153,13 @@ class ViewManager:
             if hasattr(self.views[self.current_view], 'on_hide'):
                 self.views[self.current_view].on_hide()
         
-        # Show new view with fade-in
+        # Show new view
         new_view = self.views[name]
         new_view.pack(fill=tk.BOTH, expand=True)
         self.current_view = name
-        
-        # Fade-in animation: brief opacity ramp via alpha (works on toplevel approach)
-        # For frames we simulate with a quick overlay fade
-        self._fade_in_view(new_view)
-        
+
         if hasattr(new_view, 'on_show'):
             new_view.on_show()
-        
-        try:
-            root = self.container.winfo_toplevel()
-            root.update_idletasks()
-            root.update()
-        except Exception:
-            pass
-
-    def _fade_in_view(self, view):
-        """Simulate a subtle fade-in by briefly showing a translucent overlay that dissolves."""
-        if self._fade_id:
-            try: self.container.after_cancel(self._fade_id)
-            except Exception: pass
-            self._fade_id = None
-        try:
-            overlay = tk.Frame(self.container, bg=ModernStyle.BG_PRIMARY)
-            overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-            overlay.lift()
-            # Dissolve in 3 quick steps
-            def _step(n=0):
-                if n >= 3:
-                    overlay.destroy()
-                    self._fade_id = None
-                    return
-                # Progressively lower the overlay so the view shows through
-                try:
-                    overlay.lower(view)
-                    overlay.destroy()
-                except Exception: pass
-                self._fade_id = None
-            self._fade_id = self.container.after(60, lambda: _step(0))
-        except Exception:
-            pass
 
 
 class ModernFrame(tk.Frame):
@@ -205,7 +203,7 @@ class _NavTooltip:
             self._win.attributes("-topmost", True)
             lbl = tk.Label(
                 self._win, text=self._text,
-                bg="#1A2740", fg="#E2E8F0",
+                bg=ModernStyle.SIDEBAR_BG_ALT, fg=ModernStyle.SIDEBAR_FG,
                 font=ModernStyle.FONT_SMALL_BOLD,
                 padx=10, pady=5,
                 relief="flat",
@@ -225,48 +223,45 @@ class _NavTooltip:
 
 
 class Sidebar(tk.Frame):
-    def __init__(self, parent, on_navigate: Callable):
-        # ── Colour tokens mapped from ModernStyle where possible ──────────────
-        self.sidebar_bg     = ModernStyle.SLATE_800      # "#1E293B"
-        self.accent_primary = ModernStyle.BRAND_GOLD     # "#D4AF37"
-        self.accent_hover   = ModernStyle.SLATE_700      # "#334155"
-        self.accent_pressed = ModernStyle.SLATE_600      # "#475569"
-        self.accent_gradient = ModernStyle.SLATE_700     # "#334155"
+    # Nav button height: 34 px leaves room for the summary card and all market rows
+    # on a typical window (13 pt labels still have plenty of space)
+    _NAV_BTN_H = 32
 
-        super().__init__(parent, bg=self.sidebar_bg, width=248)
+    def __init__(self, parent, on_navigate: Callable):
+        # ── Colour tokens (the sidebar is dark in both themes) ────────────────
+        self.sidebar_bg      = ModernStyle.SIDEBAR_BG
+        self.accent_primary  = ModernStyle.BRAND_GOLD
+        self.accent_hover    = ModernStyle.SIDEBAR_HOVER
+        self.accent_pressed  = ModernStyle.SIDEBAR_PRESSED
+        self.accent_gradient = ModernStyle.SIDEBAR_ACTIVE_BG
+
+        # 220 px (was 248): narrower sidebar, more room for each page's tables
+        super().__init__(parent, bg=self.sidebar_bg, width=220)
         self.pack(side=tk.LEFT, fill=tk.Y)
         self.pack_propagate(False)
 
         # Subtle right border for depth
-        tk.Frame(self, bg="#0F172A", width=1).pack(side=tk.RIGHT, fill=tk.Y)
+        tk.Frame(self, bg=ModernStyle.SIDEBAR_BORDER, width=1).pack(side=tk.RIGHT, fill=tk.Y)
 
         self.on_navigate = on_navigate
         self.buttons = {}
         self._indicators: dict[int, tk.Frame] = {}
-        self._icons: dict[str, tk.PhotoImage] = {}
         self._active_idx: int | None = None
         self._nav_labels: dict[int, str] = {}
-        self._nav_has_icon: dict[int, bool] = {}
         self._collapsed = False
         self._tooltips: list[_NavTooltip] = []   # keep references alive
 
-        # Animated sliding indicator (Pill-shaped)
-        self._sliding_indicator = tk.Canvas(self, bg=self.sidebar_bg, width=4, highlightthickness=0)
-        self._sliding_indicator_id = self._sliding_indicator.create_line(
-            2, 4, 2, 42, fill=self.accent_primary, width=4, capstyle=tk.ROUND
-        )
-        self._anim_id = None
-        self._current_indicator_y = 0.0
+
 
         # Size tokens
-        self._w_expanded  = 240
+        self._w_expanded  = 220
         self._w_collapsed = 78
-        self._btn_w_expanded  = 200
+        self._btn_w_expanded  = 184
         self._btn_w_collapsed = 52
 
         # ── Header container ──────────────────────────────────────────────────
         self._header_container = tk.Frame(self, bg=self.sidebar_bg)
-        self._header_container.pack(fill=tk.X, padx=16, pady=(16, 16))
+        self._header_container.pack(fill=tk.X, padx=12, pady=(12, 8))
 
         # TOP ROW: Toggle Button + Title + PRO Badge
         top_row = tk.Frame(self._header_container, bg=self.sidebar_bg)
@@ -296,7 +291,7 @@ class Sidebar(tk.Frame):
 
         # Title + Badge stack (save ref so toggle can hide/show it)
         self._title_stack = tk.Frame(top_row, bg=self.sidebar_bg)
-        self._title_stack.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        self._title_stack.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
 
         title_badge_row = tk.Frame(self._title_stack, bg=self.sidebar_bg)
         title_badge_row.pack(expand=True, anchor="w")
@@ -304,36 +299,34 @@ class Sidebar(tk.Frame):
         self._title_lbl = tk.Label(
             title_badge_row,
             text="PTracker",
-            font=ModernStyle.FONT_SIDEBAR_TITLE,
+            font=ModernStyle.FONT_TITLE,   # 16 pt: leaves room for the PRO badge in the 220 px sidebar
             bg=self.sidebar_bg,
-            fg=ModernStyle.TEXT_ON_ACCENT,
+            fg=ModernStyle.SIDEBAR_FG,
             anchor="w",
         )
         self._title_lbl.pack(side=tk.LEFT)
 
         # PRO / Version Badge
-        badge_frame = tk.Frame(title_badge_row, bg=ModernStyle.ACCENT_TERTIARY_PALE, padx=5, pady=2)
+        badge_frame = tk.Frame(title_badge_row, bg=ModernStyle.WARNING_PALE, padx=5, pady=2)
         badge_frame.pack(side=tk.LEFT, padx=(8, 0), pady=(3, 0))
         tk.Label(
             badge_frame, text="PRO",
             font=ModernStyle.FONT_SIDEBAR_BADGE,
-            bg=ModernStyle.ACCENT_TERTIARY_PALE, fg=ModernStyle.ACCENT_TERTIARY
+            bg=ModernStyle.WARNING_PALE, fg=ModernStyle.WARNING
         ).pack()
 
         # LOGO ROW
         self._logo_container = tk.Frame(self._header_container, bg=self.sidebar_bg)
-        self._logo_container.pack(fill=tk.X, pady=(14, 0))
+        self._logo_container.pack(fill=tk.X, pady=(8, 0))
 
         try:
-            import sys
-            from pathlib import Path
-            logo_path = Path(__file__).resolve().parent / "assets" / "images" / "logo.png"
+            # Pre-sized 80 px copy (the full-size original is in assets_src/)
+            logo_path = _asset_path("images", "logo_80.png")
             if logo_path.exists():
-
-
                 pil_img = Image.open(logo_path).convert("RGBA")
                 base_size = 64
-                pil_img = pil_img.resize((base_size, base_size), Image.Resampling.LANCZOS)
+                if pil_img.size != (base_size, base_size):
+                    pil_img = pil_img.resize((base_size, base_size), Image.Resampling.LANCZOS)
 
                 enhancer = ImageEnhance.Brightness(pil_img)
                 pil_img = enhancer.enhance(1.1)
@@ -347,9 +340,6 @@ class Sidebar(tk.Frame):
                 rounded_img = Image.new('RGBA', (base_size, base_size), (0, 0, 0, 0))
                 rounded_img.paste(pil_img, (0, 0), mask=mask)
 
-                border_draw = ImageDraw.Draw(rounded_img)
-                border_draw.rounded_rectangle((1, 1, base_size-2, base_size-2), radius=14, outline=self.accent_primary, width=2)
-
                 pil_img = rounded_img
 
                 self._logo_img = ImageTk.PhotoImage(pil_img)
@@ -358,9 +348,9 @@ class Sidebar(tk.Frame):
                     image=self._logo_img,
                     bg=self.sidebar_bg,
                 )
-                self._logo_lbl.pack(pady=(5, 0))
-        except Exception as e:
-            print(f"Logo load error: {e}")
+                self._logo_lbl.pack(pady=(2, 0), anchor=tk.CENTER)
+        except Exception:
+            log.exception("Could not load the sidebar logo")
 
         # ── Pulsing Live Status Dot ───────────────────────────────────────────
         self._status_row = tk.Frame(self._header_container, bg=self.sidebar_bg)
@@ -372,128 +362,43 @@ class Sidebar(tk.Frame):
         )
         self._pulse_canvas.pack(side=tk.LEFT, padx=(0, 6))
         self._pulse_glow = self._pulse_canvas.create_oval(
-            1, 1, 13, 13, fill="", outline="#16A34A", width=2
+            1, 1, 13, 13, fill="", outline=ModernStyle.TICKER_UP, width=2
         )
         self._pulse_dot = self._pulse_canvas.create_oval(
-            4, 4, 10, 10, fill="#16A34A", outline=""
+            4, 4, 10, 10, fill=ModernStyle.TICKER_UP, outline=""
         )
         self._pulse_phase = 0
         self._pulse_anim_id = None
 
         self._status_badge = tk.Label(
             self._status_row, text="⏳ Syncing…",
-            bg=self.sidebar_bg, fg=ModernStyle.SLATE_400,
+            bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_MUTED,
             font=ModernStyle.FONT_SMALL, anchor="w",
         )
         self._status_badge.pack(side=tk.LEFT, fill=tk.X)
 
-        self.after(1500, self._refresh_status_badge)
+        self.after(50, self._refresh_status_badge)
         self.after(100, self._pulse_step)
 
-        # ── Portfolio Summary Card ────────────────────────────────────────────
-        _card_bg = "#253347"
-        self._summary_card = tk.Frame(self, bg=_card_bg, highlightbackground=self.accent_primary, highlightthickness=1)
-        self._summary_card.pack(fill=tk.X, padx=16, pady=(4, 8))
-        
-        _vrow = tk.Frame(self._summary_card, bg=_card_bg)
-        _vrow.pack(fill=tk.X, padx=12, pady=(10, 2))
-        self._summary_value_lbl = tk.Label(_vrow, text="₹ —", bg=_card_bg, fg="#FFFFFF", font=ModernStyle.FONT_TITLE, anchor="w")
-        self._summary_value_lbl.pack(side=tk.LEFT)
-        self._summary_label_lbl = tk.Label(_vrow, text="Invested", bg=_card_bg, fg=ModernStyle.SLATE_400, font=ModernStyle.FONT_SMALL_BOLD, anchor="w")
-        self._summary_label_lbl.pack(side=tk.LEFT, padx=(6, 0), pady=(2, 0))
+        # ── Bottom Fixed Section ──────────────────────────────────────────────
+        self.bottom_fixed_frame = tk.Frame(self, bg=self.sidebar_bg)
+        self.bottom_fixed_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
-        _srow = tk.Frame(self._summary_card, bg=_card_bg)
-        _srow.pack(fill=tk.X, padx=12, pady=(0, 10))
-        self._summary_pnl_lbl = tk.Label(_srow, text="P&L: —", bg=_card_bg, fg=ModernStyle.SUCCESS, font=ModernStyle.FONT_SMALL_BOLD, anchor="w")
-        self._summary_pnl_lbl.pack(side=tk.LEFT)
-        self._summary_count_lbl = tk.Label(_srow, text="0 holdings", bg=_card_bg, fg=ModernStyle.SLATE_400, font=ModernStyle.FONT_SMALL, anchor="e")
-        self._summary_count_lbl.pack(side=tk.RIGHT)
-        self.after(1500, self._refresh_summary_card)
-
-        # ── Navigation Section Label ──────────────────────────────────────────
-        self._nav_header = tk.Frame(self, bg=self.sidebar_bg)
-        self._nav_header.pack(fill=tk.X, padx=16, pady=(10, 0))
-
-        self._menu_lbl = tk.Label(
-            self._nav_header, text="N A V I G A T I O N",
-            font=ModernStyle.FONT_NAV_SECTION,
-            bg=self.sidebar_bg, fg=self.accent_primary, anchor="w",
-        )
-        self._menu_lbl.pack(fill=tk.X)
-
-        # Gold Separator — placed before the first nav button (Dashboard)
-        self._nav_gold_sep = tk.Frame(self, bg=self.sidebar_bg)
-        self._nav_gold_sep.pack(fill=tk.X, padx=16, pady=(4, 2))
-        tk.Frame(self._nav_gold_sep, bg=self.accent_primary, height=1).pack(fill=tk.X)
-
-        # ── Navigation Items ──────────────────────────────────────────────────
-        nav_items = [
-            ("🌐  Dashboard",    0),
-            ("💼  My Holdings",  1),
-            ("💹  Trade Entry",  2),
-            ("🕒  Trade History", 3),
-            ("🧾  Tax Report",   4),
-            ("👁  Watchlist",    5),
-            ("💠  Valuation",    6),
-            ("📰  Financial News", 7),
-            ("⚙️  Settings",     8),
-            ("🔆  Help",         9),
-        ]
-
-        self._nav_labels = {idx: label for (label, idx) in nav_items}
-        _divider_after = {3, 7}  # Core | Analysis | System
-        for label, idx in nav_items:
-            self._add_nav_button(label, idx)
-            if idx in _divider_after:
-                tk.Frame(self, bg=ModernStyle.SLATE_700, height=1).pack(fill=tk.X, padx=28, pady=(4, 4))
-
-        # Spacer (pushes bottom section down)
-        tk.Frame(self, bg=self.sidebar_bg).pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        # ── Bottom section (stacked with side=BOTTOM, reverse order) ─────────
-
-        # QUIT BUTTON — very bottom
-        quit_container = tk.Frame(self, bg=self.sidebar_bg)
-        quit_container.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 16), padx=16)
-
-        self._exit_btn = tk.Label(
-            quit_container, text="⏻  Quit / Logout",
-            bg="#2A1B24", fg="#FCA5A5",
-            font=ModernStyle.FONT_TITLE,
-            cursor="hand2", anchor="center",
-            pady=10
-        )
-        self._exit_btn.pack(fill=tk.X)
-
-        # FIX: use destroy() so DB cleanup via atexit runs, not just quit()
-        self._exit_btn.bind("<Button-1>", lambda e: self._do_quit())
-        self._exit_btn.bind("<Enter>", lambda e: self._exit_btn.configure(bg="#451A24", fg="#FECACA"))
-        self._exit_btn.bind("<Leave>", lambda e: self._exit_btn.configure(bg="#2A1B24", fg="#FCA5A5"))
-
-        # Divider above Quit
-        tk.Frame(self, bg=ModernStyle.SLATE_700, height=1).pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 4))
-
-        # PROFILE SECTION
-        profile_row = tk.Frame(self, bg=self.sidebar_bg)
-        profile_row.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 12))
+        # PROFILE + QUIT on one row (two rows used ~50 px the menu needs)
+        profile_row = tk.Frame(self.bottom_fixed_frame, bg=self.sidebar_bg)
+        profile_row.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(4, 12))
 
         avatar = tk.Canvas(profile_row, width=32, height=32, bg=self.sidebar_bg, highlightthickness=0)
         avatar.pack(side=tk.LEFT)
         
         try:
-            import os, sys
-            from pathlib import Path
-            
-            if getattr(sys, 'frozen', False):
-                base_dir = Path(sys._MEIPASS)
-            else:
-                base_dir = Path(__file__).resolve().parent
-            
-            profile_path = base_dir / "assets" / "images" / "profile.png"
-            
-            if os.path.exists(profile_path):
+            # Pre-sized 30 px copy (the full-size original is in assets_src/)
+            profile_path = _asset_path("images", "profile_30.png")
+
+            if profile_path.exists():
                 pil_img = Image.open(profile_path).convert("RGBA")
-                pil_img = pil_img.resize((30, 30), Image.Resampling.LANCZOS)
+                if pil_img.size != (30, 30):
+                    pil_img = pil_img.resize((30, 30), Image.Resampling.LANCZOS)
                 
                 mask = Image.new('L', (30, 30), 0)
                 draw = ImageDraw.Draw(mask)
@@ -509,57 +414,198 @@ class Sidebar(tk.Frame):
                 avatar.create_image(16, 16, image=self._profile_img)
             else:
                 avatar.create_oval(2, 2, 30, 30, fill=self.accent_primary, outline="")
-                avatar.create_text(16, 16, text="S", fill=ModernStyle.TEXT_ON_ACCENT, font=(ModernStyle.FONT_FAMILY, 14, "bold"))
-        except Exception as e:
-            print(f"Profile image load error: {e}")
+                avatar.create_text(16, 16, text="S", fill=ModernStyle.TEXT_ON_ACCENT, font=ModernStyle.FONT_HEADING)
+        except Exception:
             avatar.create_oval(2, 2, 30, 30, fill=self.accent_primary, outline="")
-            avatar.create_text(16, 16, text="S", fill=ModernStyle.TEXT_ON_ACCENT, font=(ModernStyle.FONT_FAMILY, 14, "bold"))
+            avatar.create_text(16, 16, text="S", fill=ModernStyle.TEXT_ON_ACCENT, font=ModernStyle.FONT_HEADING)
 
         self._profile_name_lbl = tk.Label(
             profile_row, text="Selvakumar",
-            bg=self.sidebar_bg, fg="#E2E8F0",
-            font=ModernStyle.FONT_TITLE
+            bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_FG,
+            font=ModernStyle.FONT_SMALL_BOLD
         )
-        self._profile_name_lbl.pack(side=tk.LEFT, padx=(10, 0))
+        self._profile_name_lbl.pack(side=tk.LEFT, padx=(8, 0))
 
-        # Make profile row clickable → navigate to Settings (idx 7)
+        self._exit_btn = tk.Label(
+            profile_row, text="⏻",
+            bg=ModernStyle.QUIT_BG, fg=ModernStyle.QUIT_FG,
+            font=ModernStyle.FONT_SMALL_BOLD,
+            cursor="hand2", anchor="center", padx=6, pady=5
+        )
+        self._exit_btn.pack(side=tk.RIGHT)
+        from ui.ui_utils import ToolTip
+        self._exit_tip = ToolTip(self._exit_btn, "Quit PTracker")
+        # destroy() (not just quit()) so the DB cleanup via atexit runs
+        self._exit_btn.bind("<Button-1>", lambda e: self._do_quit())
+        self._exit_btn.bind("<Enter>", lambda e: self._exit_btn.configure(bg=ModernStyle.QUIT_BG_HOVER, fg=ModernStyle.QUIT_FG_HOVER))
+        self._exit_btn.bind("<Leave>", lambda e: self._exit_btn.configure(bg=ModernStyle.QUIT_BG, fg=ModernStyle.QUIT_FG))
+
+        # Make profile row clickable → navigate to Settings (index 9 in nav_items below)
         for w in (avatar, self._profile_name_lbl, profile_row):
-            w.bind("<Button-1>", lambda e: self.on_navigate(7))
+            w.bind("<Button-1>", lambda e: self.on_navigate(9))
             w.bind("<Enter>", lambda e: self._profile_name_lbl.configure(fg=self.accent_primary))
-            w.bind("<Leave>", lambda e: self._profile_name_lbl.configure(fg="#E2E8F0"))
+            w.bind("<Leave>", lambda e: self._profile_name_lbl.configure(fg=ModernStyle.SIDEBAR_FG))
         avatar.configure(cursor="hand2")
         profile_row.configure(cursor="hand2")
         self._profile_name_lbl.configure(cursor="hand2")
 
         # Divider above Profile
-        tk.Frame(self, bg=ModernStyle.SLATE_700, height=1).pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 8))
+        self._profile_divider = tk.Frame(self.bottom_fixed_frame, bg=ModernStyle.SIDEBAR_HOVER, height=1)
+        self._profile_divider.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 8))
 
-        # MINI MARKET TICKERS
-        self._ticker_frame = tk.Frame(self, bg=self.sidebar_bg)
-        self._ticker_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
+        # ── Middle Scrollable Frame ───────────────────────────────────────────
+        # Create canvas for middle contents (scrollbar removed per request)
+        self._middle_canvas = tk.Canvas(
+            self, bg=self.sidebar_bg, highlightthickness=0, bd=0
+        )
+        self._middle_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.middle_content = tk.Frame(self._middle_canvas, bg=self.sidebar_bg)
+        self._middle_canvas_win = self._middle_canvas.create_window(
+            (0, 0), window=self.middle_content, anchor="nw"
+        )
+
+        def _on_middle_canvas_configure(e):
+            self._middle_canvas.itemconfigure(self._middle_canvas_win, width=e.width)
+            self._update_scrollbar_visibility()
+            self._schedule_fit()
+
+        self._middle_canvas.bind("<Configure>", _on_middle_canvas_configure)
+
+        def _on_middle_content_configure(e=None):
+            self._middle_canvas.configure(scrollregion=self._middle_canvas.bbox("all"))
+            self._update_scrollbar_visibility()
+            self._schedule_fit()   # e.g. the market list grew when prices arrived
+
+        self.middle_content.bind("<Configure>", _on_middle_content_configure)
+
+        # Enable mousewheel scrolling on the middle canvas
+        from views.base_view import _enable_canvas_mousewheel
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self.middle_content)
+
+        # Animated sliding indicator (Pill-shaped) - height adjusted to 38px
+        self._sliding_indicator = tk.Canvas(self.middle_content, bg=self.sidebar_bg, width=4, highlightthickness=0)
+        self._sliding_indicator_id = self._sliding_indicator.create_line(
+            2, 3, 2, self._NAV_BTN_H - 3, fill=self.accent_primary, width=4, capstyle=tk.ROUND
+        )
+        self._anim_id = None
+        self._current_indicator_y = 0.0
+
+        # Size tokens
+        self._w_expanded  = 220
+        self._w_collapsed = 78
+        self._btn_w_expanded  = 184
+        self._btn_w_collapsed = 52
+
+        # ── Portfolio Summary Card ────────────────────────────────────────────
+        _card_bg = ModernStyle.SIDEBAR_BG_ALT
+        self._summary_card = tk.Frame(self.middle_content, bg=_card_bg, highlightbackground=ModernStyle.SIDEBAR_HOVER, highlightthickness=1)
+        self._summary_card.pack(fill=tk.X, padx=16, pady=(4, 8))
+        
+        _vrow = tk.Frame(self._summary_card, bg=_card_bg)
+        _vrow.pack(fill=tk.X, padx=12, pady=(10, 2))
+        self._summary_value_lbl = tk.Label(_vrow, text="₹ —", bg=_card_bg, fg=ModernStyle.SIDEBAR_FG, font=ModernStyle.FONT_TITLE, anchor="w")
+        self._summary_value_lbl.pack(side=tk.LEFT)
+        # (the holdings count is in the status line just above this card)
+        self._summary_label_lbl = self._summary_value_lbl
+
+        _srow = tk.Frame(self._summary_card, bg=_card_bg)
+        _srow.pack(fill=tk.X, padx=12, pady=(0, 2))
+        self._summary_pnl_lbl = tk.Label(_srow, text="P&L: —", bg=_card_bg, fg=ModernStyle.TICKER_UP, font=ModernStyle.FONT_SMALL_BOLD, anchor="w")
+        self._summary_pnl_lbl.pack(side=tk.LEFT)
+        # The card covers every holding in every currency, converted to ₹
+        # (the Dashboard shows one currency at a time), so say so.
+        self._summary_count_lbl = tk.Label(self._summary_card, text="invested · all in ₹", bg=_card_bg,
+                                           fg=ModernStyle.SIDEBAR_MUTED, font=ModernStyle.FONT_SMALL, anchor="w")
+        self._summary_count_lbl.pack(fill=tk.X, padx=12, pady=(0, 10))
+        
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self._summary_card)
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self._summary_value_lbl)
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self._summary_label_lbl)
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self._summary_pnl_lbl)
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self._summary_count_lbl)
+        self.after(50, self._refresh_summary_card)
+
+        # ── Navigation Section Label ──────────────────────────────────────────
+        self._nav_header = tk.Frame(self.middle_content, bg=self.sidebar_bg)
+        self._nav_header.pack(fill=tk.X, padx=16, pady=(6, 0))
+
+        self._menu_lbl = tk.Label(
+            self._nav_header, text="N A V I G A T I O N",
+            font=ModernStyle.FONT_NAV_SECTION,
+            bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_MUTED, anchor="w",
+        )
+        self._menu_lbl.pack(fill=tk.X)
+        
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self._nav_header)
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self._menu_lbl)
+
+        # Gold Separator — placed before the first nav button (Dashboard)
+        self._nav_gold_sep = tk.Frame(self.middle_content, bg=self.sidebar_bg)
+        self._nav_gold_sep.pack(fill=tk.X, padx=16, pady=(2, 2))
+        tk.Frame(self._nav_gold_sep, bg=ModernStyle.SIDEBAR_HOVER, height=1).pack(fill=tk.X)
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=self._nav_gold_sep)
+
+        # ── Navigation Items ──────────────────────────────────────────────────
+        nav_items = [
+            # Colour emoji icons for the menu
+            ("🏠  Dashboard",    0),
+            ("💼  My Holdings",  1),
+            ("✍️  Trade Entry",  2),
+            ("🕒  Trade History", 3),
+            ("🧾  Tax Report",   4),
+            ("📊  P&L Report", 5),
+            ("👀  Watchlist",    6),
+            ("💎  Valuation",    7),
+            ("📰  Financial News", 8),
+            ("⚙️  Settings",     9),
+            ("💡  Help",         10),
+        ]
+
+        self._nav_labels = {idx: label for (label, idx) in nav_items}
+        _divider_after = {3, 8}  # Core | Analysis | System
+        for label, idx in nav_items:
+            self._add_nav_button(label, idx)
+            if idx in _divider_after:
+                div = tk.Frame(self.middle_content, bg=ModernStyle.SIDEBAR_HOVER, height=1)
+                div.pack(fill=tk.X, padx=28, pady=(2, 2))
+                _enable_canvas_mousewheel(self._middle_canvas, include_widget=div)
+
+        # Spacer (thin fixed gap above the bottom-docked section)
+        tk.Frame(self, bg=self.sidebar_bg, height=4).pack(side=tk.TOP, fill=tk.X)
+
+        # MINI MARKET TICKERS — expands to fill remaining sidebar space
+        # Markets sit at the bottom of the sidebar, just above the profile row
+        self._ticker_frame = tk.Frame(self.bottom_fixed_frame, bg=self.sidebar_bg)
+        self._ticker_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 6))
 
         self._ticker_labels = {}
 
         tk.Label(
-            self._ticker_frame, text="M A R K E T S [Live]",
+            self._ticker_frame, text="M A R K E T S",
             font=ModernStyle.FONT_NAV_SECTION,
-            bg=self.sidebar_bg, fg=self.accent_primary, anchor="w"
+            bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_MUTED, anchor="w"
         ).pack(fill=tk.X, padx=16, pady=(0, 0))
 
-        tk.Frame(self._ticker_frame, bg=self.accent_primary, height=1).pack(fill=tk.X, padx=16, pady=(0, 6))
+        tk.Frame(self._ticker_frame, bg=ModernStyle.SIDEBAR_HOVER, height=1).pack(fill=tk.X, padx=16, pady=(0, 3))
 
         self._ticker_time_lbl = tk.Label(
-            self._ticker_frame, text="⚡ Last Updated: —",
-            font=ModernStyle.FONT_ITALIC_MD,
-            bg=self.sidebar_bg, fg="yellow", anchor="w"
+            self._ticker_frame, text="Prices as of —",
+            font=ModernStyle.FONT_ITALIC_SM,
+            bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_MUTED, anchor="w"
         )
-        self._ticker_time_lbl.pack(fill=tk.X, padx=20, pady=(0, 4))
+        self._ticker_time_lbl.pack(fill=tk.X, padx=16, pady=(0, 2))
 
+        # Tickers container directly in the frame
         self.tickers_container = tk.Frame(self._ticker_frame, bg=self.sidebar_bg)
-        self.tickers_container.pack(fill=tk.X, padx=20, pady=(0, 6))
+        self.tickers_container.pack(fill=tk.BOTH, expand=True, padx=10)
 
         import model.tickers as tck
-        self._show_ticker_loading()
+        cached_data = tck.get_mini_tickers()
+        if cached_data:
+            self._render_tickers()
+        else:
+            self._show_ticker_loading()
         tck.refresh_mini_tickers(callback=self._on_tickers_fetched)
 
         # ── Keyboard shortcut bindings (Alt+1..9) ────────────────────────────
@@ -630,79 +676,50 @@ class Sidebar(tk.Frame):
                 btn.set_disabled(False)
                 btn.set_palette(
                     bg=self.accent_gradient,
-                    fg="#ffffff",
+                    fg=ModernStyle.TEXT_ON_ACCENT,
                     hover_bg=self.accent_primary,
                     pressed_bg=self.accent_primary,
                 )
+                btn.set_font(ModernStyle.FONT_NAV_ACTIVE)
             else:
                 btn.set_disabled(False)
                 btn.set_palette(
                     bg=self.sidebar_bg,
-                    fg="#E2E8F0",
+                    fg=ModernStyle.SIDEBAR_FG,
                     hover_bg=self.accent_hover,
                     pressed_bg=self.accent_pressed,
                 )
+                btn.set_font(ModernStyle.FONT_NAV)
 
         if target_y is not None and not self._collapsed:
             self._animate_indicator(target_y)
 
     def _animate_indicator(self, target_y: float) -> None:
+        """Move the gold indicator next to the active button.
+
+        It jumps rather than slides: every slide frame made Tk redraw the whole
+        window, so the ~20-frame slide blocked the app for 2–3 s per click.
+        """
         if self._anim_id:
             self.after_cancel(self._anim_id)
-
-        if not self._sliding_indicator.winfo_ismapped():
-            self._current_indicator_y = target_y
-            self._sliding_indicator.place(x=0, y=int(self._current_indicator_y), width=4, height=46)
-            return
-
-        def _step():
-            dy = target_y - self._current_indicator_y
-            if abs(dy) < 1.0:
-                self._current_indicator_y = target_y
-                self._sliding_indicator.place(y=int(self._current_indicator_y))
-                self._anim_id = None
-                return
-            self._current_indicator_y += dy * 0.25
-            self._sliding_indicator.place(y=int(self._current_indicator_y))
-            self._anim_id = self.after(16, _step)
-
-        _step()
-
-    def _try_load_icon(self, label: str, filename: str, *, subsample: int = 1) -> None:
-        try:
-            if getattr(sys, 'frozen', False):
-                base = Path(sys._MEIPASS) / "assets" / "icons"
-            else:
-                base = Path(__file__).resolve().parent / "assets" / "icons"
-
-            path = base / filename
-            if not path.exists():
-                return
-
-            pil_img = Image.open(path)
-            pil_img = pil_img.resize((24, 24), Image.Resampling.LANCZOS)
-            self._icons[label] = ImageTk.PhotoImage(pil_img)
-        except Exception as e:
-            print(f"Icon load error ({label}): {e}")
-            return
+            self._anim_id = None
+        self._current_indicator_y = target_y
+        self._sliding_indicator.place(x=0, y=int(target_y), width=4, height=self._NAV_BTN_H)
 
     def _add_nav_button(self, label: str, idx: int):
-        row = tk.Frame(self, bg=self.sidebar_bg)
-        row.pack(fill=tk.X, padx=(12, 16), pady=1)
+        row = tk.Frame(self.middle_content, bg=self.sidebar_bg)
+        row.pack(fill=tk.X, padx=(12, 16), pady=0)
 
-        icon = self._icons.get(label)
-        self._nav_has_icon[idx] = bool(icon)
         btn = ModernButton(
             row,
             text=label,
             command=lambda: self.on_navigate(idx),
             invoke_on_press=True,
-            icon=icon,
             bg=self.sidebar_bg,
-            fg="#E2E8F0",
+            fg=ModernStyle.SIDEBAR_FG,
             canvas_bg=self.sidebar_bg,
             width=self._btn_w_expanded,
-            height=46,
+            height=self._NAV_BTN_H,
             radius=8,
             font=ModernStyle.FONT_NAV,
             text_anchor="w",
@@ -710,14 +727,6 @@ class Sidebar(tk.Frame):
         )
         btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.buttons[idx] = btn
-
-        # FIX: suppress hover shift for the currently active button
-        def _on_hover(e, is_hover=True, r=row, i=idx):
-            if not self._collapsed and i != self._active_idx:
-                r.pack_configure(padx=(20, 8) if is_hover else (12, 16))
-
-        btn.bind("<Enter>", lambda e: _on_hover(e, True), add="+")
-        btn.bind("<Leave>", lambda e: _on_hover(e, False), add="+")
 
         # Attach tooltip (visible only in collapsed mode)
         # Strip emoji prefix from label for clean tooltip text
@@ -729,14 +738,17 @@ class Sidebar(tk.Frame):
         tip = _NavTooltip(btn, clean, self.sidebar_bg)
         self._tooltips.append(tip)
 
+        # Enable mousewheel scrolling when hovering over buttons
+        from views.base_view import _enable_canvas_mousewheel
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=row)
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=btn)
+
     def toggle(self) -> None:
         """Collapse/expand the sidebar."""
         self._collapsed = not bool(self._collapsed)
 
-        abbr = {
-            0: "📊", 1: "💼", 2: "➕", 3: "🧬",
-            4: "📄", 5: "👁", 6: "💠", 7: "⚙️", 8: "🔅",
-        }
+        # Collapsed buttons show the same emoji as their expanded label
+        abbr = {idx: (label.split() or [""])[0] for idx, label in self._nav_labels.items()}
 
         if self._collapsed:
             self.configure(width=self._w_collapsed)
@@ -755,17 +767,14 @@ class Sidebar(tk.Frame):
             except Exception: pass
             try: self._ticker_frame.pack_forget()
             except Exception: pass
-            try: self._toggle_btn.set_text("→")
+            try: self._toggle_btn.set_text("☰")
             except Exception: pass
             try: self._profile_name_lbl.pack_forget()
             except Exception: pass
 
             for idx, btn in self.buttons.items():
                 try:
-                    if self._nav_has_icon.get(idx, False):
-                        btn.set_text("")
-                    else:
-                        btn.set_text(abbr.get(idx, ""))
+                    btn.set_text(abbr.get(idx, ""))
                     btn.set_size(width=self._btn_w_collapsed)
                 except Exception:
                     pass
@@ -777,7 +786,7 @@ class Sidebar(tk.Frame):
             # ── Expand ────────────────────────────────────────────────────────
             self.configure(width=self._w_expanded)
 
-            try: self._title_stack.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
+            try: self._title_stack.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
             except Exception: pass
             try: self._menu_lbl.pack(fill=tk.X)
             except Exception: pass
@@ -788,9 +797,9 @@ class Sidebar(tk.Frame):
                 self._status_row.pack(fill=tk.X, pady=(6, 0))
             except Exception: pass
             try:
-                self._ticker_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
+                self._ticker_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 6), after=self._profile_divider)
             except Exception: pass
-            try: self._toggle_btn.set_text("≡")
+            try: self._toggle_btn.set_text("☰")
             except Exception: pass
             try: self._profile_name_lbl.pack(side=tk.LEFT, padx=(10, 0))
             except Exception: pass
@@ -802,7 +811,7 @@ class Sidebar(tk.Frame):
                 except Exception:
                     pass
 
-            try: self._exit_btn.configure(text="⏻  Quit / Logout")
+            try: self._exit_btn.configure(text="⏻")
             except Exception: pass
 
         # Re-apply active styling (FIX: use `in` instead of fragile string comparison)
@@ -812,99 +821,86 @@ class Sidebar(tk.Frame):
         except Exception:
             pass
 
+        self._update_scrollbar_visibility()
+
     def _refresh_summary_card(self):
-        """Fetch portfolio totals and update the summary card.
+        """Fetch portfolio totals for the summary card in the background.
 
         Called once at startup and again when the dashboard Refresh button
-        is clicked (via refresh_sidebar_data).  Runs DB work in a
-        background thread to avoid blocking the UI.
+        is clicked (via refresh_sidebar_data). The card covers every holding,
+        converted to ₹; it is labelled "all, in ₹" because the Dashboard shows
+        one currency at a time.
         """
-        def _bg():
-            try:
-                from model.database import db_session
-                from model.engine import get_exchange_rate
-                with db_session() as conn:
-                    cur = conn.cursor()
-                    cur.execute("SELECT qty, avg_price, running_pnl, currency FROM holdings WHERE qty > 0")
-                    count = 0
-                    invested = 0.0
-                    pnl = 0.0
-                    for row in cur.fetchall():
-                        qty = float(row[0] or 0)
-                        price = float(row[1] or 0)
-                        running_pnl = float(row[2] or 0)
-                        currency = str(row[3] or 'INR').strip().upper()
+        from model.database import db_session
+        from model.engine import get_exchange_rate
 
-                        rate = get_exchange_rate(currency)
-                        count += 1
-                        invested += (qty * price) * rate
-                        pnl += running_pnl * rate
+        def _work():
+            with db_session() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT qty, avg_price, running_pnl, currency FROM holdings WHERE qty > 0")
+                count = 0
+                invested = 0.0
+                pnl = 0.0
+                for row in cur.fetchall():
+                    qty = float(row[0] or 0)
+                    price = float(row[1] or 0)
+                    running_pnl = float(row[2] or 0)
+                    currency = str(row[3] or 'INR').strip().upper()
 
-                try:
-                    self.after(0, lambda: self._update_summary_ui(count, invested, pnl))
-                except Exception:
-                    pass
-            except Exception as e:
-                print(f"Summary card error: {e}")
+                    rate = get_exchange_rate(currency)
+                    count += 1
+                    invested += (qty * price) * rate
+                    pnl += running_pnl * rate
+            return count, invested, pnl
 
-        threading.Thread(target=_bg, daemon=True).start()
-
-    def _update_summary_ui(self, count, invested, pnl):
-        try:
-            # Correctly labelled as "Invested" since it is cost basis, not market value
-            self._summary_value_lbl.configure(text=f"₹{invested:,.0f}")
-            color = ModernStyle.SUCCESS if pnl >= 0 else ModernStyle.ERROR
-            arrow = "▲" if pnl >= 0 else "▼"
-            self._summary_pnl_lbl.configure(text=f"{arrow} P&L: ₹{pnl:,.0f}", fg=color)
-            self._summary_count_lbl.configure(text=f"{count} holdings")
-        except Exception: pass
+        run_in_background(_work, on_done=lambda r: self._update_summary_ui(*r),
+                          widget=self, name="sidebar-summary")
 
     def _refresh_status_badge(self):
-        """Fetch last sync time and update the status badge.
+        """Fetch the holdings count and last price update time in the background."""
+        from model.database import db_session
+        from datetime import datetime
 
-        Called once at startup and again via refresh_sidebar_data.
-        Runs DB work in a background thread to avoid blocking the UI.
-        """
-        def _bg():
-            try:
-                from model.database import db_session
-                from datetime import datetime
-                with db_session() as conn:
-                    cur = conn.cursor()
-                    cur.execute("SELECT COUNT(*) FROM holdings WHERE qty > 0")
-                    row1 = cur.fetchone()
-                    count = row1[0] if row1 else 0
+        def _work():
+            with db_session() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM holdings WHERE qty > 0")
+                row1 = cur.fetchone()
+                count = row1[0] if row1 else 0
 
-                    cur.execute("SELECT MAX(last_updated) FROM marketdata")
-                    row2 = cur.fetchone()
-                    last_ts = row2[0] if row2 else None
+                cur.execute("SELECT MAX(last_updated) FROM marketdata")
+                row2 = cur.fetchone()
+                last_ts = row2[0] if row2 else None
 
-                time_str = "Unknown"
-                if last_ts:
-                    try:
-                        dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
-                        diff = int((datetime.now() - dt).total_seconds() / 60)
-                        if diff < 1: time_str = "Just now"
-                        elif diff < 60: time_str = f"{diff}m ago"
-                        else: time_str = f"{diff // 60}h ago"
-                    except Exception: pass
-
+            time_str = "Unknown"
+            if last_ts:
                 try:
-                    self.after(0, lambda: self._status_badge.configure(
-                        text=f"{count} active · {time_str}", fg=ModernStyle.SLATE_300
-                    ))
-                except Exception:
+                    dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
+                    diff = int((datetime.now() - dt).total_seconds() / 60)
+                    if diff < 1: time_str = "Just now"
+                    elif diff < 60: time_str = f"{diff}m ago"
+                    else: time_str = f"{diff // 60}h ago"
+                except ValueError:
                     pass
-            except Exception as e:
-                print(f"Status badge error: {e}")
-                try:
-                    self.after(0, lambda: self._status_badge.configure(
-                        text="Sync error", fg=ModernStyle.ERROR
-                    ))
-                except Exception:
-                    pass
+            return f"{count} active · prices {time_str}"
 
-        threading.Thread(target=_bg, daemon=True).start()
+        run_in_background(
+            _work,
+            on_done=lambda text: self._update_status_badge_ui(text, ModernStyle.SIDEBAR_MUTED),
+            on_error=lambda e: self._update_status_badge_ui("Sync error", ModernStyle.TICKER_DOWN),
+            widget=self, name="sidebar-status",
+        )
+
+    def _update_summary_ui(self, count, invested, pnl):
+        # "Invested" is the cost basis (not market value) across all currencies, in ₹
+        self._summary_value_lbl.configure(text=f"₹{invested:,.0f}")
+        color = ModernStyle.TICKER_UP if pnl >= 0 else ModernStyle.TICKER_DOWN
+        arrow = "▲" if pnl >= 0 else "▼"
+        self._summary_pnl_lbl.configure(text=f"{arrow} P&L ₹{abs(pnl):,.0f}", fg=color)
+        self._summary_count_lbl.configure(text="invested · all in ₹")
+
+    def _update_status_badge_ui(self, text, fg):
+        self._status_badge.configure(text=text, fg=fg)
 
     def refresh_sidebar_data(self):
         """Public method: re-fetch sidebar investment & status data.
@@ -915,21 +911,20 @@ class Sidebar(tk.Frame):
         self._refresh_status_badge()
 
     def _pulse_step(self):
-        """Animate the status dot with a smooth heartbeat pulse."""
+        """Pulse the status dot like a slow heartbeat: bright, then dim, once a second.
+
+        Every change to the dot makes Tk redraw the whole window (about 0.07 s
+        on a Retina Mac), so the old smooth pulse at 12 frames a second kept the
+        app busy about 80% of the time even when idle.
+        """
         try:
-            self._pulse_phase = (self._pulse_phase + 1) % 20
-            import math
-            t = math.sin(self._pulse_phase / 20.0 * math.pi * 2) * 0.5 + 0.5
-
-            r = int(10 + (34 - 10) * t)
-            g = int(92 + (197 - 92) * t)
-            b = int(47 + (94 - 47) * t)
-            color = f"#{r:02x}{g:02x}{b:02x}"
-
+            self._pulse_phase = (self._pulse_phase + 1) % 2
+            bright = self._pulse_phase == 0
+            color = ModernStyle.TICKER_UP if bright else ModernStyle.SUCCESS_FILL
             self._pulse_canvas.itemconfig(self._pulse_glow, outline=color)
             self._pulse_canvas.itemconfig(self._pulse_dot, fill=color)
 
-            expand = int(t * 2)
+            expand = 1 if bright else 0   # the glow ring swells a little on the bright beat
             self._pulse_canvas.coords(
                 self._pulse_glow,
                 1 - expand, 1 - expand, 13 + expand, 13 + expand
@@ -938,7 +933,7 @@ class Sidebar(tk.Frame):
             pass
 
         try:
-            self._pulse_anim_id = self.after(80, self._pulse_step)
+            self._pulse_anim_id = self.after(1000, self._pulse_step)
         except Exception:
             pass
 
@@ -946,70 +941,116 @@ class Sidebar(tk.Frame):
         """Show the Loading... placeholder before data arrives."""
         for w in self.tickers_container.winfo_children():
             w.destroy()
-        tk.Label(self.tickers_container, text="Loading...", bg=self.sidebar_bg, fg=ModernStyle.TEXT_ON_ACCENT, font=ModernStyle.FONT_SMALL).pack(anchor="w")
+        lbl = tk.Label(self.tickers_container, text="Loading...", bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_MUTED, font=ModernStyle.FONT_SMALL)
+        lbl.pack(anchor="w")
+        from views.base_view import _enable_canvas_mousewheel
+        _enable_canvas_mousewheel(self._middle_canvas, include_widget=lbl)
 
     def _on_tickers_fetched(self):
-        """Callback invoked from background thread when tickers are ready."""
-        try:
-            self.after(0, self._render_tickers)
-        except Exception:
-            pass
+        """Called from the ticker thread when prices are ready: hand over to the Tk thread."""
+        call_on_ui(lambda: self.winfo_exists() and self._render_tickers())
 
     def _render_tickers(self):
         """Redraw the ticker labels using cached data."""
         import model.tickers as tck
         from datetime import datetime
 
-        try:
-            self._ticker_time_lbl.config(text=f"⚡ Last Updated : {datetime.now().strftime('%H:%M:%S')}")
-        except Exception:
-            pass
+        # Show when the prices were actually fetched, not when they were drawn
+        fetched = tck.get_fetched_at() if hasattr(tck, "get_fetched_at") else None
+        if fetched:
+            when = datetime.fromtimestamp(fetched)
+            stamp = when.strftime("%H:%M") if when.date() == datetime.now().date() else when.strftime("%d %b, %H:%M")
+            self._ticker_time_lbl.config(text=f"Prices as of {stamp}")
+        else:
+            self._ticker_time_lbl.config(text="Prices not fetched yet")
 
         if self._collapsed:
             return
         if not self._ticker_frame.winfo_ismapped():
-            self._ticker_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 12))
+            self._ticker_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 6), after=self._profile_divider)
 
         data = tck.get_mini_tickers()
 
         for w in self.tickers_container.winfo_children():
             w.destroy()
 
+        from views.base_view import _enable_canvas_mousewheel
+
         if not data:
             # FIX: show retry button on failure
             err_row = tk.Frame(self.tickers_container, bg=self.sidebar_bg)
             err_row.pack(fill=tk.X)
-            tk.Label(err_row, text="No data", bg=self.sidebar_bg, fg=ModernStyle.TEXT_ON_ACCENT, font=ModernStyle.FONT_SMALL).pack(side=tk.LEFT)
+            lbl = tk.Label(err_row, text="No data", bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_MUTED, font=ModernStyle.FONT_SMALL)
+            lbl.pack(side=tk.LEFT)
             retry_lbl = tk.Label(err_row, text="↺ Retry", bg=self.sidebar_bg, fg=self.accent_primary,
                                  font=ModernStyle.FONT_SMALL_BOLD, cursor="hand2")
             retry_lbl.pack(side=tk.RIGHT)
             retry_lbl.bind("<Button-1>", lambda e: self.refresh_tickers())
+            
+            _enable_canvas_mousewheel(self._middle_canvas, include_widget=err_row)
+            _enable_canvas_mousewheel(self._middle_canvas, include_widget=lbl)
+            _enable_canvas_mousewheel(self._middle_canvas, include_widget=retry_lbl)
         else:
             for name, info in data.items():
                 row = tk.Frame(self.tickers_container, bg=self.sidebar_bg)
                 row.pack(fill=tk.X, pady=1)
 
-                tk.Label(row, text=name, bg=self.sidebar_bg, fg=ModernStyle.TEXT_ON_ACCENT, font=ModernStyle.FONT_SUBHEADING).pack(side=tk.LEFT)
+                lbl1 = tk.Label(row, text=name, bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_FG, font=ModernStyle.FONT_TICKER_SYMBOL, padx=0)
+                lbl1.pack(side=tk.LEFT)
 
                 pct = info.get("pct", 0.0)
                 cp  = info.get("price", 0.0)
 
-                # FIX: use red for negative moves (financial standard), not gold
-                color = ModernStyle.SUCCESS if pct >= 0 else ModernStyle.ERROR
+                # Use high-contrast colors optimized for the dark sidebar background
+                color = ModernStyle.TICKER_UP if pct >= 0 else ModernStyle.TICKER_DOWN
                 arrow = "▲" if pct >= 0 else "▼"
 
-                if "USD" in name:
-                    val_str = f"{cp:.2f}"
+                if "/" in name:
+                    # Currency pair - keep decimals for precision
+                    if "USD" in name:
+                        val_str = f"{cp:.2f}"
+                    else:
+                        val_str = f"{cp:,.3f}"
                 else:
-                    val_str = f"{cp:,.3f}"
+                    # Market index - round to whole number (no fractions)
+                    val_str = f"{cp:,.0f}"
 
-                tk.Label(row, text=f"{val_str} {arrow}{abs(pct):.1f}%", bg=self.sidebar_bg, fg=color, font=ModernStyle.FONT_TICKER).pack(side=tk.RIGHT)
+                lbl2 = tk.Label(row, text=f"{val_str} {arrow}{abs(pct):.1f}%", bg=self.sidebar_bg, fg=color, font=ModernStyle.FONT_TICKER_VALUE, padx=0)
+                lbl2.pack(side=tk.RIGHT)
+
+                _enable_canvas_mousewheel(self._middle_canvas, include_widget=row)
+                _enable_canvas_mousewheel(self._middle_canvas, include_widget=lbl1)
+                _enable_canvas_mousewheel(self._middle_canvas, include_widget=lbl2)
 
     def refresh_tickers(self):
         """Trigger a fresh background fetch, then re-render. Called by the Dashboard Refresh button."""
         import model.tickers as tck
         self._show_ticker_loading()
         tck.refresh_mini_tickers(callback=self._on_tickers_fetched)
+
+    def _update_scrollbar_visibility(self):
+        pass
+
+    def _schedule_fit(self):
+        if getattr(self, "_fit_after_id", None):
+            self.after_cancel(self._fit_after_id)
+        self._fit_after_id = self.after(120, self._fit_to_height)
+
+    def _fit_to_height(self):
+        """Keep the sidebar from needing to scroll: if the menu, summary and
+        market list don't fit (small window, Large text), hide the logo; show it
+        again when there is room."""
+        self._fit_after_id = None
+        if self._collapsed or not hasattr(self, "_logo_lbl"):
+            return
+        need = self.middle_content.winfo_reqheight()
+        have = self._middle_canvas.winfo_height()
+        logo_h = self._logo_container.winfo_reqheight() + 8
+        shown = self._logo_container.winfo_ismapped()
+        if shown and need > have:
+            self._logo_container.pack_forget()
+        elif not shown and need + logo_h <= have:
+            self._logo_container.pack(fill=tk.X, pady=(8, 0), after=self._title_stack.master)
 
 
 class PTrackerApp:
@@ -1019,52 +1060,72 @@ class PTrackerApp:
         self.root = root
         self.root.title("PTracker - Portfolio Tracker")
 
-        # Dynamic sizing based on screen dimensions
+        # 1. Temporarily hide the window to eliminate the startup visual flash on macOS
+        self.root.withdraw()
+
+        # Theme first, so every widget built below gets the right colours and fonts
+        ModernStyle.apply_theme(root)
+        ModernStyle.improve_treeview_scrolling(root)
+        start_ui_dispatcher(root)
+        install_row_hover(root)
+        self._last_error_toast = 0.0
+        root.report_callback_exception = self._report_callback_exception
+
+        # 2. Size: 60% x 80% of the screen, never smaller than what the pages need,
+        #    never bigger than the screen. The window can be resized and maximised.
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-
-        target_w = min(1700, int(screen_w * 0.95))
-        target_h = min(1150, int(screen_h * 0.90))
+        min_w, min_h = min(1100, screen_w), min(720, screen_h - 60)
+        target_w = max(min_w, min(int(screen_w * 0.60), screen_w))
+        target_h = max(min_h, min(int(screen_h * 0.80), screen_h - 60))
+        self.root.minsize(min_w, min_h)
+        self.root.resizable(True, True)
         self.root.geometry(f"{target_w}x{target_h}")
-
-        # If the screen is small, start maximized
-        if screen_w <= 1366 or screen_h <= 768:
-            try:
-                if sys.platform == "win32":
-                    self.root.state('zoomed')
-                else:
-                    self.root.attributes('-zoomed', True)
-            except Exception:
-                pass
-
-        # Center on screen after initial sizing
         try:
+            self.root.update_idletasks()
             center_window(self.root)
         except Exception:
             pass
+        self.root.deiconify()
 
-        # Optional: PNG app icon (place it at `assets/app_icon.png`)
+        # Dock icon when running from source (the built .app already has its .icns)
         self._app_icon: tk.PhotoImage | None = None
-        self._set_app_icon()
-
-        # Apply theme
-        ModernStyle.apply_theme(root)
-
-        # Initialize database
-        from model.database import initialize_database, ensure_marketdata_schema, ensure_watchlist_schema
-        initialize_database()
-        ensure_marketdata_schema()
-        ensure_watchlist_schema()
+        if not getattr(sys, 'frozen', False):
+            self.root.after(500, self._set_app_icon)
 
         # Store for cleanup
         atexit.register(lambda: close_all_connections(optimize=False))
 
-        # Create app state
+        # Initialize database schemas in background so the window opens instantly.
+        # Views are not shown until after navigate(0), giving this thread ample time.
         self.app_state = AppState(root)
-        try:
-            self.app_state.refresh_data_cache_async()
-        except Exception as e:
-            print(f"Warning: Could not initialize data cache: {e}")
+        self._db_ready = False
+
+        def _init_db_bg():
+            try:
+                from model.database import initialize_database, ensure_marketdata_schema, ensure_watchlist_schema
+                initialize_database()
+                ensure_marketdata_schema()
+                ensure_watchlist_schema()
+            except Exception:
+                log.exception("Database set-up failed")
+            finally:
+                self._db_ready = True
+                try:
+                    self.app_state.refresh_data_cache_async()
+                except Exception:
+                    log.exception("Could not start loading the data cache")
+            try:
+                # At most one automatic backup a day, kept for 30 days
+                from model.backup import daily_backup_if_due
+                made = daily_backup_if_due()
+                if made:
+                    log.info("Daily backup saved: %s", made)
+            except Exception:
+                log.exception("Daily backup failed")
+
+        threading.Thread(target=_init_db_bg, daemon=True).start()
+
 
         # ── Status Bar (Bottom) ──────────────────────────────────────────────
         self.status_bar_frame = tk.Frame(root, bg=ModernStyle.BG_TERTIARY, height=28)
@@ -1073,7 +1134,7 @@ class PTrackerApp:
         tk.Frame(self.status_bar_frame, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", side=tk.TOP)
         self.status_lbl = tk.Label(
             self.status_bar_frame,
-            text="🟢 Starting up...",
+            text="● Starting up...",
             fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_TERTIARY,
             font=ModernStyle.FONT_SMALL
         )
@@ -1100,6 +1161,7 @@ class PTrackerApp:
 
         # Sidebar
         self.sidebar = Sidebar(main_frame, self.navigate)
+        self.app_state.sidebar = self.sidebar   # views refresh the sidebar totals/tickers through this
 
         # Content area
         self.content_frame = ModernFrame(main_frame, bg=ModernStyle.BG_PRIMARY)
@@ -1111,30 +1173,29 @@ class PTrackerApp:
         # Initialize views (import them here to avoid circular imports)
         self._setup_views()
 
-        # Show first view
-        self.navigate(0)
-
         # Expose app on root window so views can find ViewManager via winfo_toplevel()
         try:
             self.root._ptracker_app = self
         except Exception:
             pass
 
+        # Show the first view once the window (sidebar, status bar) has been drawn,
+        # so the app appears straight away instead of after the Dashboard is built.
+        self.root.after(50, lambda: self.navigate(0))
+
         # Start background tasks
         self._start_auto_refresh()
         self.root.after(3000, self._update_status_loop)
 
     def _update_status_loop(self):
-        """Periodically update the bottom status bar."""
-        try:
-            from model.database import db_session
-            from model.engine import get_dashboard_metrics
-            import time
-            from datetime import datetime
+        """Refresh the bottom status bar every 15 s (the work runs in the background)."""
+        from model.database import db_session
+        from model.engine import get_dashboard_metrics
+        from datetime import datetime
 
+        def _work():
             metrics = get_dashboard_metrics(force_refresh=False)
             val = metrics.get('total_value', 0.0)
-
             with db_session() as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT count(1) FROM holdings WHERE qty > 0")
@@ -1142,182 +1203,158 @@ class PTrackerApp:
                 cur.execute("SELECT max(last_updated) FROM marketdata")
                 last_ts = cur.fetchone()[0]
 
-            time_str = "Unknown"
+            time_str = "unknown"
             if last_ts:
                 try:
                     dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
                     diff = int((datetime.now() - dt).total_seconds() / 60)
                     if diff < 1:
-                        time_str = "Just now"
+                        time_str = "just now"
                     elif diff < 60:
                         time_str = f"{diff} min ago"
                     else:
                         time_str = f"{diff // 60} hrs ago"
-                except Exception:
+                except ValueError:
                     pass
+            try:
+                from model.engine import get_fx_estimates
+                estimated = sorted(get_fx_estimates())
+            except Exception:
+                estimated = []
+            return time_str, count, val, estimated
 
+        def _show(result):
+            time_str, count, val, estimated = result
+            fx_note = f"   |   ≈ estimated {'/'.join(estimated)} rate" if estimated else ""
             self.status_lbl.config(
-                text=f"🟢 Last updated: {time_str}   |   📦 {count} active holdings   |   💰 ₹{val:,.2f} total value (INR equiv.)"
+                text=f"● Prices updated {time_str}   ·   {count} active holdings   ·   "
+                     f"₹{val:,.0f} total value (all currencies, in ₹){fx_note}"
             )
 
-            # Market open/close status (NSE: IST 9:15 AM - 3:30 PM, Mon-Fri)
-            try:
-                from datetime import timezone, timedelta
-                ist = timezone(timedelta(hours=5, minutes=30))
-                now_ist = datetime.now(ist)
-                weekday = now_ist.weekday()  # 0=Mon, 6=Sun
-                t_min = now_ist.hour * 60 + now_ist.minute
-                if weekday < 5 and 555 <= t_min <= 930:  # 9:15 - 15:30
-                    self._market_status_lbl.config(text="│  🟢 NSE Open", fg=ModernStyle.SUCCESS)
-                elif weekday < 5 and 540 <= t_min < 555:  # 9:00 - 9:15
-                    self._market_status_lbl.config(text="│  🟡 NSE Pre-Market", fg=ModernStyle.WARNING)
-                else:
-                    self._market_status_lbl.config(text="│  🔴 NSE Closed", fg=ModernStyle.TEXT_TERTIARY)
-            except Exception:
-                pass
-        except Exception:
-            pass
+        run_in_background(_work, on_done=_show, widget=self.status_lbl, name="status-bar")
+        self._show_market_status()
 
         # Re-run every 15 seconds
         self.root.after(15000, self._update_status_loop)
 
+    def _show_market_status(self):
+        """NSE open/closed, worked out in India time whatever the Mac's time zone (holidays not included)."""
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+            now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+        except Exception:
+            from datetime import timezone, timedelta
+            now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+        weekday = now_ist.weekday()  # 0=Mon, 6=Sun
+        t_min = now_ist.hour * 60 + now_ist.minute
+        if weekday < 5 and 555 <= t_min <= 930:  # 9:15 - 15:30
+            self._market_status_lbl.config(text="│  ● NSE Open", fg=ModernStyle.SUCCESS)
+        elif weekday < 5 and 540 <= t_min < 555:  # 9:00 - 9:15
+            self._market_status_lbl.config(text="│  ◐ NSE Pre-Market", fg=ModernStyle.WARNING)
+        else:
+            self._market_status_lbl.config(text="│  ○ NSE Closed", fg=ModernStyle.TEXT_TERTIARY)
+
     def _start_auto_refresh(self) -> None:
         def _silent_refresh():
-            import threading
-            def _bg():
-                try:
-                    from model.database import db_session
-                    from model.engine import fetch_and_update_market_data, rebuild_holdings
-                    # 1. Fetch live market prices for owned holdings
-                    with db_session() as conn:
-                        cur = conn.cursor()
-                        cur.execute("SELECT DISTINCT symbol FROM holdings WHERE qty > 0")
-                        symbols = [r[0] for r in cur.fetchall()]
-                    if symbols:
-                        fetch_and_update_market_data(symbols)
+            def _work():
+                from model.database import db_session
+                from model.engine import fetch_and_update_market_data, rebuild_holdings
+                # 1. Fetch live market prices for owned holdings
+                with db_session() as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT DISTINCT symbol FROM holdings WHERE qty > 0")
+                    symbols = [r[0] for r in cur.fetchall()]
+                if symbols:
+                    fetch_and_update_market_data(symbols)
 
-                    # 2. Re-compute running PnL, holdings
-                    rebuild_holdings(sync_trade_calcs=False)
+                # 2. Re-compute running PnL, holdings
+                rebuild_holdings(sync_trade_calcs=False)
 
-                    # 3. Reload cache in memory
-                    if getattr(self, "app_state", None):
-                        self.app_state.refresh_data_cache()
+                # 3. Reload cache in memory
+                if getattr(self, "app_state", None):
+                    self.app_state.refresh_data_cache()
 
-                    # 4. Refresh sidebar tickers silently - use .after(0) for thread safety
-                    try:
-                        if hasattr(self, "sidebar"):
-                            self.root.after(0, self.sidebar.refresh_tickers)
-                    except Exception:
-                        pass
-
-                    # 5. Tell views to visually reload safely on main thread
-                    self.root.after(0, _update_ui)
-                except Exception as e:
-                    print(f"Silent auto-refresh failed: {e}")
-
-            def _update_ui():
-                if not hasattr(self, "view_manager"): return
+            def _update_ui(_result=None):
+                # 4. Sidebar tickers and 5. the visible view reload, on the Tk thread
+                if hasattr(self, "sidebar"):
+                    self.sidebar.refresh_tickers()
+                    self.sidebar.refresh_sidebar_data()
+                if not hasattr(self, "view_manager"):
+                    return
                 for name, v in self.view_manager.views.items():
                     try:
                         v._data_loaded = False
                         if self.view_manager.current_view == name and hasattr(v, "load_data"):
                             v.load_data()
                     except Exception:
-                        pass
+                        log.exception("Reloading view %s after the price refresh failed", name)
 
-            threading.Thread(target=_bg, daemon=True).start()
+            run_in_background(_work, on_done=_update_ui, name="price-refresh")
             self.root.after(900000, _silent_refresh)
 
         # Kickoff after 45 seconds (45,000 ms) instead of waiting 15 mins for first run
         self.root.after(45000, _silent_refresh)
 
     def _set_app_icon(self) -> None:
+        """Dock icon when running from source (small pre-sized PNG; the .app uses its .icns)."""
         try:
-            from pathlib import Path
-            import sys
-
-            if getattr(sys, 'frozen', False):
-                base = Path(sys._MEIPASS) / "assets"
-            else:
-                base = Path(__file__).resolve().parent / "assets"
-
-            candidates = [
-                base / "app_icon.png",
-                base / "images" / "logo.png",
-                base / "icons" / "dashboard.png",
-            ]
-
-            icon_path = next((p for p in candidates if p.exists()), None)
-            if icon_path is None:
-                print(f"[ICON] No valid icon file found in candidates. Searched in: {[str(p) for p in candidates]}")
+            icon_path = _asset_path("images", "app_icon_128.png")
+            if not icon_path.exists():
                 return
-
-            pil_img = Image.open(icon_path).convert("RGBA")
-            icon_size = 128
-            pil_img = pil_img.resize((icon_size, icon_size), Image.Resampling.LANCZOS)
-            mask = Image.new('L', (icon_size, icon_size), 0)
-            draw = ImageDraw.Draw(mask)
-            draw.rounded_rectangle((0, 0, icon_size, icon_size), radius=int(icon_size * 0.225), fill=255)
-
-            rounded_img = Image.new('RGBA', (icon_size, icon_size), (0, 0, 0, 0))
-            rounded_img.paste(pil_img, (0, 0), mask=mask)
-
-            self._app_icon = ImageTk.PhotoImage(rounded_img)
-
+            self._app_icon = tk.PhotoImage(file=str(icon_path))
             try:
                 self.root.iconphoto(True, self._app_icon)
-            except Exception:
-                try:
-                    self.root.tk.call("wm", "iconphoto", self.root._w, self._app_icon)  # type: ignore
-                except Exception:
-                    pass
-
-            if sys.platform == "darwin":
-                try:
-                    self.root.tk.call("tk::mac::iconBitmap", self.root._w, 128, 128, "-kind", "photo", "-photo", self._app_icon)
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[ICON] Error setting app icon: {e}")
+            except tk.TclError:
+                pass
+        except Exception:
+            log.exception("Could not set the Dock icon")
             self._app_icon = None
 
-    def _setup_views(self):
-        """Register all views."""
-        from views.holdings_view import HoldingsView
-        from views.dashboard_view import DashboardView
-        from views.trade_entry_view import TradeEntryView
-        from views.trade_history_view import TradeHistoryView
-        from views.settings_view import SettingsView
-        from views.help_view import HelpView
-        from views.tax_report_view import TaxReportView
-        from views.watchlist_view import WatchlistView
-        from views.valuation_view import ValuationView
-        from views.news_view import NewsView
+    def _report_callback_exception(self, exc, val, tb):
+        """An error inside a button, timer or other Tk callback: log it and tell the user once."""
+        import time
+        log.error("Error in a Tk callback", exc_info=(exc, val, tb))
+        now = time.time()
+        if now - self._last_error_toast > 5:
+            self._last_error_toast = now
+            try:
+                show_toast(self.root, "Something went wrong. The details are in the log "
+                           "(Settings → Show Log).", type="error")
+            except Exception:
+                pass
 
-        self.view_manager.register_view('dashboard', DashboardView)
-        self.view_manager.register_view('holdings', HoldingsView)
-        self.view_manager.register_view('trade_entry', TradeEntryView)
-        self.view_manager.register_view('trade_history', TradeHistoryView)
-        self.view_manager.register_view('settings', SettingsView)
-        self.view_manager.register_view('help', HelpView)
-        self.view_manager.register_view('tax', TaxReportView)
-        self.view_manager.register_view('watchlist', WatchlistView)
-        self.view_manager.register_view('valuation', ValuationView)
-        self.view_manager.register_view('news', NewsView)
+    def _setup_views(self):
+        """Register all views as lazy import strings — modules are only imported
+        the first time a user navigates to that view, not at startup."""
+        self.view_manager.register_view('dashboard',     'views.dashboard_view.DashboardView')
+        self.view_manager.register_view('holdings',      'views.holdings_view.HoldingsView')
+        self.view_manager.register_view('trade_entry',   'views.trade_entry_view.TradeEntryView')
+        self.view_manager.register_view('trade_history', 'views.trade_history_view.TradeHistoryView')
+        self.view_manager.register_view('settings',      'views.settings_view.SettingsView')
+        self.view_manager.register_view('help',          'views.help_view.HelpView')
+        self.view_manager.register_view('tax',           'views.tax_report_view.TaxReportView')
+        self.view_manager.register_view('broker_report', 'views.broker_report_view.BrokerReportView')
+        self.view_manager.register_view('watchlist',     'views.watchlist_view.WatchlistView')
+        self.view_manager.register_view('valuation',     'views.valuation_view.ValuationView')
+        self.view_manager.register_view('news',          'views.news_view.NewsView')
 
     def navigate(self, view_idx: int):
         """Navigate to a view by index."""
-        views = ['dashboard', 'holdings', 'trade_entry', 'trade_history', 'tax', 'watchlist', 'valuation', 'news', 'settings', 'help']
+        views = ['dashboard', 'holdings', 'trade_entry', 'trade_history', 'tax', 'broker_report', 'watchlist', 'valuation', 'news', 'settings', 'help']
         if 0 <= view_idx < len(views):
             try:
                 if hasattr(self, "sidebar") and hasattr(self.sidebar, "set_active"):
                     self.sidebar.set_active(view_idx)
                 self.view_manager.show_view(views[view_idx])
-            except Exception as e:
-                print(f"Error loading view {views[view_idx]}: {e}")
+            except Exception:
+                log.exception("Error loading view %s", views[view_idx])
+                show_toast(self.root, f"Couldn't open {views[view_idx].replace('_', ' ').title()}. "
+                           "The details are in the log.", type="error")
 
 def main():
     """Application entry point."""
+    setup_logging()
     _install_macos_openpanel_stderr_filter()
 
     # Enable High-DPI awareness on Windows before creating the root window
@@ -1329,12 +1366,14 @@ def main():
             pass
 
     root = tk.Tk()
-    # Cleanup on exit
+    # The red close button (and ⌘W) hides the window, as Mac apps do; clicking
+    # the Dock icon brings it back. ⌘Q and the ⏻ button quit.
     def on_closing():
-        root.iconify()
+        root.withdraw()
 
     def on_reopen():
         root.deiconify()
+        root.lift()
 
     root.protocol("WM_DELETE_WINDOW", on_closing)
 
@@ -1345,10 +1384,14 @@ def main():
         pass
 
     app = PTrackerApp(root)
+    root.bind_all("<Command-w>", lambda _e: on_closing())
+    try:
+        root.createcommand("tk::mac::Quit", app.sidebar._do_quit)
+    except Exception:
+        pass
     root.mainloop()
 
 # source .venv/bin/activate
 # python3 -m PyInstaller --noconfirm PortfolioTrack.spec
-# /usr/local/bin/pip3.14 install tkcalendar --break-system-packages
 if __name__ == '__main__':
     main()

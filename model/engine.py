@@ -6,6 +6,33 @@ import math
 import threading
 import concurrent.futures
 
+_bad_dates_logged: set = set()
+
+
+def _trade_date(date_str, *context):
+    """Parse a stored trade date (YYYY-MM-DD). Returns None for a bad date, logged once.
+
+    One malformed date (e.g. "15/01/2024") used to abort the whole holdings
+    rebuild, or turn the overall XIRR into 0.00% without any warning.
+    """
+    try:
+        return datetime.strptime(str(date_str), '%Y-%m-%d')
+    except (TypeError, ValueError):
+        key = (str(date_str),) + tuple(str(c) for c in context)
+        if key not in _bad_dates_logged:
+            _bad_dates_logged.add(key)
+            from model.applog import log
+            log.warning("Skipping a trade with an unreadable date %r %s", date_str, " ".join(map(str, context)))
+        return None
+
+
+def _fast_parse_date(date_str: str) -> datetime:
+    """Helper to parse YYYY-MM-DD date strings up to 50x faster than strptime."""
+    try:
+        return datetime(int(date_str[:4]), int(date_str[5:7]), int(date_str[8:10]))
+    except Exception:
+        return datetime.strptime(date_str, '%Y-%m-%d')
+
 # ── Trade history materialized calculations (trade_calcs) ───────────────────
 _trade_calcs_lock = threading.Lock()
 _trade_calcs_built_this_session = False
@@ -210,6 +237,15 @@ def get_stored_dashboard_metrics() -> dict | None:
 _fx_cache: dict[str, float] = {}
 _fx_cache_ts: float = 0.0
 _FX_CACHE_TTL = 60.0  # seconds
+_fx_estimated: set[str] = set()   # currencies currently using a built-in guess
+
+
+def get_fx_estimates() -> set[str]:
+    """Currencies whose rate to INR is a built-in guess because no rate has been fetched yet.
+
+    Screens that convert currencies should say "≈ estimated rate" when this is not empty.
+    """
+    return set(_fx_estimated)
 
 def _warm_fx_cache() -> None:
     """Pre-load all exchange rates in a single DB query."""
@@ -225,6 +261,7 @@ def _warm_fx_cache() -> None:
                     code = sym.replace("INR=X", "").strip()
                     if code:
                         _fx_cache[code] = rate
+                        _fx_estimated.discard(code)
         _fx_cache["INR"] = 1.0
         _fx_cache_ts = time.time()
     except Exception:
@@ -263,12 +300,16 @@ def get_exchange_rate(currency: str) -> float:
                 rate = float(row[0]) if row[0] and float(row[0]) > 0 else float(row[1] or 0)
                 if rate > 0:
                     _fx_cache[currency] = rate
+                    _fx_estimated.discard(currency)
                     return rate
     except Exception:
         pass
 
-    # Fallback hardcoded values if not yet fetched
+    # Built-in guesses, used only until a real rate has been fetched; flagged so
+    # the screens can show "≈ estimated rate" instead of presenting them as exact.
     fallbacks = {"JPY": 0.55, "USD": 83.5, "GBP": 105.0, "CNY": 11.5}
+    if currency in fallbacks:
+        _fx_estimated.add(currency)
     return fallbacks.get(currency, 1.0)
 
 def calculate_intrinsic_value(eps: float, growth_rate: float = 0.12, discount_rate: float = 0.10, terminal_multiple: float = 15.0) -> float:
@@ -364,7 +405,10 @@ def calculate_xirr(cashflows, guesses=None, max_iter=100, tol=1e-4) -> float:
     base_date = cashflows[0][0]
     day_fracs = [(cf[0] - base_date).days / 365.25 for cf in cashflows]
 
+    import time
     for guess in guesses:
+        # Yield GIL so the Tkinter main thread stays responsive!
+        time.sleep(0.001)
         rate = guess
         for _ in range(max_iter):
             if rate <= -0.999: rate = -0.999
@@ -498,7 +542,8 @@ def fetch_and_update_market_data(symbols: list):
     marketdata_records = []
     assets_records = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
+    # 8 workers: enough to overlap network waits without 25 threads competing for the GIL
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(_fetch_single_ticker, yf_sym, orig_sym, now): orig_sym 
                    for yf_sym, orig_sym in zip(yf_symbols, symbols)}
 
@@ -516,7 +561,7 @@ def fetch_and_update_market_data(symbols: list):
                     marketdata_records.append((sym, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '', '', '', now))
                     assets_records.append((sym, 0.0, "N/A", 0.0, 0.0, 0.0, now))
                     if future in futures: del futures[future]
-        except Exception as e:
+        except Exception:
             # Catch unexpected loop failures (like KeyboardInterrupt)
             pass
 
@@ -593,18 +638,24 @@ def rebuild_holdings(*, sync_trade_calcs: bool = True):
 
             holdings_dict = {}
 
-            for broker, trade_id, date_str, symbol, t_type, qty, price, fee, currency in cursor.fetchall():
+            import time
+            for i, (broker, trade_id, date_str, symbol, t_type, qty, price, fee, currency) in enumerate(cursor.fetchall()):
+                if i % 1000 == 0:
+                    time.sleep(0.001) # Yield GIL for Tkinter responsiveness
                 key = (broker, symbol)
                 qty = float(qty)
                 price = float(price)
                 fee = float(fee or 0.0)
+
+                trade_date = _trade_date(date_str, broker, trade_id, symbol)
+                if trade_date is None:
+                    continue
 
                 if key not in holdings_dict:
                     holdings_dict[key] = {'qty': 0.0, 'cost': 0.0, 'realized_pnl': 0.0, 'cfs': [], 'earliest_date': date_str, 'total_fees': 0.0, 'currency': currency or 'INR'}
 
                 h = holdings_dict[key]
 
-                trade_date = datetime.strptime(date_str, '%Y-%m-%d')
                 if date_str < h['earliest_date']:
                     h['earliest_date'] = date_str
 
@@ -676,16 +727,19 @@ def rebuild_holdings(*, sync_trade_calcs: bool = True):
             records_to_insert.append((broker, symbol, data['qty'], avg_price, data['realized_pnl'], running_pnl, xirr_val, cagr_val, data['earliest_date'], data['total_fees'], data['currency']))
 
 
-        # Rebuild holdings table
-        cursor2 = conn.cursor()
-        cursor2.execute("DELETE FROM holdings")
-        cursor2.executemany('''
-            INSERT INTO holdings (broker, symbol, qty, avg_price, realized_pnl, running_pnl, xirr, cagr, earliest_date, total_fees, currency)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', records_to_insert)
+        # Rebuild the holdings table in one committed transaction. (This used to run
+        # after the session above had closed, so it was only saved when some later
+        # call happened to commit, and the table stayed write-locked until then.)
+        with db_session() as conn:
+            cursor2 = conn.cursor()
+            cursor2.execute("DELETE FROM holdings")
+            cursor2.executemany('''
+                INSERT INTO holdings (broker, symbol, qty, avg_price, realized_pnl, running_pnl, xirr, cagr, earliest_date, total_fees, currency)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', records_to_insert)
 
     # After rebuilding holdings, also update and save dashboard metrics
-    new_metrics = get_dashboard_metrics(force_refresh=True)
+    new_metrics = get_dashboard_metrics(force_refresh=True, _rebuild=False)
     save_dashboard_metrics(new_metrics)
     invalidate_all_caches()
 
@@ -826,9 +880,14 @@ def calculate_overall_xirr(conn=None, broker_filter: str | None = None, currency
         
         # Convert trades to cash flows
         cashflows = []
-        for trade in trades:
+        import time
+        for i, trade in enumerate(trades):
+            if i % 1000 == 0:
+                time.sleep(0.001) # Yield GIL
             date_str, trade_type, qty, price, fee = trade
-            trade_date = datetime.strptime(date_str, '%Y-%m-%d')
+            trade_date = _trade_date(date_str)
+            if trade_date is None:
+                continue
             
             if trade_type == 'BUY':
                 # BUY: negative cash flow (money goes out)
@@ -850,13 +909,28 @@ def calculate_overall_xirr(conn=None, broker_filter: str | None = None, currency
         # Calculate true XIRR using Newton-Raphson
         return calculate_xirr(cashflows)
         
-    except Exception as e:
+    except Exception:
         pass
         return 0.0
 
 
-def get_dashboard_metrics(force_refresh: bool = False, currency_filter: str = "All") -> dict:
-    """Retrieve dashboard metrics (cached unless force_refresh=True)."""
+def get_dashboard_metrics(force_refresh: bool = False, broker_filter: str = None, currency_filter: str = "All", _rebuild: bool = True) -> dict:
+    """Calculates high-level metrics for the dashboard KPI cards."""
+    # Check if holdings are completely empty. If so, we must rebuild them to show data.
+    has_holdings = False
+    try:
+        with db_session() as conn:
+            has_holdings = conn.cursor().execute("SELECT 1 FROM holdings LIMIT 1").fetchone() is not None
+    except Exception:
+        pass
+
+    if (force_refresh or not has_holdings) and _rebuild:
+        # Rebuild holdings best-effort
+        try:
+            rebuild_holdings(sync_trade_calcs=False)
+        except Exception:
+            pass
+
     # 1. Check in-memory cache (thread-safe read)
     with _cache_lock:
         # "Calculate once" policy: keep cached metrics until explicitly invalidated
@@ -883,13 +957,14 @@ def get_dashboard_metrics(force_refresh: bool = False, currency_filter: str = "A
                 h.running_pnl,
                 h.realized_pnl,
                 h.earliest_date,
-                h.currency
+                h.currency,
+                COALESCE(m.previous_close, COALESCE(NULLIF(m.current_price, 0.0), h.avg_price))
             FROM holdings h
             LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE h.qty > 0 OR h.running_pnl != 0
         ''')
         
-        invested = current_val = overall_pnl = overall_loss = unrealized_loss = 0.0
+        invested = current_val = overall_pnl = overall_loss = unrealized_loss = day_pnl = 0.0
         earliest_date = None
         
         for row in cursor.fetchall():
@@ -900,6 +975,7 @@ def get_dashboard_metrics(force_refresh: bool = False, currency_filter: str = "A
             real_pnl = float(row[4] or 0.0)
             date_str = row[5]
             currency = str(row[6] or 'INR').strip().upper()
+            prev_close = float(row[7] or 0.0)
             
             if currency_filter != "All" and currency != currency_filter.upper():
                 continue
@@ -909,10 +985,12 @@ def get_dashboard_metrics(force_refresh: bool = False, currency_filter: str = "A
             row_inv = (qty * avg_price) * rate
             row_cur = (qty * mkt_price) * rate
             row_unrealized = row_cur - row_inv
+            row_day_pnl = (qty * (mkt_price - prev_close)) * rate
             
             invested += row_inv
             current_val += row_cur
             overall_pnl += running_pnl * rate
+            day_pnl += row_day_pnl
             
             if real_pnl < 0:
                 overall_loss += real_pnl * rate
@@ -944,7 +1022,7 @@ def get_dashboard_metrics(force_refresh: bool = False, currency_filter: str = "A
         "total_invested": invested, "total_value": current_val,
         "overall_pnl": overall_pnl, "unrealized_pnl": unrealized_pnl,
         "realized_pnl": realized_pnl, "realized_loss": realized_loss, "unrealized_loss": unrealized_loss,
-        "overall_xirr": overall_xirr, "overall_cagr": overall_cagr
+        "overall_xirr": overall_xirr, "overall_cagr": overall_cagr, "day_pnl": day_pnl
     }
     with _cache_lock:
         _metrics_cache["data"], _metrics_cache["ts"] = result, time.time()
@@ -968,7 +1046,8 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
                 h.running_pnl,
                 h.realized_pnl,
                 h.earliest_date,
-                h.currency
+                h.currency,
+                COALESCE(m.previous_close, COALESCE(NULLIF(m.current_price, 0.0), h.avg_price))
             FROM holdings h
             LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE (h.qty > 0 OR h.running_pnl != 0)
@@ -987,7 +1066,7 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
             if broker not in broker_metrics:
                 broker_metrics[broker] = {
                     "invested": 0.0, "current_val": 0.0, "overall_pnl": 0.0,
-                    "overall_loss": 0.0, "unrealized_loss": 0.0, "earliest_date": None
+                    "overall_loss": 0.0, "unrealized_loss": 0.0, "day_pnl": 0.0, "earliest_date": None
                 }
                 
             metrics = broker_metrics[broker]
@@ -998,16 +1077,19 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
             real_pnl = float(row[5] or 0.0)
             date_str = row[6]
             currency = str(row[7] or 'INR').strip().upper()
+            prev_close = float(row[8] or 0.0)
             
             rate = 1.0 # Broker metrics are kept in their native currency
             
             row_inv = (qty * avg_price) * rate
             row_cur = (qty * mkt_price) * rate
             row_unrealized = row_cur - row_inv
+            row_day_pnl = (qty * (mkt_price - prev_close)) * rate
             
             metrics["invested"] += row_inv
             metrics["current_val"] += row_cur
             metrics["overall_pnl"] += running_pnl * rate
+            metrics["day_pnl"] += row_day_pnl
             
             if real_pnl < 0:
                 metrics["overall_loss"] += real_pnl * rate
@@ -1047,13 +1129,13 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
                 "overall_pnl": overall_pnl, "unrealized_pnl": unrealized_pnl,
                 "realized_pnl": realized_pnl, "realized_loss": overall_loss, "unrealized_loss": unrealized_loss,
                 "overall_xirr": overall_xirr, "overall_cagr": overall_cagr,
+                "day_pnl": metrics.get("day_pnl", 0.0),
                 "currency": currency
             }
 
     with _cache_lock:
         _broker_metrics_cache["data"], _broker_metrics_cache["ts"] = final_broker_metrics, time.time()
         _broker_metrics_cache["currency"] = currency_filter
-    return final_broker_metrics
     return final_broker_metrics
 
 def get_top_worst_performers(limit: int = 3, currency_filter: str = "All") -> dict:
@@ -1147,6 +1229,83 @@ def get_actionable_insights(limit: int = 10, currency_filter: str = "All") -> li
         _insights_cache["currency"] = currency_filter
     return result
 
+def get_watchlist_alerts(currency_filter: str = "All", fill_to: int = 0) -> list:
+    """Watchlist stocks marked Accumulate or Strong Buy, with PE and EPS.
+
+    With fill_to, a shorter list is topped up with the other watchlist stocks
+    (never "Avoid") that have the most upside to their target; those items
+    carry "watch": True so the Dashboard can show them as "watching".
+    """
+    
+    def _parse_num(val_str) -> float:
+        """'₹1,313.2', '¥7030', '$1298.9' (older Auto-Fill values) -> 1313.2 etc."""
+        import re
+        if not val_str:
+            return 0.0
+        try:
+            return float(re.sub(r"[^0-9.\-]", "", str(val_str)) or 0)
+        except ValueError:
+            return 0.0
+            
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT w.symbol, w.target_price, COALESCE(NULLIF(m.current_price, 0.0), m.previous_close, 0.0) as current_price,
+                   COALESCE(NULLIF(m.pe_ratio, 0.0), NULLIF(w.pe_ratio, '0'), NULLIF(w.pe_ratio, '0.0'), w.pe_ratio) as pe_ratio,
+                   COALESCE(NULLIF(m.eps, 0.0), NULLIF(w.eps, '0'), NULLIF(w.eps, '0.0'), w.eps) as eps,
+                   w.analyst_target, w.intrinsic_value, COALESCE(w.action_signal, '')
+            FROM watchlist w
+            LEFT JOIN marketdata m ON w.symbol = m.symbol
+        ''')
+        rows = cursor.fetchall()
+        
+        alerts, watching = [], []
+        for r in rows:
+            symbol, target, current, pe, eps, analyst_t, intrinsic_v, signal = r
+            is_alert = "Accumulate" in signal or "Strong Buy" in signal
+            if not is_alert and (not fill_to or "Avoid" in signal):
+                continue
+            
+            # The exchange suffix decides the currency (.T = Tokyo); the symbol
+            # stored with old values could be wrong (e.g. "$" on NSE stocks)
+            sym = str(symbol).upper()
+            currency = "INR"
+            if sym.endswith(".T") or (sym.isdigit() and len(sym) == 4) \
+                    or "¥" in str(analyst_t) or "¥" in str(intrinsic_v):
+                currency = "JPY"
+                
+            if currency_filter != "All" and currency != currency_filter.upper():
+                continue
+            
+            # Fallbacks for target price
+            if not target or target <= 0:
+                target = _parse_num(analyst_t)
+            if not target or target <= 0:
+                target = _parse_num(intrinsic_v)
+                
+            diff = target - current if target > 0 and current > 0 else 0
+            # signed: negative when the price is already above the target
+            pct = (diff / current) * 100 if current > 0 and target > 0 else 0
+            if not is_alert and not (target > 0 and current > 0):
+                continue
+            (alerts if is_alert else watching).append({
+                "symbol": symbol,
+                "target_price": target,
+                "current_price": current,
+                "pe": pe if pe else "-",
+                "eps": eps if eps else "-",
+                "diff": diff,
+                "pct_below": pct,
+                "currency": currency,
+                "watch": not is_alert,
+            })
+        
+        alerts.sort(key=lambda x: x["symbol"])
+        if len(alerts) < fill_to:
+            watching.sort(key=lambda x: -x["pct_below"])
+            alerts += watching[:fill_to - len(alerts)]
+        return alerts
+
 def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0, currency_filter: str = "All") -> list:
     # Use parameter-keyed cache so different thresholds don't return wrong data
     with _cache_lock:
@@ -1212,8 +1371,15 @@ def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0, currency_f
                     if lots[key][0]['qty'] <= 1e-6:
                         lots[key].pop(0)
         
+        # Solve N+1 query: Fetch all holdings avg_prices in a single query
+        cursor.execute("SELECT broker, symbol, avg_price FROM holdings")
+        holding_avg_prices = {(row[0], row[1]): float(row[2] or 0.0) for row in cursor.fetchall()}
+
         # Analyze remaining FIFO lots for unrealized losses
-        for (broker, symbol), remaining_lots in lots.items():
+        import time
+        for i, ((broker, symbol), remaining_lots) in enumerate(lots.items()):
+            if i % 50 == 0:
+                time.sleep(0.001) # Yield GIL
             if not remaining_lots:
                 continue
 
@@ -1228,10 +1394,8 @@ def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0, currency_f
                 
             current_price = prices.get(symbol)
             if not current_price:
-                # Fallback to simple average if no market price at all
-                cursor.execute("SELECT avg_price FROM holdings WHERE broker=? AND symbol=?", (broker, symbol))
-                row = cursor.fetchone()
-                current_price = float(row[0]) if row else 0.0
+                # Optimized fallback: fetch from in-memory dict instead of db query
+                current_price = holding_avg_prices.get((broker, symbol), 0.0)
                 
             if current_price == 0.0:
                 continue
@@ -1270,3 +1434,63 @@ def get_tax_harvesting_opportunities(min_loss_amount: float = 1000.0, currency_f
     return opportunities
 
 
+
+def get_daily_gainers_losers(limit: int = 10, currency_filter: str = "All") -> tuple[list, list]:
+    """
+    Returns the top daily gainers and losers from the active portfolio.
+    Calculates the % change based on current_price vs previous_close.
+    Deduplicates symbols across multiple brokers.
+    Returns (top_gainers, top_losers).
+    """
+    with db_session() as conn:
+        cursor = conn.cursor()
+        query = '''
+            SELECT h.symbol, h.broker, m.current_price, m.previous_close, h.currency
+            FROM holdings h
+            JOIN marketdata m ON h.symbol = m.symbol
+            WHERE h.qty > 0
+        '''
+        params = []
+        if currency_filter != "All":
+            query += " AND h.currency = ?"
+            params.append(currency_filter.upper())
+            
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+    symbol_dict = {}
+    for row in rows:
+        symbol, broker, cp, pc, currency = row
+        if not cp or not pc or pc <= 0:
+            continue
+        if symbol not in symbol_dict:
+            price_change = cp - pc
+            pct_change = (price_change / pc) * 100
+            symbol_dict[symbol] = {
+                "symbol": symbol,
+                "brokers": [broker],
+                "current_price": cp,
+                "prev_close": pc,
+                "price_change": price_change,
+                "pct_change": pct_change,
+                "currency": currency
+            }
+        else:
+            if broker and broker not in symbol_dict[symbol]["brokers"]:
+                symbol_dict[symbol]["brokers"].append(broker)
+                
+    stocks = []
+    for item in symbol_dict.values():
+        item["broker"] = ", ".join(item["brokers"])
+        stocks.append(item)
+        
+    # Sort for gainers (highest pct_change first)
+    gainers = sorted(stocks, key=lambda x: x["pct_change"], reverse=True)
+    # Sort for losers (lowest pct_change first)
+    losers = sorted(stocks, key=lambda x: x["pct_change"])
+    
+    # Filter out 0% change or negative from gainers, and 0% change or positive from losers
+    top_gainers = [s for s in gainers if s["pct_change"] > 0][:limit]
+    top_losers = [s for s in losers if s["pct_change"] < 0][:limit]
+    
+    return top_gainers, top_losers

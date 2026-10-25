@@ -1,17 +1,374 @@
 """
 Valuation View - Standalone Stock Analysis & Valuation view.
 Allows users to enter a symbol, fetch metrics, compute intrinsic value, and see a buy/sell signal.
+
+All network work (Yahoo Finance, Screener.in) runs in a background thread
+through collect_valuation_data(); the Tk thread only formats and shows the
+result. Only one analysis runs at a time.
+
+The module-level helpers yf_symbol_candidates(), resolve_ticker(),
+fetch_screener_ratios() and dividend_yield_pct() are shared with the
+Watchlist view, so both pages find the same Yahoo symbol for what you type.
 """
 from __future__ import annotations
 
-import threading
+import math
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 
+from model.applog import log
 from views.base_view import BaseView, _enable_canvas_mousewheel
-from ui_theme import ModernStyle
-from ui_widgets import ModernButton, LoadingOverlay, ModernCard, ModernEntry
+from ui.ui_theme import ModernStyle
+from ui.ui_widgets import ModernButton, LoadingOverlay, ModernCard, ModernEntry
+from ui.ui_utils import run_in_background
 import pandas as pd
+
+
+CURRENCY_SYMBOLS = {"INR": "₹", "JPY": "¥", "CNY": "¥", "GBP": "£", "USD": "$", "EUR": "€"}
+
+
+# ── Shared Yahoo Finance helpers (used by the Watchlist view too) ─────────────
+
+def yf_symbol_candidates(symbol: str) -> list[str]:
+    """Yahoo symbols to try for what the user typed, best guess first.
+
+        AAPL      -> AAPL, AAPL.NS, AAPL.BO   (as typed first: US and other listings)
+        RELIANCE  -> RELIANCE, RELIANCE.NS, RELIANCE.BO
+        7203      -> 7203.T                   (4-digit codes are Tokyo listings)
+        TCS.NS, ^N225, USDINR=X -> as typed   (already a full Yahoo symbol)
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return []
+    if any(ch in s for ch in ".^="):
+        return [s]
+    if len(s) == 4 and s.isdigit():
+        return [s + ".T"]
+    return [s, s + ".NS", s + ".BO"]
+
+
+def _has_price(info) -> bool:
+    if not isinstance(info, dict):
+        return False
+    return any(info.get(k) not in (None, 0, "") for k in ("regularMarketPrice", "currentPrice", "previousClose"))
+
+
+def resolve_ticker(symbol: str):
+    """Return (info, yf_symbol, ticker) for the first candidate Yahoo has prices for.
+
+    Network calls: one .info request per candidate tried. Run in a background thread.
+    Raises LookupError with a message for the user when nothing is found.
+    """
+    import yfinance as yf
+
+    candidates = yf_symbol_candidates(symbol)
+    errors = 0
+    for cand in candidates:
+        try:
+            ticker = yf.Ticker(cand)
+            info = ticker.info or {}
+        except Exception as exc:
+            errors += 1
+            log.debug("Yahoo lookup of %s failed: %s", cand, exc)
+            continue
+        if _has_price(info):
+            return info, cand, ticker
+    if candidates and errors == len(candidates):
+        raise LookupError(f"Couldn't reach Yahoo Finance for {symbol}. Check the internet connection and try again.")
+    raise LookupError(f"No price data found for {symbol} (tried {', '.join(candidates) or symbol}).")
+
+
+def currency_symbol(info: dict, yf_symbol: str = "") -> str:
+    code = str((info or {}).get("currency") or "").upper()
+    if code in CURRENCY_SYMBOLS:
+        return CURRENCY_SYMBOLS[code]
+    if yf_symbol.upper().endswith(".T"):
+        return "¥"
+    if yf_symbol.upper().endswith((".NS", ".BO")):
+        return "₹"
+    return "$"
+
+
+def dividend_yield_pct(info: dict) -> float | None:
+    """Dividend yield in percent (2.5 means 2.5 %).
+
+    yfinance 1.x reports `dividendYield` already in percent (older versions
+    used a fraction), so the yield is worked out from the dividend rate and
+    the price when possible, and only then taken from the yield fields.
+    """
+    info = info or {}
+    rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
+    price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+    try:
+        if rate and price and float(price) > 0:
+            return float(rate) / float(price) * 100.0
+    except (TypeError, ValueError):
+        pass
+    dy = info.get("dividendYield")
+    if dy is not None:
+        try:
+            return float(dy)
+        except (TypeError, ValueError):
+            pass
+    tdy = info.get("trailingAnnualDividendYield")
+    try:
+        return float(tdy) * 100.0 if tdy is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_screener_ratios(yf_symbol: str) -> dict:
+    """ROE, ROCE and P/E from Screener.in for NSE/BSE symbols (yfinance often lacks them).
+
+    Network call; run in a background thread. Returns {} on any failure.
+    """
+    if not yf_symbol.upper().endswith((".NS", ".BO")):
+        return {}
+    base_sym = yf_symbol.rsplit(".", 1)[0]
+    fallback: dict = {}
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(f"https://www.screener.in/company/{base_sym}/consolidated/", headers=headers, timeout=5)
+        if r.status_code != 200:
+            r = requests.get(f"https://www.screener.in/company/{base_sym}/", headers=headers, timeout=5)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            ratios = soup.find("ul", id="top-ratios") or soup.find("div", class_="company-ratios")
+            if ratios:
+                for item in ratios.find_all("li"):
+                    name = item.find("span", class_="name")
+                    val = item.find("span", class_="number")
+                    if name and val:
+                        try:
+                            fallback[name.text.strip().lower()] = float(val.text.strip().replace(",", ""))
+                        except ValueError:
+                            pass
+    except Exception as exc:
+        log.debug("Screener.in lookup for %s failed: %s", base_sym, exc)
+    return fallback
+
+
+def _safe(fn, default=None):
+    """Run a yfinance property access, returning `default` when it fails."""
+    try:
+        return fn()
+    except Exception as exc:
+        log.debug("yfinance call failed: %s", exc)
+        return default
+
+
+def _cagr(series, periods: int):
+    """Compound growth in percent between series[periods] (old) and series[0] (new)."""
+    try:
+        if len(series) <= periods:
+            return None
+        new, old = float(series.iloc[0]), float(series.iloc[periods])
+        if old > 0 and new > 0:
+            return ((new / old) ** (1 / periods) - 1) * 100
+    except Exception:
+        pass
+    return None
+
+
+def collect_valuation_data(symbol: str) -> dict:
+    """Fetch everything the Valuation page shows. BACKGROUND THREAD ONLY.
+
+    Returns a plain dict of raw numbers (no Tk objects). Raises LookupError
+    when Yahoo has no data for the symbol.
+    """
+    info, yf_symbol, ticker = resolve_ticker(symbol)
+    log.debug("Valuation: %s resolved to %s (%d info keys)", symbol, yf_symbol, len(info))
+
+    cy = currency_symbol(info, yf_symbol)
+    raw: dict = {"yf_symbol": yf_symbol, "currency_symbol": cy,
+                 "currency": str(info.get("currency") or "").upper()}
+
+    def extract(key, val):
+        raw[key] = val
+        return val
+
+    # ── Historical data: 1 year is all the technicals use ─────────────────────
+    hist = _safe(lambda: ticker.history(period="1y"), pd.DataFrame())
+    rsi_val = sharpe_val = macd_val = supp_res = None
+    ma50_hist = ma200_hist = None
+    if hist is not None and not hist.empty and len(hist) >= 30:
+        close = hist["Close"]
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0.0).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        rsi_last = (100 - (100 / (1 + rs))).iloc[-1]
+        if pd.notna(rsi_last):
+            rsi_val = float(rsi_last)
+
+        macd_line = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        if pd.notna(macd_line.iloc[-1]) and pd.notna(signal_line.iloc[-1]):
+            macd_val = float(macd_line.iloc[-1] - signal_line.iloc[-1])
+
+        lo, hi = hist["Low"].tail(60).min(), hist["High"].tail(60).max()
+        if pd.notna(lo) and pd.notna(hi):
+            supp_res = (float(lo), float(hi))
+
+        returns = close.pct_change().dropna()
+        if len(returns) > 20:
+            excess = returns - 0.04 / 252
+            if excess.std() > 0:
+                sharpe_val = float((excess.mean() / excess.std()) * (252 ** 0.5))
+
+        if len(hist) >= 50:
+            ma50_hist = float(close.tail(50).mean())
+        if len(hist) >= 200:
+            ma200_hist = float(close.tail(200).mean())
+    log.debug("Valuation %s technicals: RSI=%s MACD=%s Sharpe=%s", yf_symbol, rsi_val, macd_val, sharpe_val)
+
+    scr_data = fetch_screener_ratios(yf_symbol)
+    log.debug("Valuation %s: %d Screener.in ratios", yf_symbol, len(scr_data))
+
+    # ── Current price ─────────────────────────────────────────────────────────
+    cur_price = 0.0
+    last = _safe(lambda: float(ticker.fast_info.last_price))
+    if last is not None and not math.isnan(last):
+        cur_price = last
+    if cur_price <= 0.0:
+        cur_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose") or 0.0
+    extract("current_price", cur_price)
+
+    extract("company_name", info.get("longName") or info.get("shortName"))
+
+    # ── Valuation multiples ───────────────────────────────────────────────────
+    extract("pe_ratio",       info.get("trailingPE") or scr_data.get("stock p/e"))
+    extract("forward_pe",     info.get("forwardPE"))
+    extract("peg_ratio",      info.get("pegRatio") or info.get("trailingPegRatio"))
+    extract("pb_ratio",       info.get("priceToBook"))
+    extract("price_to_sales", info.get("priceToSalesTrailing12Months"))
+    extract("beta",           info.get("beta"))
+    extract("market_cap",     info.get("marketCap"))
+    extract("enterprise_value", info.get("enterpriseValue"))
+    extract("analyst_target", info.get("targetMeanPrice"))
+    extract("dividend_yield", dividend_yield_pct(info))
+    payout = info.get("payoutRatio")
+    extract("payout_ratio",   payout * 100 if payout is not None else None)
+
+    # ── Profitability ─────────────────────────────────────────────────────────
+    eps_raw = info.get("trailingEps")
+    extract("eps", eps_raw)
+    roe = info.get("returnOnEquity")
+    extract("roe", roe * 100 if roe is not None else scr_data.get("roe"))
+    roa = info.get("returnOnAssets")
+    extract("roa", roa * 100 if roa is not None else None)
+
+    # Annual income statement: fetched ONCE, used for ROCE and the CAGRs
+    fin = _safe(lambda: ticker.financials, pd.DataFrame())
+    if fin is None:
+        fin = pd.DataFrame()
+
+    def _row(df, *labels):
+        for lbl in labels:
+            if lbl in df.index:
+                v = df.loc[lbl].dropna()
+                return float(v.iloc[0]) if len(v) else None
+        return None
+
+    # ROCE = EBIT / (Total Assets - Current Liabilities)
+    roce_val = scr_data.get("roce")
+    if roce_val is None and not fin.empty:
+        bs = _safe(lambda: ticker.balance_sheet, pd.DataFrame())
+        if bs is not None and not bs.empty:
+            total_assets = _row(bs, "Total Assets", "TotalAssets")
+            curr_liab = _row(bs, "Current Liabilities", "CurrentLiabilities",
+                             "Total Current Liabilities", "TotalCurrentLiabilities")
+            ebit = _row(fin, "EBIT", "Operating Income", "OperatingIncome")
+            if total_assets and curr_liab and ebit and total_assets - curr_liab > 0:
+                roce_val = ebit / (total_assets - curr_liab) * 100
+    extract("roce", roce_val)
+
+    for key, field in (("opm", "operatingMargins"), ("ebitda_margin", "ebitdaMargins"),
+                       ("net_profit_margin", "profitMargins")):
+        v = info.get(field)
+        extract(key, v * 100 if v is not None else None)
+    extract("free_cash_flow", info.get("freeCashflow"))
+
+    # ── Health ────────────────────────────────────────────────────────────────
+    debt_eq = info.get("debtToEquity")
+    extract("debt_to_equity", debt_eq / 100 if debt_eq is not None else None)
+    extract("book_value",     info.get("bookValue"))
+    extract("current_ratio",  info.get("currentRatio"))
+    extract("quick_ratio",    info.get("quickRatio"))
+
+    # ── Growth ────────────────────────────────────────────────────────────────
+    rev_gr = info.get("revenueGrowth")
+    extract("sales_growth",  rev_gr * 100 if rev_gr is not None else None)
+    ern_gr = info.get("earningsGrowth")
+    extract("profit_growth", ern_gr * 100 if ern_gr is not None else None)
+    if not fin.empty:
+        if "Total Revenue" in fin.index:
+            revs = fin.loc["Total Revenue"].dropna()
+            extract("revenue_cagr_3y", _cagr(revs, 3))
+            extract("revenue_cagr_5y", _cagr(revs, 5))
+        if "Net Income" in fin.index:
+            incomes = fin.loc["Net Income"].dropna()
+            extract("profit_cagr_3y", _cagr(incomes, 3))
+            extract("profit_cagr_5y", _cagr(incomes, 5))
+
+    # ── Ownership ─────────────────────────────────────────────────────────────
+    insiders = info.get("heldPercentInsiders")
+    extract("promoter_holding",    insiders * 100 if insiders is not None else None)
+    inst = info.get("heldPercentInstitutions")
+    extract("institution_holding", inst * 100 if inst is not None else None)
+    extract("institution_count", None)
+    holders = _safe(lambda: ticker.major_holders)
+    try:
+        if holders is not None and not holders.empty:
+            if "Value" in holders.columns and "institutionsCount" in holders.index:
+                extract("institution_count", int(holders.loc["institutionsCount", "Value"]))
+            elif 1 in holders.columns:
+                count_row = holders[holders[1].str.contains("Number of Institutions", na=False)]
+                if not count_row.empty:
+                    extract("institution_count", int(count_row[0].values[0]))
+    except Exception:
+        pass
+    extract("short_ratio", info.get("shortRatio"))
+
+    # ── Technical ─────────────────────────────────────────────────────────────
+    extract("dma_50",  info.get("fiftyDayAverage") or ma50_hist)
+    extract("dma_200", info.get("twoHundredDayAverage") or ma200_hist)
+    extract("rsi", rsi_val)
+    extract("macd", macd_val)
+    extract("support_resistance", supp_res)
+    extract("sharpe_ratio", sharpe_val)
+    extract("volume", info.get("volume") or info.get("averageVolume"))
+    extract("h52", info.get("fiftyTwoWeekHigh"))
+    extract("l52", info.get("fiftyTwoWeekLow"))
+
+    # ── Intrinsic Value (DCF) and Graham Number ───────────────────────────────
+    if eps_raw and eps_raw > 0:
+        try:
+            from model.engine import calculate_intrinsic_value as _calc_iv
+            iv_val = _calc_iv(eps_raw)
+            if iv_val and iv_val > 0:
+                extract("intrinsic_value", iv_val)
+        except Exception:
+            log.debug("Intrinsic value for %s failed", yf_symbol, exc_info=True)
+    bvps = info.get("bookValue")
+    if eps_raw and bvps and eps_raw > 0 and bvps > 0:
+        extract("graham_number", math.sqrt(22.5 * eps_raw * bvps))
+
+    # ── Latest quarter operating profit ───────────────────────────────────────
+    qf = _safe(lambda: ticker.quarterly_financials, pd.DataFrame())
+    if qf is not None and not qf.empty:
+        for lbl in ("Operating Income", "EBIT", "OperatingIncome"):
+            if lbl in qf.index:
+                op_profit = qf.loc[lbl].iloc[0]
+                if pd.notna(op_profit):
+                    extract("qoq_op_profit", float(op_profit))
+                break
+
+    log.debug("Valuation %s: %d values collected", yf_symbol, len(raw))
+    return raw
 
 
 class ValuationView(BaseView):
@@ -21,7 +378,7 @@ class ValuationView(BaseView):
         self.add_gradient_header(
             self,
             "🔬 Valuation Analysis",
-            "Enter a symbol to fetch parameters and determine if it is undervalued."
+            "Type a symbol (AAPL, RELIANCE or 7203 for Tokyo) and press Enter or Analyze."
         )
 
         self.main_scroll_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
@@ -60,7 +417,7 @@ class ValuationView(BaseView):
         input_card = ModernCard(
             self.scrollable_inner,
             bg=ModernStyle.BG_SECONDARY,
-            highlight_color=ModernStyle.BORDER_COLOR,
+            highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
             highlight_thickness=1,
             radius=10,
             canvas_bg=ModernStyle.BG_PRIMARY
@@ -86,21 +443,19 @@ class ValuationView(BaseView):
             highlightbackground=ModernStyle.BORDER_COLOR,
             insertbackground=ModernStyle.ACCENT_PRIMARY,
         )
-        def _fi(e_evt, w=input_inner, i=self._e_symbol): i.configure(bg="#FFFFFF")
-        def _fo(e_evt, w=input_inner, i=self._e_symbol): i.configure(bg=ModernStyle.ENTRY_BG)
-        self._e_symbol.bind("<FocusIn>", _fi, add="+")
-        self._e_symbol.bind("<FocusOut>", _fo, add="+")
         self._e_symbol.pack(side="left", ipady=5, padx=(0, 15))
-        
-        # Allow hitting Enter to fetch
-        self._e_symbol.bind("<Return>", lambda _: self._fetch_data())
+
+        # Enter starts an analysis too (ignored while one is running)
+        self._fetching = False
+        self._fetch_gen = 0
+        self._e_symbol.bind("<Return>", lambda _e: self._fetch_data())
 
         self._btn_fetch = ModernButton(
-            input_inner, text="⚡ Analyze",
+            input_inner, text="▶ Analyze",
             command=self._fetch_data,
             bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
             canvas_bg=ModernStyle.BG_SECONDARY,
-            width=120, height=40, radius=8,
+            width=140, height=40, radius=8,
             font=ModernStyle.FONT_SUBHEADING,
         )
         self._btn_fetch.pack(side="left")
@@ -126,7 +481,7 @@ class ValuationView(BaseView):
         self.summary_card = ModernCard(
             self.scrollable_inner,
             bg=ModernStyle.BG_SECONDARY,
-            highlight_color=ModernStyle.BORDER_COLOR,
+            highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
             highlight_thickness=1,
             radius=10,
             canvas_bg=ModernStyle.BG_PRIMARY
@@ -179,10 +534,14 @@ class ValuationView(BaseView):
         tk.Label(right_summary, text="Decision Rationale", font=ModernStyle.FONT_SUBHEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
         
         self.txt_rationale = tk.Text(
-            right_summary, height=10, bg=ModernStyle.SLATE_800, fg=ModernStyle.SLATE_300,
-            font=ModernStyle.FONT_HEADING, relief=tk.FLAT,
-            wrap=tk.WORD, padx=12, pady=12
+            right_summary, height=12, bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY,
+            font=ModernStyle.FONT_BODY, relief=tk.FLAT, highlightthickness=0,
+            wrap=tk.WORD, padx=12, pady=10, cursor="arrow",
         )
+        self.txt_rationale.tag_configure("head", font=ModernStyle.FONT_BODY_BOLD, foreground=ModernStyle.TEXT_PRIMARY,
+                                         spacing1=6, spacing3=2)
+        self.txt_rationale.tag_configure("pass", foreground=ModernStyle.SUCCESS)
+        self.txt_rationale.tag_configure("fail", foreground=ModernStyle.ERROR)
         self.txt_rationale.pack(fill="both", expand=True)
         self.txt_rationale.configure(state="disabled")
 
@@ -263,7 +622,7 @@ class ValuationView(BaseView):
         for cat_name, items in categories.items():
             card = ModernCard(
                 self.metrics_frame, bg=ModernStyle.BG_SECONDARY,
-                highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1,
+                highlight_color=ModernStyle.BG_SECONDARY, shadow=True, highlight_thickness=1,
                 radius=10, canvas_bg=ModernStyle.BG_PRIMARY
             )
             card.grid(row=row_idx, column=col_idx, sticky="nsew", padx=8, pady=8)
@@ -323,326 +682,64 @@ class ValuationView(BaseView):
     # ── Fetching Data ─────────────────────────────────────────────────────────
 
     def _fetch_data(self):
+        """Start one analysis. Ignored while another one is still running
+        (the Return key used to bypass the disabled Analyze button)."""
+        if self._fetching:
+            return
         symbol = self._v_symbol.get().strip().upper()
         if not symbol:
             self._flash_status("⚠ Enter a symbol to analyze.", error=True)
             return
-            
-        # Optional NS suffix handling for Indian stocks
-        yf_symbol = symbol
-        if not yf_symbol.endswith('.NS') and not yf_symbol.endswith('.BO'):
-            # If standard Indian symbol length and no dot, default to NSE
-            if len(yf_symbol) < 10 and '.' not in yf_symbol:
-                yf_symbol += '.NS'
 
-        self._btn_fetch.set_text("🔄 Analyzing...")
-        self._btn_fetch.set_disabled(True)
-        self._flash_status(f"Fetching data for {yf_symbol}...")
-        
+        self._fetching = True
+        self._fetch_gen += 1
+        gen = self._fetch_gen
+
+        # The button stays readable while busy; clicks are ignored via _fetching
+        self._btn_fetch.set_text("🔄 Analyzing…")
+        self._flash_status(f"Fetching data for {symbol}…")
         self.loading_overlay.show()
-        self.loading_overlay.set_text(f"Fetching data for {yf_symbol}...")
-        
+        self.loading_overlay.set_text(f"Fetching data for {symbol}…")
+
         # Reset UI
         self.summary_card.pack_forget()
         self.metrics_frame.pack_forget()
-        self._raw_data.clear()
+        self._raw_data = {}
         for var in self._metrics_vars.values():
             var.set("---")
         for lbl in self._metric_labels.values():
             lbl.config(fg=ModernStyle.TEXT_PRIMARY)
 
-        def bg_fetch():
-            try:
-                import yfinance as yf
-                ticker = yf.Ticker(yf_symbol)
-                info = ticker.info
+        run_in_background(
+            lambda: collect_valuation_data(symbol),
+            on_done=lambda raw: self._on_fetch_done(gen, raw),
+            on_error=lambda err: self._on_fetch_failed(gen, symbol, err),
+            widget=self, name="valuation-fetch",
+        )
 
-                if not info or ('regularMarketPrice' not in info and 'currentPrice' not in info and 'previousClose' not in info):
-                    print(f"[ValuationView] No price data for {yf_symbol}. Keys: {list(info.keys())[:10]}")
-                    self.after(0, lambda: self._flash_status(f"⚠ Could not find data for {yf_symbol}.", error=True))
-                    return
-                print(f"[ValuationView] Got info with {len(info)} keys for {yf_symbol}")
+    def _end_fetch(self):
+        self._fetching = False
+        self.loading_overlay.hide()
+        self._btn_fetch.set_text("▶ Analyze")
 
-                # ── Detect currency symbol from exchange ──────────────────────
-                currency = (info.get("currency") or "USD").upper()
-                _cy_map = {"INR": "₹", "JPY": "¥", "CNY": "¥", "GBP": "£", "USD": "$", "EUR": "€"}
-                cy = _cy_map.get(currency, "$")
-                extract_meta = {"cy": cy, "currency": currency}
+    def _on_fetch_done(self, gen: int, raw: dict):
+        if gen != self._fetch_gen:
+            return  # an older request; a newer one owns the page
+        self._end_fetch()
+        self._raw_data = raw
+        self._process_and_display()
 
-                # ── Historical data (RSI, MACD, Sharpe, Support/Resistance) ──
-                hist = ticker.history(period="3y")
-                rsi_val = None
-                sharpe_val = None
-                macd_val = None
-                supp_res = None
-                recent_hist = pd.DataFrame()
-
-                if not hist.empty and len(hist) >= 30:
-                    recent_hist = hist.tail(252)
-
-                    # RSI (14-period)
-                    delta = recent_hist['Close'].diff()
-                    gain = delta.where(delta > 0, 0.0).rolling(window=14).mean()
-                    loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
-                    rs = gain / loss.replace(0, float('nan'))
-                    rsi_series = 100 - (100 / (1 + rs))
-                    rsi_last = rsi_series.iloc[-1]
-                    if pd.notna(rsi_last):
-                        rsi_val = float(rsi_last)
-
-                    # MACD (12/26/9)
-                    exp12 = recent_hist['Close'].ewm(span=12, adjust=False).mean()
-                    exp26 = recent_hist['Close'].ewm(span=26, adjust=False).mean()
-                    macd_line = exp12 - exp26
-                    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-                    if pd.notna(macd_line.iloc[-1]) and pd.notna(signal_line.iloc[-1]):
-                        macd_val = float(macd_line.iloc[-1] - signal_line.iloc[-1])
-
-                    # Support / Resistance (60-day high/low)
-                    recent_min = recent_hist['Low'].tail(60).min()
-                    recent_max = recent_hist['High'].tail(60).max()
-                    supp_res = (float(recent_min), float(recent_max))
-
-                    # Sharpe Ratio (annualised, rf=4%)
-                    returns = recent_hist['Close'].pct_change().dropna()
-                    if len(returns) > 20:
-                        rf = 0.04 / 252
-                        excess_ret = returns - rf
-                        if excess_ret.std() > 0:
-                            sharpe_val = float((excess_ret.mean() / excess_ret.std()) * (252 ** 0.5))
-
-                    # Compute actual 50-Day & 200-Day MA from history if info values missing
-                    if not hist.empty and len(hist) >= 50:
-                        ma50_hist = float(hist['Close'].tail(50).mean())
-                        ma200_hist = float(hist['Close'].tail(200).mean()) if len(hist) >= 200 else None
-                    else:
-                        ma50_hist = None
-                        ma200_hist = None
-
-                print(f"[ValuationView] Computed technicals: RSI={rsi_val}, MACD={macd_val}, Sharpe={sharpe_val}")
-
-                scr_data = self._fetch_screener_fallback(yf_symbol) if yf_symbol.endswith('.NS') or yf_symbol.endswith('.BO') else {}
-                print(f"[ValuationView] Screener data: {scr_data}")
-
-                def extract(key, val):
-                    self._raw_data[key] = val
-                    return val
-
-                # ── Current price ─────────────────────────────────────────────
-                cur_price = 0.0
-                try:
-                    import math
-                    val = float(ticker.fast_info.last_price)
-                    if not math.isnan(val):
-                        cur_price = val
-                except Exception:
-                    pass
-                if cur_price <= 0.0:
-                    cur_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose") or 0.0
-                extract("current_price", cur_price)
-                extract("currency_symbol", cy)
-
-                # ── Identity ──────────────────────────────────────────────────
-                extract("company_name",  info.get("longName") or info.get("shortName"))
-
-                # ── Valuation multiples ───────────────────────────────────────
-                extract("pe_ratio",      info.get("trailingPE")       or scr_data.get("stock p/e"))
-                extract("forward_pe",    info.get("forwardPE"))
-                extract("peg_ratio",     info.get("pegRatio"))
-                extract("pb_ratio",      info.get("priceToBook"))
-                extract("price_to_sales",info.get("priceToSalesTrailing12Months"))
-                extract("beta",          info.get("beta"))
-                extract("market_cap",    info.get("marketCap"))
-                extract("enterprise_value", info.get("enterpriseValue"))
-                extract("analyst_target",info.get("targetMeanPrice"))
-
-                dy = info.get("dividendYield")
-                extract("dividend_yield", dy * 100 if dy is not None else None)
-                payout = info.get("payoutRatio")
-                extract("payout_ratio",  payout * 100 if payout is not None else None)
-
-                # ── Profitability ─────────────────────────────────────────────
-                eps_raw = info.get("trailingEps")
-                extract("eps", eps_raw)
-
-                roe = info.get("returnOnEquity")
-                extract("roe", roe * 100 if roe is not None else scr_data.get("roe"))
-
-                roa = info.get("returnOnAssets")
-                extract("roa", roa * 100 if roa is not None else None)
-
-                # ROCE: computed from financials (EBIT / Capital Employed)
-                # Capital Employed = Total Assets - Current Liabilities
-                roce_val = scr_data.get("roce")  # Indian screener fallback
-                if roce_val is None:
-                    try:
-                        bs  = ticker.balance_sheet
-                        fin = ticker.financials
-                        if not bs.empty and not fin.empty:
-                            # Try multiple label variants across exchanges
-                            def _row(df, *labels):
-                                for lbl in labels:
-                                    if lbl in df.index:
-                                        v = df.loc[lbl].dropna()
-                                        return float(v.iloc[0]) if len(v) else None
-                                return None
-
-                            total_assets = _row(bs, "Total Assets", "TotalAssets")
-                            curr_liab    = _row(bs, "Current Liabilities", "CurrentLiabilities",
-                                                    "Total Current Liabilities", "TotalCurrentLiabilities")
-                            ebit         = _row(fin, "EBIT", "Operating Income", "OperatingIncome")
-
-                            if total_assets and curr_liab and ebit:
-                                cap_employed = total_assets - curr_liab
-                                if cap_employed > 0:
-                                    roce_val = (ebit / cap_employed) * 100
-                    except Exception:
-                        pass
-                extract("roce", roce_val)
-
-                opm = info.get("operatingMargins")
-                extract("opm", opm * 100 if opm is not None else None)
-
-                eb_m = info.get("ebitdaMargins")
-                extract("ebitda_margin", eb_m * 100 if eb_m is not None else None)
-
-                np_m = info.get("profitMargins")
-                extract("net_profit_margin", np_m * 100 if np_m is not None else None)
-
-                extract("free_cash_flow", info.get("freeCashflow"))
-
-                # ── Health ────────────────────────────────────────────────────
-                debt_eq = info.get("debtToEquity")
-                extract("debt_to_equity",  debt_eq / 100 if debt_eq is not None else None)
-                extract("book_value",       info.get("bookValue"))
-                extract("current_ratio",    info.get("currentRatio"))
-                extract("quick_ratio",      info.get("quickRatio"))
-
-                # ── Growth ────────────────────────────────────────────────────
-                rev_gr = info.get("revenueGrowth")
-                extract("sales_growth",  rev_gr * 100 if rev_gr is not None else None)
-                ern_gr = info.get("earningsGrowth")
-                extract("profit_growth", ern_gr * 100 if ern_gr is not None else None)
-
-                # ── Ownership ─────────────────────────────────────────────────
-                insiders = info.get("heldPercentInsiders")
-                extract("promoter_holding",   insiders * 100 if insiders is not None else None)
-                inst = info.get("heldPercentInstitutions")
-                extract("institution_holding", inst * 100 if inst is not None else None)
-
-                extract("institution_count", None)
-                try:
-                    maj_holders = ticker.major_holders
-                    if maj_holders is not None and not maj_holders.empty:
-                        # New yfinance format: index=Breakdown names, column='Value'
-                        if 'Value' in maj_holders.columns and 'institutionsCount' in maj_holders.index:
-                            extract("institution_count", int(maj_holders.loc['institutionsCount', 'Value']))
-                        # Legacy format: columns 0, 1
-                        elif 1 in maj_holders.columns:
-                            count_row = maj_holders[maj_holders[1].str.contains("Number of Institutions", na=False)]
-                            if not count_row.empty:
-                                extract("institution_count", int(count_row[0].values[0]))
-                except Exception:
-                    pass
-
-                extract("short_ratio", info.get("shortRatio"))
-
-                # ── Technical ─────────────────────────────────────────────────
-                dma50  = info.get("fiftyDayAverage")  or (ma50_hist  if not recent_hist.empty else None)
-                dma200 = info.get("twoHundredDayAverage") or (ma200_hist if not recent_hist.empty else None)
-                extract("dma_50",   dma50)
-                extract("dma_200",  dma200)
-                extract("rsi",      rsi_val)
-                extract("macd",     macd_val)
-                extract("support_resistance", supp_res)
-                extract("sharpe_ratio", sharpe_val)
-                extract("volume", info.get("volume") or info.get("averageVolume"))
-
-                h52 = info.get("fiftyTwoWeekHigh")
-                l52 = info.get("fiftyTwoWeekLow")
-                extract("h52", h52)
-                extract("l52", l52)
-
-                # ── Intrinsic Value (DCF) ─────────────────────────────────────
-                iv_val = None
-                try:
-                    from model.engine import calculate_intrinsic_value as _calc_iv
-                    if eps_raw and eps_raw > 0:
-                        iv_val = _calc_iv(eps_raw)
-                        extract("intrinsic_value", iv_val)
-                except Exception:
-                    pass
-
-                # ── Graham Number ─────────────────────────────────────────────
-                bvps = info.get("bookValue")
-                if eps_raw and bvps and eps_raw > 0 and bvps > 0:
-                    try:
-                        import math
-                        extract("graham_number", math.sqrt(22.5 * eps_raw * bvps))
-                    except Exception:
-                        pass
-
-                # ── CAGR from income statement ────────────────────────────────
-                try:
-                    inc_stmt = ticker.financials
-                    if not inc_stmt.empty and "Total Revenue" in inc_stmt.index:
-                        revs = inc_stmt.loc["Total Revenue"].dropna()
-                        if len(revs) >= 4:
-                            y0, y3 = revs.iloc[0], revs.iloc[3]
-                            if y3 and y3 > 0:
-                                extract("revenue_cagr_3y", (((y0 / y3) ** (1/3)) - 1) * 100)
-                        if len(revs) >= 5:
-                            periods = min(5, len(revs) - 1)
-                            y5 = revs.iloc[periods]
-                            if y5 and y5 > 0 and periods >= 4:
-                                extract("revenue_cagr_5y", (((y0 / y5) ** (1/periods)) - 1) * 100)
-
-                    if not inc_stmt.empty and "Net Income" in inc_stmt.index:
-                        incomes = inc_stmt.loc["Net Income"].dropna()
-                        if len(incomes) >= 4:
-                            y0, y3 = incomes.iloc[0], incomes.iloc[3]
-                            if y3 and y3 > 0:
-                                extract("profit_cagr_3y", (((y0 / y3) ** (1/3)) - 1) * 100)
-                        if len(incomes) >= 5:
-                            periods = min(5, len(incomes) - 1)
-                            y_end = incomes.iloc[periods]
-                            if y_end and y_end > 0 and periods >= 4:
-                                extract("profit_cagr_5y", (((y0 / y_end) ** (1/periods)) - 1) * 100)
-                except Exception:
-                    pass
-
-                # ── QoQ Operating Profit ──────────────────────────────────────
-                try:
-                    qf = ticker.quarterly_financials
-                    if not qf.empty:
-                        for lbl in ("Operating Income", "EBIT", "OperatingIncome"):
-                            if lbl in qf.index:
-                                op_profit = qf.loc[lbl].iloc[0]
-                                if pd.notna(op_profit):
-                                    extract("qoq_op_profit", op_profit)
-                                break
-                except Exception:
-                    pass
-
-                print(f"[ValuationView] All data extracted. Calling _process_and_display...")
-                self.after(0, self._process_and_display)
-
-            except Exception as e:
-                import traceback
-                print(f"[ValuationView] fetch error: {e}\n{traceback.format_exc()}")
-                self.after(0, lambda: self._flash_status(f"⚠ Failed: {e}", error=True))
-            finally:
-                self.after(0, self.loading_overlay.hide)
-                self.after(1000, lambda: getattr(self, "_btn_fetch").set_text("⚡ Analyze") if hasattr(self, "_btn_fetch") else None)
-                self.after(1000, lambda: getattr(self, "_btn_fetch").set_disabled(False) if hasattr(self, "_btn_fetch") else None)
-
-        threading.Thread(target=bg_fetch, daemon=True).start()
-
+    def _on_fetch_failed(self, gen: int, symbol: str, err: Exception):
+        if gen != self._fetch_gen:
+            return
+        self._end_fetch()
+        msg = str(err) if isinstance(err, LookupError) else f"Couldn't analyse {symbol}: {err}"
+        self._flash_status(f"⚠ {msg}", error=True)
 
     def _process_and_display(self):
         """Format the raw data into UI elements and run the logic engine."""
-        print(f"[ValuationView] _process_and_display called. raw_data keys: {len(self._raw_data)}")
-        self._flash_status("Analysis complete.")
+        yf_sym = self._raw_data.get("yf_symbol") or ""
+        self._flash_status(f"✓ Analysis complete for {yf_sym}." if yf_sym else "✓ Analysis complete.")
 
         cy = self._raw_data.get("currency_symbol", "$")
 
@@ -838,17 +935,28 @@ class ValuationView(BaseView):
         # 2. Logic Engine
         badge, tip = self._compute_signal()
         
-        self.lbl_signal_badge.config(text=badge)
         if "Strong Buy" in badge or "Accumulate" in badge:
-            self.lbl_signal_badge.config(fg=ModernStyle.SUCCESS)
+            badge_fg = ModernStyle.SUCCESS
         elif "Avoid" in badge:
-            self.lbl_signal_badge.config(fg=ModernStyle.ERROR)
+            badge_fg = ModernStyle.ERROR
+        elif "Not enough" in badge:
+            badge_fg = ModernStyle.TEXT_SECONDARY
         else:
-            self.lbl_signal_badge.config(fg=ModernStyle.WARNING) # Warning orange
+            badge_fg = ModernStyle.WARNING
+        self.lbl_signal_badge.config(text=badge, fg=badge_fg)
             
         self.txt_rationale.configure(state="normal")
         self.txt_rationale.delete(1.0, tk.END)
-        self.txt_rationale.insert(tk.END, tip)
+        for line in tip.split("\n"):
+            if not line.strip():
+                continue
+            if line.startswith(("✅", "🛡", "📈")):
+                tag = "pass"
+            elif line.startswith(("❌", "🚨", "📉")):
+                tag = "fail"
+            else:
+                tag = "head"
+            self.txt_rationale.insert(tk.END, line + "\n", tag)
         self.txt_rationale.configure(state="disabled")
 
         # Show panels
@@ -865,10 +973,10 @@ class ValuationView(BaseView):
 
         def check(label, key, condition_fn, tip_pass, tip_fail, ui_key=None):
             nonlocal score, max_score
-            max_score += 1
             v = self._raw_data.get(key)
             if v is None:
-                return  # No data = no score
+                return  # No data: neither scored nor counted
+            max_score += 1
             
             # Use specific ui_key if different from data key
             target_key = ui_key if ui_key else key
@@ -908,9 +1016,9 @@ class ValuationView(BaseView):
         check("P/B", "pb_ratio", lambda v: v < 3.0, "Reasonable price-to-book", "High price vs book value")
 
         # === Health & Quality Piotroski Proxy ===
-        fcf = self._raw_data.get("free_cash_flow", 0)
-        debt_eq = self._raw_data.get("debt_to_equity", 0)
-        npm = self._raw_data.get("net_profit_margin", 0)
+        fcf = self._raw_data.get("free_cash_flow")
+        debt_eq = self._raw_data.get("debt_to_equity")
+        npm = self._raw_data.get("net_profit_margin")
         
         # Hard stop / Z-Score proxy combinations
         if fcf is not None and debt_eq is not None and npm is not None:
@@ -979,12 +1087,6 @@ class ValuationView(BaseView):
                 score -= 1
                 reasons_fail.append("❌ Graham Number: Price exceeds defensive valuation threshold")
 
-        # === Growth ===
-        check("Sales Gr", "sales_growth", lambda v: v >= 10.0, "Strong revenue growth metrics", "Sluggish top-line growth")
-        check("Profit Gr", "profit_growth", lambda v: v >= 10.0, "Earnings are expanding rapidly", "Profit growth is lagging")
-        check("3Y Rev CAGR", "revenue_cagr_3y", lambda v: v >= 10.0, "Consistent 3-year revenue compounding", "Inconsistent multi-year revenue trends")
-        check("3Y Profit CAGR", "profit_cagr_3y", lambda v: v >= 10.0, "Consistent 3-year profit compounding", "Inconsistent multi-year profit trends")
-
         # === Ownership & Technicals ===
         check("Promoters", "promoter_holding", lambda v: v >= 40.0, "High insider ownership aligns with shareholder interests", "Low promoter confidence & skin-in-the-game")
         check("Institutions", "institution_holding", lambda v: v >= 10.0, "Strong institutional backing ('Smart Money')", "Low institutional support", "institution_holding")
@@ -1006,7 +1108,9 @@ class ValuationView(BaseView):
 
         # ── Determine badge ──
         pct = score / max_score if max_score else 0
-        if pct >= 0.65:
+        if max_score == 0:
+            badge = "⚪ Not enough data"
+        elif pct >= 0.65:
             badge = "🟢 Strong Buy"
         elif pct >= 0.4:
             badge = "🟡 Accumulate"
@@ -1023,43 +1127,9 @@ class ValuationView(BaseView):
         if reasons_fail:
             tip_lines.append("\nWEAKNESSES / RISKS:")
             tip_lines.extend(reasons_fail)
-        if score == 0 and max_score == 0:
-            tip_lines.append("Failed to fetch metric data.")
+        if max_score == 0:
+            tip_lines.append("Failed to fetch metric data: Yahoo Finance returned no ratios for this symbol.")
         
         tip = "\n".join(tip_lines)
 
         return badge, tip
-
-    def _fetch_screener_fallback(self, symbol: str) -> dict:
-        """Hit Screener.in to pull ROE, ROCE, and P/E since yfinance omits them for India."""
-        base_sym = symbol.replace('.NS', '').replace('.BO', '')
-        url = f"https://www.screener.in/company/{base_sym}/consolidated/"
-        fallback = {}
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-            
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            r = requests.get(url, headers=headers, timeout=5)
-            if r.status_code != 200:
-                url = f"https://www.screener.in/company/{base_sym}/"
-                r = requests.get(url, headers=headers, timeout=5)
-                
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, 'html.parser')
-                ratios = soup.find('div', class_='company-ratios')
-                if ratios:
-                    for item in ratios.find_all('li'):
-                        name = item.find('span', class_='name')
-                        val = item.find('span', class_='number')
-                        if name and val:
-                            n = name.text.strip().lower()
-                            v = val.text.strip().replace(',', '')
-                            try:
-                                fallback[n] = float(v)
-                            except ValueError:
-                                pass
-        except Exception as e:
-            print(f"Screener fallback failed for {base_sym}: {e}")
-            
-        return fallback

@@ -10,7 +10,7 @@ import shutil
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Prioritize the specified development assets path if it exists
-DEV_ASSETS_DIR = "/Volumes/SELVA DATA/USER DATA/srselvakumar/Downloads/PROJECTS/assets"
+DEV_ASSETS_DIR = "/Volumes/SELVA DATA/USER DATA/PROJECTS/assets"
 if os.path.exists(DEV_ASSETS_DIR):
     LOCAL_ASSETS_DIR = DEV_ASSETS_DIR
 else:
@@ -28,12 +28,28 @@ if getattr(sys, 'frozen', False):
     app_support = os.path.expanduser("~/Library/Application Support/PTracker")
     os.makedirs(app_support, exist_ok=True)
     DB_PATH = os.path.join(app_support, "portfolio.db")
-    
-    # If the database doesn't exist in App Support yet, copy the pre-packaged one from the bundle
+
+    # Seed the starter database from the bundle ONLY when there is no database
+    # file at all. An existing file is never replaced: not when it has no trades
+    # (that would undo "Delete All Data") and not when it fails to open (that
+    # would destroy data that might still be recoverable).
     if not os.path.exists(DB_PATH):
+        # -wal/-shm files left behind by an old database would be replayed into
+        # the new one and corrupt it, so move them aside first.
+        for suffix in ("-wal", "-shm"):
+            stale = DB_PATH + suffix
+            if os.path.exists(stale):
+                try:
+                    os.replace(stale, stale + ".orphaned")
+                except Exception as e:
+                    print(f"[DB] Could not move aside {stale}: {e}")
+
         bundle_db = os.path.join(sys._MEIPASS, "assets", "portfolio.db")
-        if os.path.exists(bundle_db):
-            shutil.copy2(bundle_db, DB_PATH)
+        if os.path.exists(bundle_db) and os.path.getsize(bundle_db) > 0:
+            try:
+                shutil.copy2(bundle_db, DB_PATH)
+            except Exception as e:
+                print(f"[DB] Error copying bundled database: {e}")
 elif not DB_PATH:
     # Running in normal Python development mode: use the project local assets
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,6 +80,7 @@ def _get_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=10000")
     conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA mmap_size=30000000")  # 30MB memory-mapped I/O for faster reads
     _local.conn = conn
     return conn
 
@@ -152,8 +169,9 @@ def _ensure_columns(conn: sqlite3.Connection, table: str, columns: list[tuple[st
             if col not in existing:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
     except Exception:
-        # Best-effort: schema guard should never crash the app
-        pass
+        # Best-effort: schema guard should never crash the app, but say what failed
+        from model.applog import log
+        log.exception("Could not add missing columns to table %s", table)
 
 
 def ensure_marketdata_schema():
@@ -217,16 +235,28 @@ def initialize_database(reset=False):
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS brokers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL
+                name TEXT UNIQUE NOT NULL,
+                currency TEXT DEFAULT 'INR'
             )
         ''')
+
+        # Migration: Add currency column to existing brokers table if it doesn't exist
+        try:
+            cursor.execute("ALTER TABLE brokers ADD COLUMN currency TEXT DEFAULT 'INR'")
+            # Update specific brokers to JPY during migration
+            cursor.execute("UPDATE brokers SET currency = 'JPY' WHERE upper(name) IN ('TANAKA', 'NOMURA')")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
         # Seed default Brokers
         cursor.execute("SELECT COUNT(*) FROM brokers")
         if cursor.fetchone()[0] == 0:
-            default_brokers = ['Selva-Kite', 'Bahee-Kite', 'Mithun-Kite', 'Upstox', 'ICICI', 'Nomura']
-            for broker in default_brokers:
-                cursor.execute("INSERT INTO brokers (name) VALUES (?)", (broker,))
+            default_brokers = [
+                ('Selva-Kite', 'INR'), ('Bahee-Kite', 'INR'), ('Mithun-Kite', 'INR'), 
+                ('Upstox', 'INR'), ('ICICI', 'INR'), ('Nomura', 'JPY'), ('Tanaka', 'JPY')
+            ]
+            for broker, currency in default_brokers:
+                cursor.execute("INSERT INTO brokers (name, currency) VALUES (?, ?)", (broker, currency))
 
         # 2. Trades Table (Composite Primary Key)
         cursor.execute('''
@@ -443,10 +473,6 @@ def initialize_database(reset=False):
 
             conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
-if __name__ == "__main__":
-    # Run with reset=True to fulfill user request
-    initialize_database(reset=True)
-
 def ensure_watchlist_schema():
     with db_session() as conn:
         _ensure_columns(conn, "watchlist", [
@@ -485,5 +511,10 @@ def ensure_watchlist_schema():
             ("action_signal", "TEXT DEFAULT ''"),
             ("sector", "TEXT DEFAULT ''"),
             ("industry", "TEXT DEFAULT ''"),
-            ("current_value", "TEXT DEFAULT ''")
+            ("current_value", "TEXT DEFAULT ''"),
+            # Filled by Watchlist Auto-Fill / Refresh All (they were computed but had nowhere to go)
+            ("macd", "TEXT DEFAULT ''"),
+            ("support_resistance", "TEXT DEFAULT ''"),
+            ("revenue_cagr_3y", "TEXT DEFAULT ''"),
+            ("profit_cagr_3y", "TEXT DEFAULT ''"),
         ])

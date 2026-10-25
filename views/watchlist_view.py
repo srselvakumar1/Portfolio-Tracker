@@ -2,79 +2,563 @@
 Watchlist View — single-screen CRUD for tracked symbols.
 
 Layout (top → bottom):
-  • Header row with title and quick-add shortcut hint
-  • Inline Add / Edit form (symbol, notes, tags, target price + Save / Clear / Delete)
+  • Gradient header with the "Refresh All" button
+  • Inline Add / Edit form (symbol, notes, tags, your target price + Save / Clear /
+    Edit Metrics / Delete)
+  • Signal filter pills (All / Strong Buy / Accumulate / Wait / Watch / Avoid / No Data)
   • Treeview table showing all watchlist entries
-  Clicking a row pre-fills the form for editing.
+  Clicking a row fills the form for editing; double-clicking opens the full analysis.
+
+Saving never loses data: a form save sends only the fields you changed, and
+Refresh All sends only the values Yahoo actually returned (see
+model/watchlist_db.py). All network work (Yahoo Finance, Screener.in) runs in
+background threads through run_in_background().
 """
 from __future__ import annotations
 
-import threading
+import math
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from views.base_view import BaseView, _enable_canvas_mousewheel
-from ui_theme import ModernStyle
-from ui_widgets import ModernButton, PremiumModal, ModernEntry, ModernCard
-from ui_utils import add_treeview_copy_menu, treeview_sort_column, fade_color_transition
 import pandas as pd
+
+from model.applog import log
+from views.base_view import BaseView
+from ui.ui_theme import ModernStyle
+from ui.ui_widgets import ModernButton, ModernEntry, ModernCard, PremiumModal
+from ui.ui_utils import (add_treeview_copy_menu, treeview_sort_column, run_in_background,
+                         call_on_ui, show_toast, ToolTip, HeadingTips)
+
+
+# ── Signals ───────────────────────────────────────────────────────────────────
+# One table for the badge text, the filter pills and the colours, so they
+# always match.
+SIGNAL_ORDER = ["strong_buy", "accumulate", "wait", "avoid", "nodata"]
+SIGNAL_TEXT = {
+    "strong_buy": ("🟢", "Strong Buy"),
+    "accumulate": ("🌲", "Accumulate"),
+    "wait":       ("🔸", "Wait / Watch"),
+    "avoid":      ("🔻", "Avoid"),
+    "nodata":     ("⚪", "No Data"),
+}
+
+
+def signal_badge(key: str) -> str:
+    emoji, label = SIGNAL_TEXT[key]
+    return f"{emoji}  {label}"
+
+
+def signal_colours(key: str) -> tuple[str, str, str]:
+    """(text colour, soft tint, solid fill) for a signal key or "all"."""
+    S = ModernStyle
+    return {
+        "all":        (S.TEXT_ACCENT, S.ACCENT_PRIMARY_PALE, S.ACCENT_PRIMARY),
+        "strong_buy": (S.SUCCESS, S.SUCCESS_PALE, S.SUCCESS_FILL),
+        "accumulate": (S.INFO, S.INFO_PALE, S.INFO_FILL),
+        "wait":       (S.WARNING, S.WARNING_PALE, S.WARNING_FILL),
+        "avoid":      (S.ERROR, S.ERROR_PALE, S.ERROR_FILL),
+        "nodata":     (S.TEXT_SECONDARY, S.BG_TERTIARY, S.NEUTRAL_FILL),
+    }[key]
+
+
+# ── Number helpers ────────────────────────────────────────────────────────────
+
+def parse_num(val) -> float | None:
+    """'₹1,234.5' / '12.3%' / '₹1,234 Cr' / '$1.2B' / 3.4 → float, or None."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return None if (isinstance(val, float) and math.isnan(val)) else float(val)
+    s = str(val).strip()
+    if s in ("", "None", "—", "-", "nan", "N/A", "n/a"):
+        return None
+    for ch in ",%₹¥$£€▲▼+":
+        s = s.replace(ch, "")
+    s = s.strip()
+    mult = 1.0
+    if s.lower().endswith("cr"):
+        mult, s = 1e7, s[:-2]
+    elif s[-1:] in ("T", "B", "M", "K"):
+        mult, s = {"T": 1e12, "B": 1e9, "M": 1e6, "K": 1e3}[s[-1]], s[:-1]
+    try:
+        return float(s.strip()) * mult
+    except ValueError:
+        return None
+
+
+def graham_number(row: dict) -> float | None:
+    """√(22.5 × EPS × book value per share), or None when either is missing/negative."""
+    eps, bv = parse_num(row.get("eps")), parse_num(row.get("book_value"))
+    if eps and bv and eps > 0 and bv > 0:
+        return math.sqrt(22.5 * eps * bv)
+    return None
+
+
+def _week52(row: dict) -> tuple[float, float] | None:
+    text = str(row.get("week52_range") or "")
+    if "–" not in text:
+        return None
+    lo, _, hi = text.partition("–")
+    lo_f, hi_f = parse_num(lo), parse_num(hi)
+    if lo_f is None or hi_f is None:
+        return None
+    return lo_f, hi_f
+
+
+def compute_signal(row: dict) -> tuple[str, str, str]:
+    """Score a watchlist row. Returns (signal key, badge text, reason text).
+
+    Only metrics that are present are scored and counted, so a stock with
+    patchy data is judged on what is known instead of drifting to "Avoid".
+    Pure function: safe to call from a background thread.
+    """
+    score = 0
+    max_score = 0
+    reasons_pass: list[str] = []
+    reasons_fail: list[str] = []
+
+    def check(label, key, condition_fn, tip_pass, tip_fail):
+        nonlocal score, max_score
+        v = parse_num(row.get(key))
+        if v is None:
+            return  # no data: neither scored nor counted
+        max_score += 1
+        if condition_fn(v):
+            score += 1
+            reasons_pass.append(f"✅ {label}: {tip_pass}")
+        else:
+            score -= 1
+            reasons_fail.append(f"❌ {label}: {tip_fail}")
+
+    # === Valuation ===
+    check("P/E", "pe_ratio", lambda v: 0 < v < 30, "Reasonable valuation", "Overvalued or negative earnings")
+    check("PEG Ratio", "peg_ratio", lambda v: v < 2.0, "Growth at fair price", "Expensive relative to growth")
+    check("P/B Ratio", "pb_ratio", lambda v: v < 3.0, "Reasonable price-to-book", "High price vs book value")
+    check("Debt/Equity", "debt_to_equity", lambda v: v < 1.0, "Low financial leverage", "High debt is risky")
+    check("Current Ratio", "current_ratio", lambda v: v >= 1.5,
+          "Healthy short-term liquidity", "May struggle to meet short-term obligations")
+
+    # === Profitability ===
+    check("ROE", "roe", lambda v: v >= 12.0, "Strong return on equity", "Weak returns for shareholders")
+    check("ROCE", "roce", lambda v: v >= 12.0, "Efficient capital allocation", "Capital not being used efficiently")
+    check("OPM", "opm", lambda v: v >= 10.0, "Healthy operating margins", "Thin operating margins")
+    check("Net Profit Margin", "net_profit_margin", lambda v: v >= 8.0, "Solid profitability", "Low net margins")
+    check("Free Cash Flow", "free_cash_flow", lambda v: v > 0,
+          "Positive FCF — company self-funds growth", "Negative FCF — cash burn risk")
+    check("EBITDA Margin", "ebitda_margin", lambda v: v >= 15.0,
+          "Good earnings before interest and taxes", "Low EBITDA margins")
+
+    # === Growth ===
+    check("Sales Gr", "sales_growth", lambda v: v >= 10.0, "Strong revenue growth", "Sluggish growth")
+    check("Profit Gr", "profit_growth", lambda v: v >= 10.0, "Earnings expanding rapidly", "Profit growth lagging")
+    check("3Y Rev CAGR", "revenue_cagr_3y", lambda v: v >= 10.0,
+          "Consistent 3-year revenue compounding", "Inconsistent long-term revenue")
+    check("3Y Profit CAGR", "profit_cagr_3y", lambda v: v >= 10.0,
+          "Consistent 3-year profit compounding", "Inconsistent long-term profit")
+    check("QoQ Op", "qoq_op_profit", lambda v: v > 0, "Sequential operating improvement", "Operating profit declined")
+
+    # === Intrinsic value, Graham number, analyst target, 52-week range ===
+    cp = parse_num(row.get("current_value"))
+    iv = parse_num(row.get("intrinsic_value"))
+    if cp and iv and cp > 0 and iv > 0:
+        max_score += 2  # margin of safety counts double
+        if cp < iv * 0.8:
+            score += 2
+            reasons_pass.append("✅ Intrinsic Value: Trading at >20% discount to DCF value (Safety Margin)")
+        elif cp < iv:
+            score += 1
+            reasons_pass.append("✅ Intrinsic Value: Trading below DCF intrinsic value")
+        else:
+            score -= 1
+            reasons_fail.append("❌ Intrinsic Value: Trading above DCF intrinsic value (Overvalued)")
+
+    gn = graham_number(row)
+    if gn and cp:
+        max_score += 1
+        if cp < gn:
+            score += 1
+            reasons_pass.append("✅ Graham Number: Price is below classic defensive valuation limit")
+        else:
+            score -= 1
+            reasons_fail.append("❌ Graham Number: Price exceeds defensive valuation threshold")
+
+    check("Dividend", "dividend_yield", lambda v: v >= 1.2, "Healthy dividend payout", "Low or no dividend yield")
+
+    at = parse_num(row.get("analyst_target"))
+    if cp and at:
+        max_score += 1
+        if cp < at * 0.9:
+            score += 1
+            reasons_pass.append("✅ Analyst Target: Price is >10% below average analyst target")
+        elif cp > at * 1.1:
+            score -= 1
+            reasons_fail.append("❌ Analyst Target: Price exceeds analyst target by >10%")
+
+    rng = _week52(row)
+    if rng and cp and rng[0] < rng[1]:
+        max_score += 1
+        pos_pct = (cp - rng[0]) / (rng[1] - rng[0])
+        if pos_pct < 0.25:
+            score += 1
+            reasons_pass.append("✅ 52W Range: Trading near 52-week lows (Potential value)")
+        elif pos_pct > 0.85:
+            score -= 1
+            reasons_fail.append("❌ 52W Range: Trading near 52-week highs (Potential resistance zone)")
+
+    # === Ownership & technical ===
+    check("Promoters", "promoter_holding", lambda v: v >= 40.0, "Promoters have skin in the game", "Low promoter confidence")
+    check("RSI", "rsi", lambda v: 30.0 <= v <= 65.0, "Good entry zone", "Overbought or deeply oversold")
+    check("Beta", "beta", lambda v: v < 1.5, "Lower volatility vs market", "High beta — volatile stock")
+    check("MACD", "macd", lambda v: v > 0, "Short-term momentum is bullish", "Short-term momentum is bearish")
+
+    # ── Badge ──
+    pct = score / max_score if max_score else 0
+    if max_score == 0:
+        key = "nodata"
+    elif pct >= 0.65:
+        key = "strong_buy"
+    elif pct >= 0.4:
+        key = "accumulate"
+    elif pct >= 0.1:
+        key = "wait"
+    else:
+        key = "avoid"
+    badge = signal_badge(key)
+
+    tip_lines = [f"Signal: {badge}  (Score: {score}/{max_score})"]
+    if reasons_pass:
+        tip_lines.append("\nStrengths:")
+        tip_lines.extend(reasons_pass)
+    if reasons_fail:
+        tip_lines.append("\nWeaknesses:")
+        tip_lines.extend(reasons_fail)
+    if max_score == 0:
+        tip_lines.append("No metrics fetched yet. Use Edit Metrics → Auto-Fill, or Refresh All, to fetch them.")
+    return key, badge, "\n".join(tip_lines)
+
+
+# ── Fetching metrics from Yahoo Finance (BACKGROUND THREAD ONLY) ──────────────
+
+def _fmt_big(value: float, cy: str) -> str:
+    """Large money amounts: ₹1,234.5 Cr for rupees, $1.2B / ¥3.4T otherwise."""
+    v = float(value)
+    if cy == "₹":
+        return f"{cy}{v / 1e7:,.1f} Cr" if abs(v) >= 1e7 else f"{cy}{v:,.0f}"
+    for div, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if abs(v) >= div:
+            return f"{cy}{v / div:,.2f}{suffix}"
+    return f"{cy}{v:,.0f}"
+
+
+def _price(v: float) -> str:
+    return f"{v:,.0f}" if abs(v) >= 100 else f"{v:,.2f}"
+
+
+def fetch_watchlist_metrics(symbol: str, columns: set[str]) -> tuple[str, dict[str, str]]:
+    """Fetch and format every watchlist metric Yahoo has for `symbol`.
+
+    Returns (yahoo symbol used, {column: text}). Only values that were really
+    found are included, and only for columns this database has, so nothing
+    gets blanked and nothing is computed only to be thrown away.
+    Raises LookupError when Yahoo has no data for the symbol.
+    """
+    from views.valuation_view import (resolve_ticker, currency_symbol, dividend_yield_pct,
+                                      fetch_screener_ratios)
+
+    info, yf_symbol, ticker = resolve_ticker(symbol)
+    cy = currency_symbol(info, yf_symbol)
+    out: dict[str, str] = {}
+
+    def put(key, val, fmt="{}"):
+        if key not in columns or val is None:
+            return
+        try:
+            if isinstance(val, float) and math.isnan(val):
+                return
+            text = fmt.format(val)
+        except (TypeError, ValueError):
+            return
+        if text.strip() and text.lower() != "nan":
+            out[key] = text
+
+    def put_big(key, val):
+        if val is not None and key in columns:
+            try:
+                out[key] = _fmt_big(val, cy)
+            except (TypeError, ValueError):
+                pass
+
+    def pct(field):
+        v = info.get(field)
+        return v * 100 if isinstance(v, (int, float)) else None
+
+    def safe(fn):
+        try:
+            return fn()
+        except Exception as exc:
+            log.debug("yfinance call for %s failed: %s", yf_symbol, exc)
+            return None
+
+    scr = fetch_screener_ratios(yf_symbol)
+
+    put("stock_name", info.get("longName") or info.get("shortName"))
+    put("sector", info.get("sector"))
+    put("industry", info.get("industry"))
+    cur_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+    put("current_value", cur_price, f"{cy}{{:,.2f}}")
+
+    put("pe_ratio", info.get("trailingPE") or scr.get("stock p/e"), "{:.1f}")
+    put("peg_ratio", info.get("pegRatio") or info.get("trailingPegRatio"), "{:.2f}")
+    put("pb_ratio", info.get("priceToBook"), "{:.2f}")
+    eps = info.get("trailingEps")
+    put("eps", eps, f"{cy}{{:,.2f}}")
+    put("book_value", info.get("bookValue"), f"{cy}{{:,.2f}}")
+    de = info.get("debtToEquity")
+    put("debt_to_equity", de / 100 if isinstance(de, (int, float)) else None, "{:.2f}")
+    put("current_ratio", info.get("currentRatio"), "{:.2f}")
+    put("beta", info.get("beta"), "{:.2f}")
+
+    roe = pct("returnOnEquity")
+    put("roe", roe if roe is not None else scr.get("roe"), "{:.1f}%")
+    put("roce", scr.get("roce"), "{:.1f}%")
+    put("opm", pct("operatingMargins"), "{:.1f}%")
+    put("ebitda_margin", pct("ebitdaMargins"), "{:.1f}%")
+    put("net_profit_margin", pct("profitMargins"), "{:.1f}%")
+    put_big("free_cash_flow", info.get("freeCashflow"))
+    put("sales_growth", pct("revenueGrowth"), "{:.1f}%")
+    put("profit_growth", pct("earningsGrowth"), "{:.1f}%")
+    put("promoter_holding", pct("heldPercentInsiders"), "{:.1f}%")
+    put("fii_dii_holding", pct("heldPercentInstitutions"), "{:.1f}%")
+    put("dividend_yield", dividend_yield_pct(info), "{:.2f}%")
+    put_big("market_cap", info.get("marketCap"))
+    put("analyst_target", info.get("targetMeanPrice"), f"{cy}{{:,.1f}}")
+
+    h52, l52 = info.get("fiftyTwoWeekHigh"), info.get("fiftyTwoWeekLow")
+    if h52 and l52:
+        put("week52_range", f"{_price(l52)} – {_price(h52)}")
+    d50, d200 = info.get("fiftyDayAverage"), info.get("twoHundredDayAverage")
+    if d50 and d200:
+        put("dma_50_200", f"{_price(d50)} / {_price(d200)}")
+
+    vol = info.get("volume") or info.get("averageVolume")
+    if isinstance(vol, (int, float)):
+        if vol >= 1e9:
+            put("volume", f"{vol / 1e9:.1f}B")
+        elif vol >= 1e6:
+            put("volume", f"{vol / 1e6:.1f}M")
+        else:
+            put("volume", f"{vol:,.0f}")
+
+    if eps and eps > 0 and "intrinsic_value" in columns:
+        try:
+            from model.engine import calculate_intrinsic_value as _calc_iv
+            iv_val = _calc_iv(eps)
+            if iv_val and iv_val > 0:
+                put("intrinsic_value", iv_val, f"{cy}{{:,.2f}}")
+        except Exception:
+            log.debug("Intrinsic value for %s failed", yf_symbol, exc_info=True)
+
+    # ── One year of prices: RSI, Sharpe ratio, MACD, support / resistance ──
+    hist = safe(lambda: ticker.history(period="1y"))
+    if hist is not None and not hist.empty and len(hist) >= 30:
+        close = hist["Close"]
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0.0).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
+        rsi = (100 - 100 / (1 + gain / loss.replace(0, float("nan")))).iloc[-1]
+        if pd.notna(rsi):
+            put("rsi", float(rsi), "{:.1f}")
+        returns = close.pct_change().dropna()
+        if len(returns) > 20:
+            excess = returns - 0.07 / 252  # 7 % risk-free rate
+            if excess.std() > 0:
+                put("sharpe_ratio", float(excess.mean() / excess.std() * 252 ** 0.5), "{:.2f}")
+        if "macd" in columns:
+            macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+            sig = macd.ewm(span=9, adjust=False).mean()
+            if pd.notna(macd.iloc[-1]) and pd.notna(sig.iloc[-1]):
+                put("macd", float(macd.iloc[-1] - sig.iloc[-1]), "{:.2f}")
+        if "support_resistance" in columns:
+            lo, hi = hist["Low"].tail(60).min(), hist["High"].tail(60).max()
+            if pd.notna(lo) and pd.notna(hi):
+                put("support_resistance", f"{_price(lo)} / {_price(hi)}")
+
+    # ── Statements (each is a separate request, so only when needed) ──
+    if "capex" in columns:
+        cf = safe(lambda: ticker.cashflow)
+        if cf is not None and not cf.empty and "Capital Expenditure" in cf.index:
+            capex = cf.loc["Capital Expenditure"].dropna()
+            if len(capex):
+                put_big("capex", abs(float(capex.iloc[0])))
+    if "qoq_op_profit" in columns:
+        qf = safe(lambda: ticker.quarterly_financials)
+        if qf is not None and not qf.empty:
+            for lbl in ("Operating Income", "EBIT"):
+                if lbl in qf.index:
+                    op = qf.loc[lbl].dropna()
+                    if len(op):
+                        put_big("qoq_op_profit", float(op.iloc[0]))
+                    break
+    if {"revenue_cagr_3y", "profit_cagr_3y"} & columns:
+        fin = safe(lambda: ticker.financials)
+        if fin is not None and not fin.empty:
+            for key, label in (("revenue_cagr_3y", "Total Revenue"), ("profit_cagr_3y", "Net Income")):
+                if label in fin.index:
+                    s = fin.loc[label].dropna()
+                    if len(s) >= 4 and float(s.iloc[3]) > 0 and float(s.iloc[0]) > 0:
+                        put(key, ((float(s.iloc[0]) / float(s.iloc[3])) ** (1 / 3) - 1) * 100, "{:.1f}%")
+
+    return yf_symbol, out
+
+
+# ── Pop-up helpers ────────────────────────────────────────────────────────────
+
+def _fit_to_screen(widget: tk.Misc, want_w: int, want_h: int) -> str:
+    """A geometry string no bigger than the screen (13" MacBooks are ~800 pt tall)."""
+    try:
+        sw, sh = int(widget.winfo_screenwidth()), int(widget.winfo_screenheight())
+    except Exception:
+        sw, sh = 1440, 900
+    w = max(560, min(want_w, sw - 80))
+    h = max(420, min(want_h, sh - 150))  # menu bar, title bar and Dock
+    return f"{w}x{h}"
+
+
+def _bind_popup_scroll(top: tk.Toplevel, canvas: tk.Canvas) -> None:
+    """Scroll `canvas` with the wheel/trackpad anywhere inside `top`.
+
+    The bindings live on the pop-up window itself (every child has it in its
+    bindtags), so they never affect the rest of the app and vanish with the
+    pop-up. Returning "break" stops a main-window bind_all handler running too.
+    """
+    canvas.configure(yscrollincrement=20)
+    pending = [0.0]
+
+    def _wheel(event):
+        d = event.delta
+        if d:
+            steps = -round(d / 120) * 3 if abs(d) >= 120 else -d
+            canvas.yview_scroll(int(steps) or (-1 if d > 0 else 1), "units")
+        return "break"
+
+    def _touchpad(event):
+        low = event.delta & 0xFFFF
+        dy = low - 0x10000 if low >= 0x8000 else low
+        pending[0] -= dy
+        steps = int(pending[0] / 20)
+        if steps:
+            pending[0] -= steps * 20
+            canvas.yview_scroll(steps, "units")
+        return "break"
+
+    top.bind("<MouseWheel>", _wheel)
+    top.bind("<Button-4>", lambda _e: (canvas.yview_scroll(-3, "units"), "break")[1])
+    top.bind("<Button-5>", lambda _e: (canvas.yview_scroll(3, "units"), "break")[1])
+    try:
+        top.bind("<TouchpadScroll>", _touchpad)  # Tk 9 trackpads
+    except tk.TclError:
+        pass
+
+
+def _make_scroll_area(parent: tk.Misc, bg: str) -> tuple[tk.Canvas, tk.Frame]:
+    canvas = tk.Canvas(parent, bg=bg, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas, bg=bg)
+    inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+    window = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    return canvas, inner
+
+
+def _alive(widget) -> bool:
+    try:
+        return widget is not None and bool(widget.winfo_exists())
+    except Exception:
+        return False
+
 
 class WatchlistView(BaseView):
     """Watchlist view with inline CRUD form and a live Treeview table."""
 
+    # Metric columns the form keeps values for (Edit Metrics dialog / Auto-Fill).
+    # stock_name has no field; it is kept so Auto-Fill can store the company name.
+    BASE_METRIC_KEYS = [
+        "pe_ratio", "peg_ratio", "eps", "debt_to_equity", "book_value", "intrinsic_value",
+        "roe", "roce", "opm", "free_cash_flow", "inventory_days",
+        "sales_growth", "profit_growth",
+        "promoter_holding", "pledged_shares", "fii_dii_holding", "order_book",
+        "dma_50_200", "rsi", "volume",
+        "ebitda_margin", "capex", "net_profit_margin", "sharpe_ratio", "qoq_op_profit",
+        "beta", "week52_range", "current_ratio", "dividend_yield",
+        "pb_ratio", "analyst_target", "market_cap", "action_signal",
+        "sector", "industry", "current_value", "stock_name",
+    ]
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def build(self):
+        from model.watchlist_db import OPTIONAL_METRIC_COLS
+
         self._selected_id: int | None = None   # id of row being edited
+        self._loaded: dict = {}                 # form values of that row when it was selected
+        self._loaded_metrics: dict = {}
         self._data: list[dict] = []
+        self._db_columns: set[str] = set(self.BASE_METRIC_KEYS)
+        self._optional_cols = list(OPTIONAL_METRIC_COLS)
+        self._load_gen = 0
+        self._refreshing = False
+        self._autofill_running = False
+        self._fetch_btn = None
+        self._signal_filter = "all"
+        self._filter_pills: dict[str, tk.Label] = {}
 
         def _build_right(parent):
             self._btn_refresh_all = ModernButton(
-                parent, text="🔄 Refresh All",
+                parent, text="↻ Refresh All",
                 command=self._bulk_refresh_metrics,
-                bg=ModernStyle.ACCENT_SECONDARY, fg=ModernStyle.TEXT_ON_ACCENT,
-                canvas_bg="#0D9488", width=140, height=36, radius=8,
+                bg=ModernStyle.WARNING_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+                canvas_bg=ModernStyle.PURPLE_FILL, width=170, height=36, radius=8,
                 font=ModernStyle.FONT_BODY_BOLD
             )
-            self._btn_refresh_all.pack(anchor="e", pady=(0, 4))
+            self._btn_refresh_all.pack(side="left", pady=(0, 4))
+            ToolTip(self._btn_refresh_all, "Fetch the latest metrics from Yahoo Finance for every symbol")
 
         self.add_gradient_header(
             self,
             "👁  Watchlist",
-            "Track symbols you're watching — double-click a row to pre-fill the form.",
+            "Click a row to edit it · double-click for the full analysis.",
             right_widget_func=_build_right
         )
 
         # ── Inline form ───────────────────────────────────────────────────────
         form_card = ModernCard(self,
             bg=ModernStyle.BG_SECONDARY,
-            highlight_color=ModernStyle.BORDER_COLOR,
+            highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
             highlight_thickness=1,
             radius=10,
             canvas_bg=ModernStyle.BG_PRIMARY
         )
         form_card.pack(fill="x", padx=20, pady=(14, 6))
 
-        # Thin top accent
-        # tk.Frame(form_card, bg=ModernStyle.ACCENT_PRIMARY, height=3).pack(fill="x")
-
         form_inner = tk.Frame(form_card.content, bg=ModernStyle.BG_SECONDARY)
         form_inner.pack(fill="x", padx=16, pady=14)
 
-        # Row 1: Symbol | Notes | Tags | Target Price
+        # Row 1: Symbol (+ Add) | Notes | Tags | My Target
         fields_row = tk.Frame(form_inner, bg=ModernStyle.BG_SECONDARY)
         fields_row.pack(fill="x")
 
-        def _field(parent, label: str, var: tk.StringVar, width: int = 14, numeric=False) -> tk.Entry:
+        def _field(parent, label: str, var: tk.StringVar, width: int = 14, expand=False) -> ModernEntry:
             col = tk.Frame(parent, bg=ModernStyle.BG_SECONDARY)
-            col.pack(side="left", padx=(0, 16))
+            col.pack(side="left", padx=(0, 16), fill="x" if expand else None, expand=expand)
             tk.Label(
                 col, text=label, bg=ModernStyle.BG_SECONDARY,
                 fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD
             ).pack(anchor="w", pady=(0, 2))
-            
             e = ModernEntry(
-                col, placeholder=label,
+                col, placeholder="",
                 textvariable=var,
                 bg=ModernStyle.ENTRY_BG,
                 fg=ModernStyle.TEXT_PRIMARY,
@@ -86,7 +570,9 @@ class WatchlistView(BaseView):
                 font=ModernStyle.FONT_INPUT,
                 width=width
             )
-            e.pack(anchor="w")
+            e.pack(anchor="w", fill="x" if expand else None, ipady=3)
+            e.bind("<Return>", lambda _e: self._on_save())
+            e.bind("<Escape>", self._clear_form, add="+")
             return e
 
         self._v_symbol = tk.StringVar()
@@ -94,39 +580,34 @@ class WatchlistView(BaseView):
         self._v_tags   = tk.StringVar()
         self._v_target = tk.StringVar()
 
-        self._metrics_keys = [
-            "pe_ratio", "peg_ratio", "eps", "debt_to_equity", "book_value", "intrinsic_value",
-            "roe", "roce", "opm", "free_cash_flow", "inventory_days",
-            "sales_growth", "profit_growth",
-            "promoter_holding", "pledged_shares", "fii_dii_holding", "order_book",
-            "dma_50_200", "rsi", "volume",
-            "ebitda_margin", "capex", "net_profit_margin", "sharpe_ratio", "qoq_op_profit",
-            "beta", "week52_range", "current_ratio", "dividend_yield",
-            "pb_ratio", "analyst_target", "market_cap", "action_signal",
-            "sector", "industry", "current_value",
-        ]
+        self._metrics_keys = list(self.BASE_METRIC_KEYS)
         self._metrics_vars = {k: tk.StringVar() for k in self._metrics_keys}
 
-        self._e_symbol = _field(fields_row, "Symbol *",      self._v_symbol, width=20)
-        
-        # Quick Add Button inside the symbol row aligned with the entries
-        ModernButton(
-            fields_row, text="➕",
-            command=self._on_quick_add,
-            bg=ModernStyle.BRAND_GOLD, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY,
-            width=36, height=36, radius=8,
-            font=ModernStyle.FONT_HEADING,
-        ).pack(side="left", padx=(0, 16), pady=(4, 0))
-        
-        _field(fields_row, "Notes",         self._v_notes,  width=60)
+        self._e_symbol = _field(fields_row, "Symbol *", self._v_symbol, width=11)
 
-        # Row 2: Buttons (right-aligned)
+        # Add-as-new button next to the symbol
+        add_btn = ModernButton(
+            fields_row, text="+ Add",
+            command=self._on_quick_add,
+            bg=ModernStyle.SUCCESS_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+            canvas_bg=ModernStyle.BG_SECONDARY,
+            width=86, height=36, radius=8,
+            font=ModernStyle.FONT_BODY_BOLD,
+        )
+        add_btn.pack(side="left", padx=(0, 16), pady=(20, 0))
+        ToolTip(add_btn, "Add this symbol as a new watchlist entry")
+
+        self._e_notes = _field(fields_row, "Notes", self._v_notes, width=12, expand=True)
+        self._e_tags = _field(fields_row, "Tags", self._v_tags, width=11)
+        self._e_target = _field(fields_row, "My Target Price", self._v_target, width=10)
+        self._entries = (self._e_symbol, self._e_notes, self._e_tags, self._e_target)
+
+        # Row 2: Buttons
         btn_row = tk.Frame(form_inner, bg=ModernStyle.BG_SECONDARY)
         btn_row.pack(fill="x", pady=(10, 0))
 
         ModernButton(
-            btn_row, text="💾  Save",
+            btn_row, text="✓  Save",
             command=self._on_save,
             bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
             canvas_bg=ModernStyle.BG_SECONDARY,
@@ -135,47 +616,64 @@ class WatchlistView(BaseView):
         ).pack(side="left", padx=(0, 8))
 
         ModernButton(
-            btn_row, text="✕  Clear",
+            btn_row, text="✕  Clear", variant="soft",
             command=self._clear_form,
-            bg=ModernStyle.TEXT_SECONDARY, fg=ModernStyle.TEXT_ON_ACCENT,
+            bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
             canvas_bg=ModernStyle.BG_SECONDARY,
             width=100, height=36, radius=8,
             font=ModernStyle.FONT_SUBHEADING,
         ).pack(side="left", padx=(0, 8))
 
         ModernButton(
-            btn_row, text="📋  Edit Metrics",
+            btn_row, text="✎  Edit Metrics", variant="soft",
             command=self._open_metrics_dialog,
-            bg=ModernStyle.ACCENT_TERTIARY, fg=ModernStyle.TEXT_ON_ACCENT,
+            bg=ModernStyle.PURPLE_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
             canvas_bg=ModernStyle.BG_SECONDARY,
-            width=140, height=36, radius=8,
+            width=150, height=36, radius=8,
             font=ModernStyle.FONT_BODY_BOLD,
         ).pack(side="left", padx=(0, 8))
 
         self._del_btn = ModernButton(
-            btn_row, text="🗑  Delete",
+            btn_row, text="✕  Delete", variant="soft",
             command=self._on_delete,
-            bg=ModernStyle.ERROR, fg=ModernStyle.TEXT_ON_ACCENT,
+            bg=ModernStyle.ERROR_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
             canvas_bg=ModernStyle.BG_SECONDARY,
             width=110, height=36, radius=8,
             font=ModernStyle.FONT_SUBHEADING,
         )
         self._del_btn.pack(side="left")
-        self._del_btn.set_disabled(True)   # enabled only when a row is selected
+        self._set_delete_enabled(False)   # enabled only when a row is selected
 
         self._form_status = tk.Label(
             btn_row,
             text="",
             fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY,
-            font=ModernStyle.FONT_SMALL,
+            font=ModernStyle.FONT_SMALL_BOLD,
         )
         self._form_status.pack(side="right", padx=4)
+
+        # ── Signal filter pills ───────────────────────────────────────────────
+        filter_bar = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        filter_bar.pack(fill="x", padx=22, pady=(6, 0))
+        tk.Label(
+            filter_bar, text="Show:", bg=ModernStyle.BG_PRIMARY,
+            fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD,
+        ).pack(side="left", padx=(0, 6))
+        for key in ["all"] + SIGNAL_ORDER:
+            pill = tk.Label(
+                filter_bar, text=self._pill_text(key, None), font=ModernStyle.FONT_SMALL,
+                padx=8, pady=4, cursor="hand2", bd=0,
+            )
+            pill.pack(side="left", padx=(0, 5))
+            pill.bind("<Button-1>", lambda _e, k=key: self._set_signal_filter(k))
+            self._filter_pills[key] = pill
+        self._style_pills()
 
         # ── Treeview table ────────────────────────────────────────────────────
         table_frame = ModernCard(
             self,
             bg=ModernStyle.BG_SECONDARY,
-            highlight_color=ModernStyle.BORDER_COLOR,
+            highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
             highlight_thickness=1,
             radius=10,
             canvas_bg=ModernStyle.BG_PRIMARY,
@@ -185,38 +683,53 @@ class WatchlistView(BaseView):
         table_frame.content.grid_rowconfigure(0, weight=1)
         table_frame.content.grid_columnconfigure(0, weight=1)
 
-        cols = ("#", "Symbol", "Signal", "Sector / Industry", "Current Px", "IV (DCF)", "MoS %", "Graham No.", "Target Px", "P/E", "PEG", "Yield(%)", "From 52W H", "Notes", "Added")
-        
+        cols = ("#", "Symbol", "Signal", "Sector / Industry", "Current Px", "IV (DCF)", "MoS %",
+                "Graham No.", "Analyst Tgt", "My Target", "P/E", "PEG", "Div. Yield", "From 52W H",
+                "Tags", "Notes / Name", "Added")
+
         style = ttk.Style()
-        style.configure("Watchlist.Treeview", font=ModernStyle.FONT_TABLE, rowheight=32)
+        style.configure("Watchlist.Treeview", font=ModernStyle.FONT_TABLE, rowheight=ModernStyle.TABLE_ROW_HEIGHT)
         style.configure("Watchlist.Treeview.Heading", font=ModernStyle.FONT_SUBHEADING)
-        
+
         self._tv = ttk.Treeview(
             table_frame.content, columns=cols, show="headings",
             selectmode="browse", style="Watchlist.Treeview"
         )
-        col_widths = [36, 100, 130, 140, 90, 80, 70, 90, 80, 50, 50, 60, 90, 200, 80]
-        sortable_cols = ("Symbol", "Signal", "P/E", "IV (DCF)")
-        
-        for c, w in zip(cols, col_widths):
-            if c in sortable_cols:
-                self._tv.heading(c, text=f"{c} ↕", command=lambda col=c: treeview_sort_column(self._tv, col, False), anchor="w" if c != "#" else "center")
-            else:
-                self._tv.heading(c, text=c, anchor="w" if c != "#" else "center")
-            self._tv.column(c, width=w, minwidth=w, anchor="w" if c != "#" else "center")
-        self._tv.heading("Added", text="Added", anchor="center")
-        self._tv.column("Added", anchor="center")
+        HeadingTips(self._tv, {
+            "Signal": "Suggestion from the valuation checks",
+            "Current Px": "Latest market price",
+            "IV (DCF)": "Fair value from a discounted-cash-flow estimate",
+            "MoS %": "Margin of safety: how far the price is below fair value",
+            "Graham No.": "Benjamin Graham's fair price: √(22.5 × EPS × book value per share)",
+            "Analyst Tgt": "Average analyst price target",
+            "My Target": "Your own target price",
+            "P/E": "Price ÷ earnings per share (lower can mean cheaper)",
+            "PEG": "P/E ÷ earnings growth (under 1 can mean cheap for its growth)",
+            "Div. Yield": "Yearly dividend as a % of the price",
+            "From 52W H": "How far the price is below its 52-week high",
+        })
+        col_widths = [40, 120, 140, 250, 100, 100, 80, 100, 100, 100, 60, 60, 90, 100, 110, 220, 100]
+        sortable_cols = ("Symbol", "Signal", "Current Px", "IV (DCF)", "MoS %", "P/E", "Div. Yield", "From 52W H", "Added")
 
-        # Tag styles
-        self._tv.tag_configure("odd",  background=ModernStyle.BG_SECONDARY)
-        self._tv.tag_configure("even", background=ModernStyle.BG_PRIMARY)
-        # Signal-based full row background colouring
-        self._tv.tag_configure("sig_strong_buy", background="#DCFCE7", foreground="#15803D")  # pastel green
-        self._tv.tag_configure("sig_accumulate", background="#d2fee2", foreground="#065F46")  # much more visible green
-        self._tv.tag_configure("sig_wait",        background="#FFF7ED", foreground="#C2410C")  # pastel orange
-        self._tv.tag_configure("sig_avoid",       background="#FEF2F2", foreground="#B91C1C")  # pastel red
-        self._tv.tag_configure("undervalued",     background="#D1FAE5", foreground="#065F46", font=ModernStyle.FONT_SMALL_BOLD)
-        self._tv.tag_configure("overvalued",      background="#FEE2E2", foreground="#991B1B", font=ModernStyle.FONT_SMALL_BOLD)
+        for c, w in zip(cols, col_widths):
+            anchor = "center" if c in ("#", "Added") else "w"
+            if c in sortable_cols:
+                self._tv.heading(c, text=f"{c} ↕", anchor=anchor,
+                                 command=lambda col=c: treeview_sort_column(self._tv, col, False))
+            else:
+                self._tv.heading(c, text=c, anchor=anchor)
+            self._tv.column(c, width=w, minwidth=w, anchor=anchor)
+
+        # Row colours by signal. Configured BEFORE the plain stripes so they win
+        # if a sort adds "odd"/"even" tags; "odd"/"even" themselves carry no
+        # colour (rows without a signal use the "plain_*" stripes).
+        for key in SIGNAL_ORDER:
+            if key == "nodata":
+                continue
+            fg, pale, _fill = signal_colours(key)
+            self._tv.tag_configure(f"sig_{key}", background=pale, foreground=fg)
+        self._tv.tag_configure("plain_odd", background=ModernStyle.BG_SECONDARY, foreground=ModernStyle.TEXT_PRIMARY)
+        self._tv.tag_configure("plain_even", background=ModernStyle.TABLE_ROW_ALT, foreground=ModernStyle.TEXT_PRIMARY)
 
         vsb = ttk.Scrollbar(table_frame.content, orient="vertical",   command=self._tv.yview)
         hsb = ttk.Scrollbar(table_frame.content, orient="horizontal", command=self._tv.xview)
@@ -225,18 +738,17 @@ class WatchlistView(BaseView):
         self._tv.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        table_frame.content.grid_rowconfigure(0, weight=1)
-        table_frame.content.grid_columnconfigure(0, weight=1)
-        
-        # Add right click copy menu
+
         add_treeview_copy_menu(self._tv)
 
-        # Row selection → fill form
+        # Row selection → fill form (mouse and arrow keys); double-click → analysis
         self._tv.bind("<ButtonRelease-1>", self._on_row_select)
+        self._tv.bind("<KeyRelease-Up>",   self._on_row_select)
+        self._tv.bind("<KeyRelease-Down>", self._on_row_select)
         self._tv.bind("<Double-1>",        self._on_double_click)
-
-        # Allow Escape to deselect
-        self.bind("<Escape>", lambda _: self._clear_form())
+        self._tv.bind("<Return>",          self._on_double_click)
+        # Escape clears the form from the table or any form field (they take focus)
+        self._tv.bind("<Escape>", self._clear_form)
 
     # ── Data loading ──────────────────────────────────────────────────────────
 
@@ -246,318 +758,148 @@ class WatchlistView(BaseView):
         self.load_data()
 
     def load_data(self):
-        self._data_loaded = True
-        threading.Thread(target=self._bg_load, daemon=True).start()
+        from model.watchlist_db import get_all_watchlist, watchlist_columns
 
-    def _bg_load(self):
-        try:
-            from model.watchlist_db import get_all_watchlist
-            data = get_all_watchlist()
-            self.after(0, lambda: self._populate_table(data))
-        except Exception as exc:
-            print(f"[Watchlist] load error: {exc}")
+        self._data_loaded = True
+        self._load_gen += 1
+        gen = self._load_gen
+        run_in_background(
+            lambda: (get_all_watchlist(), watchlist_columns()),
+            on_done=lambda res: self._on_loaded(gen, res),
+            on_error=lambda err: self._notify(f"Couldn't load the watchlist: {err}", "error"),
+            widget=self, name="watchlist-load",
+        )
+
+    def _on_loaded(self, gen: int, result) -> None:
+        if gen != self._load_gen:
+            return  # a newer load is on its way
+        rows, columns = result
+        self._db_columns = set(columns)
+        for key in self._optional_cols:
+            if key in self._db_columns and key not in self._metrics_vars:
+                self._metrics_vars[key] = tk.StringVar()
+                self._metrics_keys.append(key)
+        self._populate_table(rows)
+        if self._selected_id is not None and self._tv.exists(str(self._selected_id)):
+            self._tv.selection_set(str(self._selected_id))
+
+    # ── Filter pills ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _pill_text(key: str, count: int | None) -> str:
+        label = "All" if key == "all" else f"{SIGNAL_TEXT[key][0]} {SIGNAL_TEXT[key][1]}"
+        return label if count is None else f"{label} {count}"
+
+    def _style_pills(self) -> None:
+        for key, pill in self._filter_pills.items():
+            fg, pale, fill = signal_colours(key)
+            if key == self._signal_filter:
+                pill.config(bg=fill, fg=ModernStyle.TEXT_ON_ACCENT, font=ModernStyle.FONT_SMALL_BOLD)
+            else:
+                pill.config(bg=pale, fg=fg, font=ModernStyle.FONT_SMALL)
+
+    def _set_signal_filter(self, key: str) -> None:
+        if key == self._signal_filter:
+            return
+        self._signal_filter = key
+        self._style_pills()
+        self._populate_table()
 
     # ── Table rendering ───────────────────────────────────────────────────────
 
-    def _populate_table(self, data: list[dict]) -> None:
-        self._data = data
+    def _populate_table(self, data: list[dict] | None = None) -> None:
+        if data is not None:
+            self._data = data
         self._tv.delete(*self._tv.get_children())
-        for i, row in enumerate(data):
+
+        counts = {k: 0 for k in SIGNAL_ORDER}
+        shown = 0
+        for row in self._data:
+            key, signal_badge_text, _ = compute_signal(row)
+            counts[key] += 1
+            if self._signal_filter != "all" and key != self._signal_filter:
+                continue
+
             sym = row.get("symbol", "")
             cy = "¥" if str(sym).upper().endswith(".T") else "₹"
-            analyst_target = str(row.get("analyst_target") or "—").strip()
-            target_str = analyst_target if analyst_target and analyst_target != "None" else "—"
-            tag = "odd" if i % 2 == 0 else "even"
-            signal_badge, _ = self._compute_signal(row)
-            # Build Sector / Industry combined cell
-            sector = row.get("sector", "") or ""
-            industry = row.get("industry", "") or ""
-            sector_cell = " / ".join(filter(None, [sector, industry])) or "—"
-            
-            # Determine conditional styling tag for the current value cell
-            curr_val = row.get("current_value")
-            intr_val = row.get("intrinsic_value")
-            cv_str = str(curr_val).replace("₹", cy) if curr_val else "—"
-            iv_str = str(intr_val).replace("₹", cy) if intr_val else "—"
-            target_str = str(target_str).replace("₹", cy)
-            
-            cv_f = self._parse_num(curr_val)
-            iv_f = self._parse_num(intr_val)
-            
-            mos_str = "—"
-            graham_str = "—"
-            from_high_str = "—"
-            
-            # Additional UI Context Computations
+
+            def money(text):
+                text = str(text or "").strip()
+                return text.replace("₹", cy) if text and text != "None" else "—"
+
+            sector_cell = " / ".join(filter(None, [row.get("sector") or "", row.get("industry") or ""])) or "—"
+            cv_f = parse_num(row.get("current_value"))
+            iv_f = parse_num(row.get("intrinsic_value"))
+
+            mos_str = graham_str = from_high_str = "—"
             if cv_f is not None:
-                # 1. Margin of Safety
                 if iv_f is not None and iv_f > 0:
-                    mos_pct = ((iv_f - cv_f) / iv_f) * 100
-                    prefix = "▲ +" if mos_pct > 0 else "▼ "
-                    mos_str = f"{prefix}{mos_pct:.1f}%"
-                    
-                # 2. Graham Number
-                eps_f = self._parse_num(str(row.get("eps")))
-                bv_f = self._parse_num(str(row.get("book_value")))
-                if eps_f and bv_f and eps_f > 0 and bv_f > 0:
-                    import math
-                    graham_val = math.sqrt(22.5 * eps_f * bv_f)
-                    graham_str = f"{cy}{graham_val:.1f}"
-                    
-                # 3. Distance from 52-Week High
-                range_52 = str(row.get("week52_range") or "")
-                if range_52 and "–" in range_52:
-                    parts = range_52.split("–")
-                    if len(parts) == 2:
-                        high_f = self._parse_num(parts[1])
-                        if high_f and high_f > 0:
-                            drop_pct = ((cv_f - high_f) / high_f) * 100
-                            prefix = "▲ +" if drop_pct > 0 else "▼ "
-                            from_high_str = f"{prefix}{drop_pct:.1f}%"
-            
-            price_tag = tag # Default to normal row color
-            if cv_f and iv_f:
-                if iv_f > 0: # Avoid division by zero
-                    if cv_f < iv_f * 0.85: # Strong undervaluation
-                        price_tag = "undervalued"
-                    elif cv_f > iv_f * 1.15: # Strong overvaluation
-                        price_tag = "overvalued"
-                
-            # Determine signal tag for full-row background coloring
-            sig_tag = "odd"
-            sig_lower = signal_badge.lower()
-            if "strong buy" in sig_lower:
-                sig_tag = "sig_strong_buy"
-            elif "accumulate" in sig_lower:
-                sig_tag = "sig_accumulate"
-            elif "wait" in sig_lower or "watch" in sig_lower:
-                sig_tag = "sig_wait"
-            elif "avoid" in sig_lower:
-                sig_tag = "sig_avoid"
+                    mos_pct = (iv_f - cv_f) / iv_f * 100
+                    mos_str = f"{'▲ +' if mos_pct > 0 else '▼ '}{mos_pct:.1f}%"
+                gn = graham_number(row)
+                if gn:
+                    graham_str = f"{cy}{gn:,.1f}"
+                rng = _week52(row)
+                if rng and rng[1] > 0:
+                    drop_pct = (cv_f - rng[1]) / rng[1] * 100
+                    from_high_str = f"{'▲ +' if drop_pct > 0 else '▼ '}{drop_pct:.1f}%"
+
+            target = parse_num(row.get("target_price"))
+            if target and target > 0:
+                hit = cv_f is not None and cv_f <= target
+                my_target = f"{'🎯 ' if hit else ''}{cy}{target:,.2f}"
             else:
-                sig_tag = tag  # fallback to odd/even default
-            
-            # Use valuation override when signal is neutral/unavailable
-            row_tags = (sig_tag,) if sig_tag not in ("odd", "even") else (tag,)
-            if price_tag in ("undervalued", "overvalued") and sig_tag in ("odd", "even"):
-                row_tags = (price_tag,)  # Only apply valuation color if no signal color
+                my_target = "—"
+
+            if key == "nodata":
+                row_tag = "plain_odd" if shown % 2 == 0 else "plain_even"
+            else:
+                row_tag = f"sig_{key}"
 
             self._tv.insert(
                 "", "end",
                 iid=str(row["id"]),
                 values=(
-                    i + 1,
-                    row.get("symbol", ""),
-                    signal_badge,
+                    shown + 1,
+                    sym,
+                    signal_badge_text,
                     sector_cell,
-                    cv_str,
-                    iv_str,
+                    money(row.get("current_value")),
+                    money(row.get("intrinsic_value")),
                     mos_str,
                     graham_str,
-                    target_str,
-                    row.get("pe_ratio", "") or "—",
-                    row.get("peg_ratio", "") or "—",
-                    row.get("dividend_yield", "") or "—",
+                    money(row.get("analyst_target")),
+                    my_target,
+                    row.get("pe_ratio") or "—",
+                    row.get("peg_ratio") or "—",
+                    row.get("dividend_yield") or "—",
                     from_high_str,
-                    row.get("notes", "") or row.get("stock_name", "") or "",
+                    row.get("tags") or "",
+                    row.get("notes") or row.get("stock_name") or "",
                     row.get("added_on", ""),
                 ),
-                tags=row_tags,
+                tags=(row_tag,),
             )
+            shown += 1
 
-    # ── Signal Engine ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _parse_num(val_str: str) -> float | None:
-        """Strip common formatting and return float or None."""
-        if not val_str or str(val_str).strip() in ("", "None", "—"):
-            return None
-        clean = str(val_str).replace(",", "").replace("%", "").replace("₹","").replace("¥","").replace("$","").replace("£","").replace(" Cr","e7").strip()
-        # Handle '1.4e7' style if Cr suffix was converted
-        clean = clean.replace("Cre7", "e7")
-        try:
-            return float(clean)
-        except ValueError:
-            return None
-
-    def _compute_signal(self, row: dict) -> tuple[str, str]:
-        """Compute buy/sell signal and reason tip from row metrics.
-        Returns (badge_text, reason_tip_text).
-        """
-        score = 0
-        max_score = 0
-        reasons_pass = []
-        reasons_fail = []
-
-        def check(label, key, condition_fn, tip_pass, tip_fail):
-            nonlocal score, max_score
-            max_score += 1
-            v = self._parse_num(str(row.get(key, "")))
-            if v is None:
-                return  # No data = no score
-            if condition_fn(v):
-                score += 1
-                reasons_pass.append(f"✅ {label}: {tip_pass}")
-            else:
-                score -= 1
-                reasons_fail.append(f"❌ {label}: {tip_fail}")
-
-        # === Valuation ===
-        check("P/E", "pe_ratio",
-              lambda v: 0 < v < 30,
-              "Reasonable valuation", "Overvalued or negative earnings")
-        check("PEG Ratio", "peg_ratio",
-              lambda v: v < 2.0,
-              "Growth at fair price", "Expensive relative to growth")
-        check("P/B Ratio", "pb_ratio",
-              lambda v: v < 3.0,
-              "Reasonable price-to-book", "High price vs book value")
-        check("Debt/Equity", "debt_to_equity",
-              lambda v: v < 1.0,
-              "Low financial leverage", "High debt is risky")
-        check("Current Ratio", "current_ratio",
-              lambda v: v >= 1.5,
-              "Healthy short-term liquidity", "May struggle to meet short-term obligations")
-
-        # === Profitability ===
-        check("ROE", "roe",
-              lambda v: v >= 12.0,
-              "Strong return on equity", "Weak returns for shareholders")
-        check("ROCE", "roce",
-              lambda v: v >= 12.0,
-              "Efficient capital allocation", "Capital not being used efficiently")
-        check("OPM", "opm",
-              lambda v: v >= 10.0,
-              "Healthy operating margins", "Thin operating margins")
-        check("Net Profit Margin", "net_profit_margin",
-              lambda v: v >= 8.0,
-              "Solid profitability", "Low net margins")
-        check("Free Cash Flow", "free_cash_flow",
-              lambda v: v > 0,
-              "Positive FCF — company self-funds growth", "Negative FCF — cash burn risk")
-        check("EBITDA Margin", "ebitda_margin",
-              lambda v: v >= 15.0,
-              "Good earnings before interest and taxes", "Low EBITDA margins")
-
-        # === Growth ===
-        check("Sales Gr", "sales_growth", lambda v: v >= 10.0, "Strong revenue growth", "Sluggish growth")
-        check("Profit Gr", "profit_growth", lambda v: v >= 10.0, "Earnings expanding rapidly", "Profit growth lagging")
-        check("3Y Rev CAGR", "revenue_cagr_3y", lambda v: v >= 10.0, "Consistent 3-year revenue compounding", "Inconsistent long-term revenue")
-        check("3Y Profit CAGR", "profit_cagr_3y", lambda v: v >= 10.0, "Consistent 3-year profit compounding", "Inconsistent long-term profit")
-        check("QoQ Op", "qoq_op_profit", lambda v: v > 0, "Sequential operating improvement", "Operating profit declined")
-
-        # === Intrinsic Value ===
-        # Special check comparing IV to Current Price
-        # In Watchlist, these are mostly strings formatted with currency, so we need to parse them
-        try:
-            cp_str = str(row.get("current_value", ""))
-            iv_str = str(row.get("intrinsic_value", ""))
-            if cp_str and iv_str and cp_str != "—" and iv_str != "—":
-                cp = float(cp_str.replace("₹", "").replace("¥", "").replace(",", ""))
-                iv = float(iv_str.replace("₹", "").replace("¥", "").replace(",", ""))
-                
-                if cp > 0 and iv > 0:
-                    max_score += 2 # Give higher weight to margin of safety
-                    if cp < iv * 0.8: # >20% margin of safety
-                        score += 2
-                        reasons_pass.append("✅ Intrinsic Value: Trading at >20% discount to DCF value (Safety Margin)")
-                    elif cp < iv: 
-                        score += 1
-                        reasons_pass.append("✅ Intrinsic Value: Trading below DCF intrinsic value")
-                    else:
-                        score -= 1 # Not necessarily a double penalty
-                        reasons_fail.append("❌ Intrinsic Value: Trading above DCF intrinsic value (Overvalued)")
-        except: pass
-
-        gn_str = str(row.get("graham_number", ""))
-        try:
-            if gn_str and gn_str != "—" and gn_str != "None":
-                cp = float(str(row.get("current_value", "")).replace("₹", "").replace("¥", "").replace(",", ""))
-                gn = float(gn_str.replace("₹", "").replace("¥", "").replace(",", ""))
-                if gn and cp:
-                    max_score += 1
-                    if cp < gn:
-                        score += 1
-                        reasons_pass.append("✅ Graham Number: Price is below classic defensive valuation limit")
-                    else:
-                        score -= 1
-                        reasons_fail.append("❌ Graham Number: Price exceeds defensive valuation threshold")
-        except: pass
-
-        # === Additional Technical / Valuation ===
-        check("Dividend", "dividend_yield", lambda v: v >= 1.2, "Healthy dividend payout", "Low or no dividend yield")
-        
-        atpt_str = str(row.get("analyst_target", ""))
-        try:
-            if atpt_str and atpt_str != "—" and atpt_str != "None":
-                cp = float(str(row.get("current_value", "")).replace("₹", "").replace("¥", "").replace(",", ""))
-                at = float(atpt_str.replace("₹", "").replace("¥", "").replace(",", ""))
-                if cp and at:
-                    max_score += 1
-                    if cp < at * 0.9:
-                        score += 1
-                        reasons_pass.append("✅ Analyst Target: Price is >10% below average analyst target")
-                    elif cp > at * 1.1:
-                        score -= 1
-                        reasons_fail.append("❌ Analyst Target: Price exceeds analyst target by >10%")
-        except: pass
-
-        range52_str = str(row.get("week52_range", ""))
-        try:
-            if range52_str and "–" in range52_str:
-                parts = range52_str.split("–")
-                if len(parts) == 2:
-                    l52 = float(parts[0].replace(",", "").strip())
-                    h52 = float(parts[1].replace(",", "").strip())
-                    cp = float(str(row.get("current_value", "")).replace("₹", "").replace("¥", "").replace(",", ""))
-                    if l52 < h52 and cp:
-                        max_score += 1
-                        pos_pct = (cp - l52) / (h52 - l52)
-                        if pos_pct < 0.25:
-                            score += 1
-                            reasons_pass.append("✅ 52W Range: Trading near 52-week lows (Potential value)")
-                        elif pos_pct > 0.85:
-                            score -= 1
-                            reasons_fail.append("❌ 52W Range: Trading near 52-week highs (Potential resistance zone)")
-        except: pass
-
-        # === Ownership ===
-        check("Promoters", "promoter_holding", lambda v: v >= 40.0, "Promoters have skin in the game", "Low promoter confidence")
-
-        # === Technical ===
-        check("RSI", "rsi", lambda v: 30.0 <= v <= 65.0, "Good entry zone", "Overbought or deeply oversold")
-        check("Beta", "beta", lambda v: v < 1.5, "Lower volatility vs market", "High beta — volatile stock")
-        check("MACD", "macd", lambda v: v > 0, "Short-term momentum is bullish", "Short-term momentum is bearish")
-
-        # ── Determine badge ──
-        pct = score / max_score if max_score else 0
-        if pct >= 0.65:
-            badge = " 🟢  Strong Buy "
-        elif pct >= 0.4:
-            badge = " 🌲  Accumulate "
-        elif pct >= 0.1:
-            badge = " 🔸  Wait / Watch "
-        else:
-            badge = " 🔻  Avoid "
-
-        # ── Build reason tip ──
-        tip_lines = [f"Signal: {badge}  (Score: {score}/{max_score})"]
-        if reasons_pass:
-            tip_lines.append("\nStrengths:")
-            tip_lines.extend(reasons_pass)
-        if reasons_fail:
-            tip_lines.append("\nWeaknesses:")
-            tip_lines.extend(reasons_fail)
-        if score == 0 and max_score == 0:
-            tip_lines.append("No metrics fetched yet. Use Auto-Fill to populate.")
-        tip = "\n".join(tip_lines)
-
-        return badge, tip
+        total = len(self._data)
+        for key, pill in self._filter_pills.items():
+            pill.config(text=self._pill_text(key, total if key == "all" else counts[key]))
 
     # ── Form helpers ──────────────────────────────────────────────────────────
 
+    def _set_delete_enabled(self, enabled: bool) -> None:
+        # A grey surface when disabled, so the greyed-out text stays readable
+        try:
+            self._del_btn.set_palette(bg=ModernStyle.ERROR_FILL if enabled else ModernStyle.BG_TERTIARY)
+            self._del_btn.set_disabled(not enabled)
+        except Exception:
+            pass
+
     def _clear_form(self, _=None) -> None:
         self._selected_id = None
+        self._loaded = {}
+        self._loaded_metrics = {}
         self._v_symbol.set("")
         self._v_notes.set("")
         self._v_tags.set("")
@@ -565,964 +907,495 @@ class WatchlistView(BaseView):
         for v in self._metrics_vars.values():
             v.set("")
         self._form_status.config(text="", fg=ModernStyle.TEXT_TERTIARY)
+        self._set_delete_enabled(False)
         try:
-            self._del_btn.set_disabled(True)
-        except Exception:
-            pass
-        try:
-            for sel in self._tv.selection():
-                self._tv.selection_remove(sel)
+            self._tv.selection_remove(*self._tv.selection())
         except Exception:
             pass
 
+    def _row_by_iid(self, iid) -> dict | None:
+        return next((r for r in self._data if str(r["id"]) == str(iid)), None)
 
     def _on_double_click(self, _=None):
         sel = self._tv.selection()
-        if not sel: return
-        iid = sel[0]
-        try:
-            row = next(r for r in self._data if str(r["id"]) == str(iid))
-        except StopIteration: return
-        self._open_diagnostic_popup(row)
+        row = self._row_by_iid(sel[0]) if sel else None
+        if row:
+            self._open_diagnostic_popup(row)
 
     def _on_row_select(self, _=None) -> None:
         sel = self._tv.selection()
-        if not sel:
-            return
-        iid = sel[0]
-        # Find row dict by id
-        try:
-            row = next(r for r in self._data if str(r["id"]) == str(iid))
-        except StopIteration:
+        row = self._row_by_iid(sel[0]) if sel else None
+        if row is None:
             return
 
+        sym = row.get("symbol", "") or ""
+        cy = "¥" if sym.upper().endswith(".T") else "₹"
+        target = parse_num(row.get("target_price")) or 0.0
+
         self._selected_id = row["id"]
-        self._v_symbol.set(row.get("symbol", ""))
-        self._v_notes.set(row.get("notes", ""))
-        self._v_tags.set(row.get("tags", ""))
-        target = row.get("target_price") or 0.0
-        
-        sym = row.get("symbol", "")
-        cy = "¥" if str(sym).upper().endswith(".T") else "₹"
-        
-        self._v_target.set(str(target) if target else "")
+        self._loaded = {
+            "symbol": sym.upper(),
+            "notes": (row.get("notes") or "").strip(),
+            "tags": (row.get("tags") or "").strip(),
+            "target_price": target,
+        }
+        self._v_symbol.set(sym)
+        self._v_notes.set(self._loaded["notes"])
+        self._v_tags.set(self._loaded["tags"])
+        self._v_target.set(f"{target:g}" if target else "")
+        for e in self._entries:
+            e.config(fg=e.normal_color)   # not the grey placeholder colour
+
+        self._loaded_metrics = {}
         for k, v in self._metrics_vars.items():
-            val = row.get(k, "")
-            if isinstance(val, str):
-                val = val.replace("₹", cy)
+            val = row.get(k)
+            val = "" if val is None else str(val).replace("₹", cy)
             v.set(val)
-        self._form_status.config(
-            text=f"Editing: {row.get('symbol', '')}",
-            fg=ModernStyle.ACCENT_TERTIARY,
-        )
-        try:
-            self._del_btn.set_disabled(False)
-        except Exception:
-            pass
+            self._loaded_metrics[k] = val.strip()
+        self._form_status.config(text=f"✏️ Editing {sym}", fg=ModernStyle.TEXT_ACCENT)
+        self._set_delete_enabled(True)
+
+    def _read_form(self) -> dict | None:
+        """The form's values, or None (after telling the user) when invalid."""
+        symbol = self._v_symbol.get().strip().upper()
+        if not symbol:
+            self._notify("Symbol is required.", "error")
+            try:
+                self._e_symbol.focus_set()
+            except Exception:
+                pass
+            return None
+        target_text = self._v_target.get().strip()
+        target = parse_num(target_text) if target_text else 0.0
+        if target is None or target < 0:
+            self._notify("Target price must be a number, e.g. 1250 or 1250.50.", "error")
+            return None
+        return {"symbol": symbol, "notes": self._v_notes.get().strip(),
+                "tags": self._v_tags.get().strip(), "target_price": target}
+
+    def _metric_values(self) -> dict[str, str]:
+        return {k: v.get().strip() for k, v in self._metrics_vars.items()}
 
     # ── CRUD event handlers ───────────────────────────────────────────────────
 
-    def _on_save(self) -> None:
+    def _on_save(self) -> bool:
+        """Add a new entry, or save the CHANGED fields of the selected one.
+
+        Returns True when a save was started.
+        """
         from model.watchlist_db import add_watchlist, update_watchlist
 
-        symbol = self._v_symbol.get().strip().upper()
-        if not symbol:
-            self._flash_status("⚠  Symbol is required.", error=True)
-            return
+        form = self._read_form()
+        if form is None:
+            return False
 
-        notes  = self._v_notes.get().strip()
-        tags   = self._v_tags.get().strip()
-        target = 0.0
+        if self._selected_id is None:
+            metrics = {k: v for k, v in self._metric_values().items() if v}
+            symbol = form["symbol"]
+            self._run_db(lambda: add_watchlist(symbol, form["notes"], form["tags"], form["target_price"], **metrics),
+                         f"'{symbol}' added to watchlist.")
+            return True
 
+        changes: dict = {}
+        for key in ("symbol", "notes", "tags"):
+            if form[key] != self._loaded.get(key, ""):
+                changes[key] = form[key]
+        if abs(form["target_price"] - self._loaded.get("target_price", 0.0)) > 1e-9:
+            changes["target_price"] = form["target_price"]
+        for k, val in self._metric_values().items():
+            if val != self._loaded_metrics.get(k, ""):
+                changes[k] = val
+        if not changes:
+            self._notify(f"No changes to save for {form['symbol']}.", "info")
+            return True
 
-        def _bg():
-            try:
-                metrics = {k: v.get().strip() for k, v in self._metrics_vars.items()}
-                if self._selected_id is None:
-                    add_watchlist(symbol, notes, tags, target, **metrics)
-                    msg = f"✅  '{symbol}' added to watchlist."
-                else:
-                    update_watchlist(self._selected_id, symbol, notes, tags, target, **metrics)
-                    msg = f"✅  '{symbol}' updated."
-                self.after(0, lambda: self._post_save(msg))
-            except ValueError as exc:
-                self.after(0, lambda: self._flash_status(f"⚠  {exc}", error=True))
-            except Exception as exc:
-                self.after(0, lambda: self._flash_status(f"⚠  {exc}", error=True))
-
-        threading.Thread(target=_bg, daemon=True).start()
+        row_id = self._selected_id
+        self._run_db(lambda: update_watchlist(row_id, **changes), f"'{form['symbol']}' updated.")
+        return True
 
     def _on_quick_add(self) -> None:
-        """Always add to the watchlist — never overwrite an existing entry."""
+        """Always add a NEW entry — never overwrite an existing one.
+
+        When a row is selected and you type a different symbol, the selected
+        row's metrics, notes, tags and target are NOT copied to the new entry
+        (only what you changed in the form is used).
+        """
         from model.watchlist_db import add_watchlist
 
-        symbol = self._v_symbol.get().strip().upper()
-        if not symbol:
-            self._flash_status("⚠  Symbol is required.", error=True)
+        form = self._read_form()
+        if form is None:
             return
-
-        notes  = self._v_notes.get().strip()
-        tags   = self._v_tags.get().strip()
-        target = 0.0
-
-        def _bg():
-            try:
-                metrics = {k: v.get().strip() for k, v in self._metrics_vars.items()}
-                add_watchlist(symbol, notes, tags, target, **metrics)
-                msg = f"✅  '{symbol}' added to watchlist."
-                self.after(0, lambda: self._post_save(msg))
-            except ValueError as exc:
-                self.after(0, lambda: self._flash_status(f"⚠  {exc}", error=True))
-            except Exception as exc:
-                self.after(0, lambda: self._flash_status(f"⚠  {exc}", error=True))
-
-        threading.Thread(target=_bg, daemon=True).start()
+        symbol = form["symbol"]
+        if self._selected_id is None or symbol == self._loaded.get("symbol"):
+            notes, tags, target = form["notes"], form["tags"], form["target_price"]
+            metrics = {k: v for k, v in self._metric_values().items() if v} if self._selected_id is None else {}
+        else:
+            notes = form["notes"] if form["notes"] != self._loaded.get("notes") else ""
+            tags = form["tags"] if form["tags"] != self._loaded.get("tags") else ""
+            target = form["target_price"] if form["target_price"] != self._loaded.get("target_price") else 0.0
+            metrics = {}
+        self._run_db(lambda: add_watchlist(symbol, notes, tags, target, **metrics),
+                     f"'{symbol}' added to watchlist.")
 
     def _on_delete(self) -> None:
+        from model.watchlist_db import delete_watchlist
+
         if self._selected_id is None:
             return
-        symbol = self._v_symbol.get().strip().upper() or str(self._selected_id)
+        symbol = self._loaded.get("symbol") or self._v_symbol.get().strip().upper() or str(self._selected_id)
         if not messagebox.askyesno(
             "Delete from Watchlist",
             f"Remove '{symbol}' from your watchlist?",
             parent=self,
         ):
             return
-
         row_id = self._selected_id
+        self._run_db(lambda: delete_watchlist(row_id), f"'{symbol}' removed.")
 
-        def _bg():
-            try:
-                from model.watchlist_db import delete_watchlist
-                delete_watchlist(row_id)
-                self.after(0, lambda: self._post_save(f"🗑  '{symbol}' removed."))
-            except Exception as exc:
-                self.after(0, lambda: self._flash_status(f"⚠  {exc}", error=True))
-
-        threading.Thread(target=_bg, daemon=True).start()
+    def _run_db(self, work, success_msg: str) -> None:
+        """Run a database write in the background; report success or the error."""
+        run_in_background(
+            work,
+            on_done=lambda _res: self._post_save(success_msg),
+            on_error=lambda err: self._notify(str(err) if isinstance(err, ValueError)
+                                              else f"Couldn't save: {err}", "error"),
+            widget=self, name="watchlist-save",
+        )
 
     def _post_save(self, msg: str) -> None:
         """Refresh table, clear form, show success message."""
         self._clear_form()
-        self._flash_status(msg, error=False)
+        self._notify(msg, "success")
         self.load_data()
 
-    def _flash_status(self, msg: str, *, error: bool = False) -> None:
+    def _notify(self, msg: str, kind: str = "success") -> None:
+        """Show a toast (success / info / warning / error)."""
         try:
-            from ui_utils import show_toast
-            
-            # Clean up the emoji since the toast provides its own
-            clean_msg = msg.replace("✅  ", "").replace("🗑  ", "").replace("⚠  ", "").replace("✅ ", "").replace("🗑 ", "").replace("⚠ ", "")
-            show_toast(self.winfo_toplevel(), clean_msg, type="error" if error else "success")
-            
-            # Fallback for the old label, clear it out
-            self._form_status.config(text="")
+            show_toast(self.winfo_toplevel(), msg, type=kind)
         except Exception:
-            # Absolute fallback if ui_utils fails
-            color = ModernStyle.ERROR if error else ModernStyle.SUCCESS
+            color = ModernStyle.ERROR if kind == "error" else ModernStyle.SUCCESS
             self._form_status.config(text=msg, fg=color)
 
-# ── Edit Metrics Dialog ───────────────────────────────────────────────────
+    # ── Auto-Fill one symbol (Edit Metrics dialog) ────────────────────────────
 
-
-    # ── Auto Fetch Metrics (yfinance) ─────────────────────────────────────────
+    def _set_fetch_btn(self, text: str) -> None:
+        if _alive(self._fetch_btn):
+            self._fetch_btn.set_text(text)
 
     def _auto_fetch_metrics(self):
+        if self._autofill_running:
+            return
         symbol = self._v_symbol.get().strip().upper()
         if not symbol:
-            self._flash_status("⚠ Enter a symbol first to auto-fetch.", error=True)
+            self._notify("Enter a symbol first to auto-fill.", "error")
             return
-            
-        # Optional NS suffix handling for Indian stocks
-        yf_symbol = symbol
-        if not yf_symbol.endswith('.NS') and not yf_symbol.endswith('.BO'):
-            # If standard Indian symbol length and no dot, default to NSE
-            if len(yf_symbol) < 10 and '.' not in yf_symbol:
-                yf_symbol += '.NS'
+        self._autofill_running = True
+        self._set_fetch_btn("🔄 Fetching…")
+        columns = set(self._db_columns)
+        run_in_background(
+            lambda: fetch_watchlist_metrics(symbol, columns),
+            on_done=lambda res: self._on_autofill_done(symbol, res),
+            on_error=lambda err: self._on_autofill_failed(symbol, err),
+            widget=self, name="watchlist-autofill",
+        )
 
-        try:
-            if hasattr(self, "_fetch_btn"):
-                self._fetch_btn.set_text("🔄 Fetching...")
-                self._fetch_btn.set_disabled(True)
-        except Exception:
-            pass
+    def _reset_fetch_btn_later(self) -> None:
+        self.after(2500, lambda: self._set_fetch_btn("↻ Auto-Fill (yfinance)"))
 
-        def bg_fetch():
-            try:
-                # import yfinance as yf
-                ticker = yf.Ticker(yf_symbol)
-                info = ticker.info
-                
-                curr = info.get("financialCurrency") or info.get("currency") or ""
-                if str(curr).upper() == "JPY": cy = "¥"
-                elif str(curr).upper() == "USD": cy = "$"
-                else: cy = "¥" if symbol.endswith(".T") else "₹"
-                
-                # Fetch RSI, Sharpe Ratio, MACD, etc using historical data
-                hist = ticker.history(period="3y")
-                rsi_val = ""
-                sharpe_val = ""
-                macd_val = ""
-                supp_res = ""
-                
-                if not hist.empty and len(hist) >= 30:
-                    recent_hist = hist.tail(252) # Use last year for technicals
-                    
-                    # RSI
-                    delta = recent_hist['Close'].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                    rs = gain / loss
-                    rsi = 100 - (100 / (1 + rs))
-                    rsi_last = rsi.iloc[-1]
-                    if pd.notna(rsi_last):
-                        rsi_val = f"{rsi_last:.1f}"
-                        
-                    # MACD
-                    exp12 = recent_hist['Close'].ewm(span=12, adjust=False).mean()
-                    exp26 = recent_hist['Close'].ewm(span=26, adjust=False).mean()
-                    macd_line = exp12 - exp26
-                    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-                    
-                    if pd.notna(macd_line.iloc[-1]) and pd.notna(signal_line.iloc[-1]):
-                        macd_val = f"{(macd_line.iloc[-1] - signal_line.iloc[-1]):.2f}"
-                        
-                    # Target Support / Resistance
-                    # cur_p = recent_hist['Close'].iloc[-1] # Not used directly for supp_res string
-                    recent_min = recent_hist['Low'].tail(60).min()
-                    recent_max = recent_hist['High'].tail(60).max()
-                    if pd.notna(recent_min) and pd.notna(recent_max):
-                        supp_res = f"{recent_min:.0f} / {recent_max:.0f}"
-                
-                    # Sharpe Ratio (Approximate)
-                    returns = recent_hist['Close'].pct_change().dropna()
-                    if len(returns) > 20:
-                        # Annualized return - risk free (7%) / Annualized Volatility
-                        rf = 0.07 / 252 # Daily risk free
-                        excess_ret = returns - rf
-                        if excess_ret.std() > 0:
-                            sharpe = (excess_ret.mean() / excess_ret.std()) * (252**0.5)
-                            sharpe_val = f"{sharpe:.2f}"
+    def _on_autofill_done(self, symbol: str, result) -> None:
+        self._autofill_running = False
+        yf_symbol, values = result
+        filled = 0
+        for key, text in values.items():
+            var = self._metrics_vars.get(key)
+            if var is not None:
+                var.set(text)
+                filled += 1
+        self._set_fetch_btn(f"✅ {filled} values filled")
+        self._reset_fetch_btn_later()
+        shown_as = f" ({yf_symbol})" if yf_symbol != symbol else ""
+        self._notify(f"Auto-Fill: {filled} values for {symbol}{shown_as}. Press Save to keep them.", "success")
 
-                # GUI Update Helper
-                def update_field(key, val, fmt="{}"):
-                    if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
-                        try:
-                            self._metrics_vars[key].set(fmt.format(val))
-                        except Exception:
-                            pass
+    def _on_autofill_failed(self, symbol: str, err: Exception) -> None:
+        self._autofill_running = False
+        self._set_fetch_btn("⚠ Failed")
+        self._reset_fetch_btn_later()
+        msg = str(err) if isinstance(err, LookupError) else f"Auto-Fill for {symbol} failed: {err}"
+        self._notify(msg, "error")
 
-                scr_data = self._fetch_screener_fallback(yf_symbol) if yf_symbol.endswith('.NS') or yf_symbol.endswith('.BO') else {}
-
-                def apply_data():
-                    pe = info.get("trailingPE") or scr_data.get("stock p/e")
-                    update_field("pe_ratio", pe, "{:.1f}")
-                    
-                    update_field("peg_ratio", info.get("pegRatio"), "{:.2f}")
-                    update_field("eps", info.get("trailingEps"), f"{cy}{{:.1f}}")
-                    
-                    debt_eq = info.get("debtToEquity")
-                    if debt_eq is not None:
-                        update_field("debt_to_equity", debt_eq / 100, "{:.2f}")
-                        
-                    update_field("book_value", info.get("bookValue"), f"{cy}{{:.1f}}")
-                    
-                    roe = info.get("returnOnEquity")
-                    scr_roe = scr_data.get("roe")
-                    if roe is not None:
-                        update_field("roe", roe * 100, "{:.1f}%")
-                    elif scr_roe is not None:
-                        update_field("roe", scr_roe, "{:.1f}%")
-                        
-                    scr_roce = scr_data.get("roce")
-                    if scr_roce is not None:
-                        update_field("roce", scr_roce, "{:.1f}%")
-                        
-                    opm = info.get("operatingMargins")
-                    if opm is not None:
-                        update_field("opm", opm * 100, "{:.1f}%")
-
-                    fcf = info.get("freeCashflow")
-                    if fcf is not None:
-                        # Format in Crores if very large
-                        if abs(fcf) > 10_000_000:
-                            update_field("free_cash_flow", fcf / 10_000_000, f"{cy}{{:.1f}}")
-                        else:
-                            update_field("free_cash_flow", fcf, f"{cy}{{:,}}")
-                            
-                    stock_name = info.get("longName") or info.get("shortName") or ""
-                    if stock_name:
-                        # We save it in the DB quietly alongside other metrics
-                        update_field("stock_name", stock_name, "{}")
-
-                    rev_gr = info.get("revenueGrowth")
-                    if rev_gr is not None:
-                        update_field("sales_growth", rev_gr * 100, "{:.1f}%")
-                        
-                    ern_gr = info.get("earningsGrowth")
-                    if ern_gr is not None:
-                        update_field("profit_growth", ern_gr * 100, "{:.1f}%")
-                        
-                    insiders = info.get("heldPercentInsiders")
-                    if insiders is not None:
-                        update_field("promoter_holding", insiders * 100, "{:.1f}%")
-                        
-                    inst = info.get("heldPercentInstitutions")
-                    if inst is not None:
-                        update_field("fii_dii_holding", inst * 100, "{:.1f}%")
-
-                    dma_50 = info.get("fiftyDayAverage")
-                    dma_200 = info.get("twoHundredDayAverage")
-                    if dma_50 and dma_200:
-                        update_field("dma_50_200", f"{dma_50:.0f} / {dma_200:.0f}")
-
-                    if rsi_val:
-                        update_field("rsi", rsi_val)
-                    update_field("macd", macd_val)
-                    update_field("support_resistance", supp_res)
-                    update_field("sharpe_ratio", sharpe_val)
-
-                    # New Requested Metrics
-                    eb_m = info.get("ebitdaMargins")
-                    if eb_m is not None:
-                        update_field("ebitda_margin", eb_m * 100, "{:.1f}%")
-
-                    np_m = info.get("profitMargins")
-                    if np_m is not None:
-                        update_field("net_profit_margin", np_m * 100, "{:.1f}%")
-
-                    # Additional Valuation & Risk Metrics
-                    update_field("beta", info.get("beta"), "{:.2f}")
-                    update_field("pb_ratio", info.get("priceToBook"), "{:.2f}")
-                    
-                    eps_raw = info.get("trailingEps")
-                    bvps = info.get("bookValue")
-                    if eps_raw and bvps and eps_raw > 0 and bvps > 0:
-                        try:
-                            import math
-                            graham_num = math.sqrt(22.5 * eps_raw * bvps)
-                            update_field("graham_number", graham_num, f"{cy}{{:.2f}}")
-                        except: pass
-                    
-                    # Financials (CAGR)
-                    try:
-                        inc_stmt = ticker.financials
-                        if not inc_stmt.empty and "Total Revenue" in inc_stmt.index:
-                            revs = inc_stmt.loc["Total Revenue"].dropna()
-                            if len(revs) >= 4: # Need at least 4 years for 3-year CAGR
-                                y0 = revs.iloc[0]
-                                y3 = revs.iloc[3]
-                                if y3 and y3 > 0:
-                                    rev_cagr = ((y0 / y3) ** (1/3)) - 1
-                                    update_field("revenue_cagr_3y", rev_cagr * 100, "{:.1f}%")
-                                    
-                        if not inc_stmt.empty and "Net Income" in inc_stmt.index:
-                            incomes = inc_stmt.loc["Net Income"].dropna()
-                            if len(incomes) >= 4: # Need at least 4 years for 3-year CAGR
-                                y0 = incomes.iloc[0]
-                                y3 = incomes.iloc[3]
-                                if y3 and y3 > 0:
-                                    prof_cagr = ((y0 / y3) ** (1/3)) - 1
-                                    update_field("profit_cagr_3y", prof_cagr * 100, "{:.1f}%")
-                    except: pass
-
-                    update_field("current_ratio", info.get("currentRatio"), "{:.2f}")
-
-                    dy = info.get("dividendYield")
-                    if dy is not None:
-                        update_field("dividend_yield", dy * 100, "{:.2f}%")
-
-                    mc = info.get("marketCap")
-                    if mc is not None:
-                        if mc > 1e12:
-                            update_field("market_cap", mc / 1e7, f"{cy}{{:.0f}}")  # lakhs
-                        elif mc > 1e9:
-                            update_field("market_cap", mc / 1e7, f"{cy}{{:.0f}}")
-                        else:
-                            update_field("market_cap", mc / 1e7, f"{cy}{{:.1f}}")
-
-                    atp = info.get("targetMeanPrice")
-                    if atp is not None:
-                        update_field("analyst_target", atp, f"{cy}{{:.1f}}")
-
-                    h52 = info.get("fiftyTwoWeekHigh")
-                    l52 = info.get("fiftyTwoWeekLow")
-                    if h52 and l52:
-                        update_field("week52_range", f"{l52:.0f} – {h52:.0f}")
-
-                    # Sector, Industry, Current Price
-                    sector = info.get("sector") or ""
-                    if sector:
-                        self._metrics_vars["sector"].set(sector)
-                    industry = info.get("industry") or ""
-                    if industry:
-                        self._metrics_vars["industry"].set(industry)
-
-                    cur_price = info.get("currentPrice") or info.get("regularMarketPrice")
-                    if cur_price is not None:
-                        update_field("current_value", cur_price, f"{cy}{{:.2f}}")
-
-                    # Auto-calculate Intrinsic Value using DCF engine
-                    try:
-                        from model.engine import calculate_intrinsic_value as _calc_iv
-                        eps_raw = info.get("trailingEps")
-                        if eps_raw and eps_raw > 0:
-                            iv_val = _calc_iv(eps_raw)
-                            if iv_val > 0:
-                                update_field("intrinsic_value", iv_val, f"{cy}{{:.2f}}")
-                    except Exception:
-                        pass
-
-                    # Capex & Quarterly Op Profit (Slower calls)
-                    try:
-                        cf = ticker.cashflow
-                        if not cf.empty and "Capital Expenditure" in cf.index:
-                            capex_val = cf.loc["Capital Expenditure"].iloc[0]
-                            if pd.notna(capex_val):
-                                # Convert negative capex to positive for display
-                                capex_abs = abs(capex_val)
-                                if capex_abs > 10_000_000:
-                                    update_field("capex", capex_abs / 10_000_000, f"{cy}{{:.1f}}")
-                                else:
-                                    update_field("capex", capex_abs, f"{cy}{{:,}}")
-                    except: pass
-
-                    try:
-                        qf = ticker.quarterly_financials
-                        if not qf.empty and "Operating Income" in qf.index:
-                            op_profit = qf.loc["Operating Income"].iloc[0]
-                            if pd.notna(op_profit):
-                                if abs(op_profit) > 10_000_000:
-                                    update_field("qoq_op_profit", op_profit / 10_000_000, f"{cy}{{:.1f}}")
-                                else:
-                                    update_field("qoq_op_profit", op_profit, f"{cy}{{:,}}")
-                    except: pass
-
-                    vol = info.get("volume") or info.get("averageVolume")
-                    if vol is not None:
-                        if vol > 1_000_000_000:
-                            update_field("volume", vol / 1_000_000_000, "{:.1f}B")
-                        elif vol > 1_000_000:
-                            update_field("volume", vol / 1_000_000, "{:.1f}M")
-                        else:
-                            update_field("volume", vol, "{:,}")
-                            
-                    try:
-                        if hasattr(self, "_fetch_btn"):
-                            self._fetch_btn.set_text("✅ Downloaded")
-                    except Exception:
-                        pass
-
-                self.after(0, apply_data)
-                
-            except Exception as e:
-                print(f"Error auto-fetching yfinance for {yf_symbol}: {e}")
-                self.after(0, lambda: self._fetch_btn.set_text("⚠ Failed") if hasattr(self, "_fetch_btn") else None)
-            finally:
-                self.after(2000, lambda: getattr(self, "_fetch_btn").set_text("�� Auto-Fill (yfinance)") if hasattr(self, "_fetch_btn") else None)
-                self.after(2000, lambda: getattr(self, "_fetch_btn").set_disabled(False) if hasattr(self, "_fetch_btn") else None)
-
-        import threading
-        import pandas as pd
-        threading.Thread(target=bg_fetch, daemon=True).start()
-
-    def _fetch_screener_fallback(self, symbol: str) -> dict:
-        """Hit Screener.in to pull ROE, ROCE, and P/E since yfinance omits them for India."""
-        base_sym = symbol.replace('.NS', '').replace('.BO', '')
-        url = f"https://www.screener.in/company/{base_sym}/consolidated/"
-        fallback = {}
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-            
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            r = requests.get(url, headers=headers, timeout=5)
-            if r.status_code != 200:
-                # Try standalone non-consolidated
-                url = f"https://www.screener.in/company/{base_sym}/"
-                r = requests.get(url, headers=headers, timeout=5)
-                
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, 'html.parser')
-                ratios = soup.find('div', class_='company-ratios')
-                if ratios:
-                    for item in ratios.find_all('li'):
-                        name = item.find('span', class_='name')
-                        val = item.find('span', class_='number')
-                        if name and val:
-                            n = name.text.strip().lower()
-                            v = val.text.strip().replace(',', '')
-                            try:
-                                fallback[n] = float(v)
-                            except ValueError:
-                                pass
-        except Exception as e:
-            print(f"Screener fallback failed for {base_sym}: {e}")
-            
-        return fallback
-
-    # ── Bulk Auto Fetch Metrics (yfinance) ────────────────────────────────────
+    # ── Refresh All ───────────────────────────────────────────────────────────
 
     def _bulk_refresh_metrics(self):
+        if self._refreshing:
+            return
         if not self._data:
-            self._flash_status("⚠ Watchlist is empty.", error=True)
+            self._notify("Watchlist is empty.", "error")
             return
 
-        self._btn_refresh_all.set_disabled(True)
-        total = len(self._data)
-        
-        def bg_refresh():
-            try:
-                from model.watchlist_db import update_watchlist
-                
-                for idx, row in enumerate(self._data):
-                    self.after(0, lambda i=idx: self._btn_refresh_all.set_text(f"🔄 Updating {i+1}/{total}"))
-                    
-                    symbol = row["symbol"]
-                    yf_symbol = symbol
-                    if not yf_symbol.endswith('.NS') and not yf_symbol.endswith('.BO'):
-                        if len(yf_symbol) < 10 and '.' not in yf_symbol:
-                            yf_symbol += '.NS'
-                            
+        rows = [dict(r) for r in self._data]
+        columns = set(self._db_columns)
+        total = len(rows)
+        self._refreshing = True
+        self._btn_refresh_all.set_text(f"🔄 Updating 0/{total}")
+
+        def work():
+            import concurrent.futures
+            from model.watchlist_db import update_watchlist
+
+            updated, failed, done = 0, [], 0
+            # A few symbols at a time; database writes stay in this one thread
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(fetch_watchlist_metrics, r.get("symbol") or "", columns): r for r in rows}
+                for fut in concurrent.futures.as_completed(futures):
+                    row = futures[fut]
+                    sym = row.get("symbol") or "?"
+                    done += 1
+                    call_on_ui(self._show_refresh_progress, done, total)
                     try:
-                        ticker = yf.Ticker(yf_symbol)
-                        info = ticker.info
-                        
-                        curr = info.get("financialCurrency") or info.get("currency") or ""
-                        if str(curr).upper() == "JPY": cy = "¥"
-                        elif str(curr).upper() == "USD": cy = "$"
-                        else: cy = "¥" if symbol.endswith(".T") else "₹"
-                        
-                        # Preserve existing manual metrics
-                        metrics = {k: row.get(k, "") for k in self._metrics_keys}
-                        
-                        scr_data = self._fetch_screener_fallback(yf_symbol) if yf_symbol.endswith('.NS') or yf_symbol.endswith('.BO') else {}
+                        _yf, values = fut.result()
+                    except Exception as exc:
+                        log.warning("Watchlist refresh: %s failed: %s", sym, exc)
+                        failed.append(sym)
+                        continue
+                    if not values:
+                        failed.append(sym)
+                        continue
+                    merged = dict(row)
+                    merged.update(values)
+                    values["action_signal"] = compute_signal(merged)[1]
+                    try:
+                        update_watchlist(row["id"], **values)   # only the values found
+                        updated += 1
+                    except Exception:
+                        log.exception("Watchlist refresh: saving %s failed", sym)
+                        failed.append(sym)
+            return updated, sorted(failed), total
 
-                        def mset(key, val, fmt="{}"):
-                            if val is not None and str(val).strip() != "" and str(val).lower() != "nan":
-                                metrics[key] = fmt.format(val)
-                                
-                        pe = info.get("trailingPE") or scr_data.get("stock p/e")
-                        mset("pe_ratio", pe, "{:.1f}")
-                        
-                        mset("peg_ratio", info.get("pegRatio"), "{:.2f}")
-                        mset("eps", info.get("trailingEps"), f"{cy}{{:.1f}}")
-                        
-                        debt_eq = info.get("debtToEquity")
-                        if debt_eq is not None:
-                            mset("debt_to_equity", debt_eq / 100, "{:.2f}")
-                            
-                        mset("book_value", info.get("bookValue"), f"{cy}{{:.1f}}")
-                        
-                        roe = info.get("returnOnEquity")
-                        scr_roe = scr_data.get("roe")
-                        if roe is not None:
-                            mset("roe", roe * 100, "{:.1f}%")
-                        elif scr_roe is not None:
-                            mset("roe", scr_roe, "{:.1f}%")
-                            
-                        scr_roce = scr_data.get("roce")
-                        if scr_roce is not None:
-                            mset("roce", scr_roce, "{:.1f}%")
-                            
-                        opm = info.get("operatingMargins")
-                        if opm is not None:
-                            mset("opm", opm * 100, "{:.1f}%")
+        run_in_background(work, on_done=self._on_bulk_done, on_error=self._on_bulk_failed,
+                          widget=self, name="watchlist-refresh-all")
 
-                        fcf = info.get("freeCashflow")
-                        if fcf is not None:
-                            if abs(fcf) > 10_000_000:
-                                mset("free_cash_flow", fcf / 10_000_000, f"{cy}{{:.1f}}")
-                            else:
-                                mset("free_cash_flow", fcf, f"{cy}{{:,}}")
+    def _show_refresh_progress(self, done: int, total: int) -> None:
+        if self._refreshing and _alive(self._btn_refresh_all):
+            self._btn_refresh_all.set_text(f"🔄 Updating {done}/{total}")
 
-                        rev_gr = info.get("revenueGrowth")
-                        if rev_gr is not None:
-                            mset("sales_growth", rev_gr * 100, "{:.1f}%")
-                            
-                        ern_gr = info.get("earningsGrowth")
-                        if ern_gr is not None:
-                            mset("profit_growth", ern_gr * 100, "{:.1f}%")
-                            
-                        insiders = info.get("heldPercentInsiders")
-                        if insiders is not None:
-                            mset("promoter_holding", insiders * 100, "{:.1f}%")
-                            
-                        inst = info.get("heldPercentInstitutions")
-                        if inst is not None:
-                            mset("fii_dii_holding", inst * 100, "{:.1f}%")
+    def _end_bulk(self) -> None:
+        self._refreshing = False
+        self._btn_refresh_all.set_text("↻ Refresh All")
 
-                        eb_m = info.get("ebitdaMargins")
-                        if eb_m is not None:
-                            mset("ebitda_margin", eb_m * 100, "{:.1f}%")
+    def _on_bulk_done(self, result) -> None:
+        updated, failed, total = result
+        self._end_bulk()
+        msg = f"Updated {updated} of {total}"
+        if failed:
+            names = ", ".join(failed[:6]) + ("…" if len(failed) > 6 else "")
+            msg += f" ({len(failed)} failed: {names})"
+            kind = "warning" if updated else "error"
+        else:
+            msg += "."
+            kind = "success"
+        self._notify(msg, kind)
+        self.load_data()
 
-                        np_m = info.get("profitMargins")
-                        if np_m is not None:
-                            mset("net_profit_margin", np_m * 100, "{:.1f}%")
+    def _on_bulk_failed(self, err: Exception) -> None:
+        self._end_bulk()
+        self._notify(f"Refresh All failed: {err}", "error")
 
-                        try:
-                            cf = ticker.cashflow
-                            if not cf.empty and "Capital Expenditure" in cf.index:
-                                capex_val = cf.loc["Capital Expenditure"].iloc[0]
-                                if pd.notna(capex_val):
-                                    capex_abs = abs(capex_val)
-                                    if capex_abs > 10_000_000:
-                                        mset("capex", capex_abs / 10_000_000, f"{cy}{{:.1f}}")
-                                    else:
-                                        mset("capex", capex_abs, f"{cy}{{:,}}")
-                        except: pass
-
-                        try:
-                            qf = ticker.quarterly_financials
-                            if not qf.empty and "Operating Income" in qf.index:
-                                op_profit = qf.loc["Operating Income"].iloc[0]
-                                if pd.notna(op_profit):
-                                    if abs(op_profit) > 10_000_000:
-                                        mset("qoq_op_profit", op_profit / 10_000_000, f"{cy}{{:.1f}}")
-                                    else:
-                                        mset("qoq_op_profit", op_profit, f"{cy}{{:,}}")
-                        except: pass
-
-                        # Additional Risk & Valuation Metrics
-                        mset("beta", info.get("beta"), "{:.2f}")
-                        mset("pb_ratio", info.get("priceToBook"), "{:.2f}")
-                        mset("current_ratio", info.get("currentRatio"), "{:.2f}")
-                        dy = info.get("dividendYield")
-                        if dy is not None:
-                            mset("dividend_yield", dy * 100, "{:.2f}%")
-                        mc = info.get("marketCap")
-                        if mc is not None:
-                            mset("market_cap", mc / 1e7, f"{cy}{{:.0f}}")
-                        atp = info.get("targetMeanPrice")
-                        if atp is not None:
-                            mset("analyst_target", atp, f"{cy}{{:.1f}}")
-                        h52 = info.get("fiftyTwoWeekHigh")
-                        l52 = info.get("fiftyTwoWeekLow")
-                        if h52 and l52:
-                            mset("week52_range", f"{l52:.0f} – {h52:.0f}")
-
-                        # Compute Sector, Industry, Current Price & Intrinsic Value
-                        sector = info.get("sector") or ""
-                        if sector:
-                            mset("sector", sector, "{}")
-                        industry = info.get("industry") or ""
-                        if industry:
-                            mset("industry", industry, "{}")
-
-                        cur_price = info.get("regularMarketPrice") or info.get("currentPrice") or info.get("previousClose")
-                        if cur_price is not None:
-                            mset("current_value", cur_price, f"{cy}{{:.2f}}")
-                            
-                        stock_name = info.get("longName") or info.get("shortName") or ""
-                        if stock_name:
-                            mset("stock_name", stock_name, "{}")
-
-                        try:
-                            from model.engine import calculate_intrinsic_value as _calc_iv
-                            eps_raw = info.get("trailingEps")
-                            if eps_raw and eps_raw > 0:
-                                iv_val = _calc_iv(eps_raw)
-                                if iv_val > 0:
-                                    mset("intrinsic_value", iv_val, f"{cy}{{:.2f}}")
-                        except Exception:
-                            pass
-
-                        # Compute signal and store
-                        badge, _ = self._compute_signal(metrics)
-                        metrics["action_signal"] = badge
-                            
-                        dma_50 = info.get("fiftyDayAverage")
-                        dma_200 = info.get("twoHundredDayAverage")
-                        if dma_50 and dma_200:
-                            mset("dma_50_200", f"{dma_50:.0f} / {dma_200:.0f}")
-
-                        vol = info.get("volume") or info.get("averageVolume")
-                        if vol is not None:
-                            if vol > 1_000_000_000:
-                                mset("volume", vol / 1_000_000_000, "{:.1f}B")
-                            elif vol > 1_000_000:
-                                mset("volume", vol / 1_000_000, "{:.1f}M")
-                            else:
-                                mset("volume", vol, "{:,}")
-
-                        hist = ticker.history(period="1mo")
-                        if not hist.empty and len(hist) >= 15:
-                            delta = hist['Close'].diff()
-                            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-                            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-                            rs = gain / loss
-                            rsi = 100 - (100 / (1 + rs))
-                            rsi_last = rsi.iloc[-1]
-                            if pd.notna(rsi_last):
-                                mset("rsi", rsi_last, "{:.1f}")
-
-                        # Write to database (preserves manually entered tags, targets, notes, etc.)
-                        target = float(row.get("target_price", 0.0) or 0.0)
-                        update_watchlist(row["id"], symbol, row.get("notes", ""), row.get("tags", ""), target, **metrics)
-                        
-                    except Exception as e:
-                        print(f"Error refreshing {symbol}: {e}")
-
-                self.after(0, lambda: self._post_save("✅ Bulk refresh complete."))
-            except Exception as e:
-                print(f"Bulk refresh error: {e}")
-            finally:
-                self.after(0, lambda: self._btn_refresh_all.set_text("🔄 Refresh All"))
-                self.after(0, lambda: self._btn_refresh_all.set_disabled(False))
-
-        threading.Thread(target=bg_refresh, daemon=True).start()
+    # ── Edit Metrics dialog ───────────────────────────────────────────────────
 
     def _open_metrics_dialog(self):
         sym = self._v_symbol.get().strip().upper() or "New Symbol"
-        top = PremiumModal(self, title=f"Advanced Metrics", geometry="800x850", icon="📋")
-        top.add_chip("📈", sym, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.SLATE_300)
-        
-        main_frame = tk.Frame(top.content_frame, bg=ModernStyle.SLATE_50)
+        top = PremiumModal(self, title="Advanced Metrics", geometry=_fit_to_screen(self, 820, 850), icon="📋")
+        top.resizable(True, True)
+        top.minsize(600, 420)
+        top.add_chip("📈", sym, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.TEXT_ON_ACCENT)
+
+        main_frame = tk.Frame(top.content_frame, bg=ModernStyle.BG_SECONDARY)
         main_frame.pack(fill="both", expand=True)
-        
-        canvas = tk.Canvas(main_frame, bg=ModernStyle.SLATE_50, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg=ModernStyle.SLATE_50)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        def _on_canvas_configure(event):
-            canvas.itemconfig(canvas_window, width=event.width)
-        canvas.bind("<Configure>", _on_canvas_configure)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Mousewheel binding
-        def _on_mousewheel(event):
-            if event.widget.winfo_toplevel() == top:
-                delta = event.delta
-                if abs(delta) >= 120: delta = delta / 120
-                if delta == 0: delta = 1 if event.delta > 0 else -1
-                canvas.yview_scroll(int(-1 * delta), "units")
-        top.bind_all("<MouseWheel>", _on_mousewheel)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
+        canvas, scrollable_frame = _make_scroll_area(main_frame, ModernStyle.BG_SECONDARY)
+        _bind_popup_scroll(top, canvas)
+
+        def present(fields):
+            return [(lbl, key) for lbl, key in fields if key in self._metrics_vars]
+
         groups = [
             ("Financial Ratios & Valuation", ModernStyle.ACCENT_PRIMARY, [
                 ("P/E Ratio", "pe_ratio"), ("PEG Ratio", "peg_ratio"), ("EPS", "eps"),
-                ("Debt to Equity", "debt_to_equity"), ("Book Value", "book_value"), ("Intrinsic Value", "intrinsic_value")
+                ("Debt to Equity", "debt_to_equity"), ("Book Value", "book_value"), ("Intrinsic Value", "intrinsic_value"),
+                ("P/B Ratio", "pb_ratio"), ("Current Ratio", "current_ratio"),
             ]),
-            ("Profitability & Efficiency", ModernStyle.SUCCESS, [
+            ("Profitability & Efficiency", ModernStyle.SUCCESS_FILL, [
                 ("ROE", "roe"), ("ROCE", "roce"), ("OPM (%)", "opm"), ("EBITDA Margin (%)", "ebitda_margin"),
-                ("Net Profit Margin (%)", "net_profit_margin"), ("Free Cash Flow", "free_cash_flow"), 
-                ("Inventory Days", "inventory_days"), ("Capex", "capex"), ("QoQ Op. Profit", "qoq_op_profit")
+                ("Net Profit Margin (%)", "net_profit_margin"), ("Free Cash Flow", "free_cash_flow"),
+                ("Inventory Days", "inventory_days"), ("Capex", "capex"), ("QoQ Op. Profit", "qoq_op_profit"),
             ]),
-            ("Growth Metrics (3-Year & 5-Year)", ModernStyle.WARNING, [
-                ("Sales Growth", "sales_growth"), ("Profit Growth", "profit_growth")
+            ("Growth Metrics", ModernStyle.WARNING_FILL, [
+                ("Sales Growth", "sales_growth"), ("Profit Growth", "profit_growth"),
+                ("3Y Rev CAGR", "revenue_cagr_3y"), ("3Y Profit CAGR", "profit_cagr_3y"),
             ]),
-            ("Operational & Ownership", ModernStyle.BRAND_GOLD, [
+            ("Operational & Ownership", ModernStyle.PURPLE_FILL, [
                 ("Promoter Holding", "promoter_holding"), ("Pledged Shares", "pledged_shares"),
-                ("FII / DII Holding", "fii_dii_holding"), ("Order Book", "order_book")
+                ("FII / DII Holding", "fii_dii_holding"), ("Order Book", "order_book"),
+                ("Dividend Yield", "dividend_yield"),
             ]),
-            ("Technical Analysis (Entry/Exit)", ModernStyle.ACCENT_SECONDARY, [
-                ("50 & 200 DMA", "dma_50_200"), ("RSI", "rsi"), ("Sharpe Ratio", "sharpe_ratio"), ("Volume", "volume")
-            ])
+            ("Technical Analysis (Entry/Exit)", ModernStyle.INFO_FILL, [
+                ("50 & 200 DMA", "dma_50_200"), ("RSI", "rsi"), ("MACD", "macd"),
+                ("Support/Resistance", "support_resistance"), ("Sharpe Ratio", "sharpe_ratio"),
+                ("Volume", "volume"), ("Beta", "beta"), ("52-Week Range", "week52_range"),
+            ]),
         ]
-        
+
         for group_name, accent_color, fields in groups:
-            # Container for the group
-            group_wrapper = tk.Frame(scrollable_frame, bg=ModernStyle.SLATE_50)
+            fields = present(fields)
+            if not fields:
+                continue
+            group_wrapper = tk.Frame(scrollable_frame, bg=ModernStyle.BG_SECONDARY)
             group_wrapper.pack(fill="x", pady=(0, 15))
-            
-            # Header color bar
             tk.Frame(group_wrapper, bg=accent_color, height=3).pack(fill="x")
-            
-            group_frame = tk.Frame(group_wrapper, bg=ModernStyle.SLATE_100, highlightthickness=1, highlightbackground=ModernStyle.SLATE_200)
-            group_frame.pack(fill="x", ipady=12)
-            
+
+            group_frame = tk.Frame(group_wrapper, bg=ModernStyle.BG_TERTIARY, highlightthickness=1,
+                                   highlightbackground=ModernStyle.BORDER_COLOR)
+            group_frame.pack(fill="x", ipady=8)
             tk.Label(
                 group_frame, text=group_name,
-                fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.SLATE_100,
+                fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_TERTIARY,
                 font=ModernStyle.FONT_MODAL_TITLE
-            ).pack(anchor="w", padx=20, pady=(6, 12))
-            
-            grid = tk.Frame(group_frame, bg=ModernStyle.SLATE_100)
+            ).pack(anchor="w", padx=20, pady=(6, 8))
+
+            grid = tk.Frame(group_frame, bg=ModernStyle.BG_TERTIARY)
             grid.pack(fill="x", padx=20)
-            
             for i, (label_text, key) in enumerate(fields):
-                col = i % 2
-                row = i // 2
-                f = tk.Frame(grid, bg=ModernStyle.SLATE_100)
-                f.grid(row=row, column=col, padx=12, pady=8, sticky="ew")
-                grid.grid_columnconfigure(col, weight=1)
-                
+                f = tk.Frame(grid, bg=ModernStyle.BG_TERTIARY)
+                f.grid(row=i // 2, column=i % 2, padx=12, pady=6, sticky="ew")
+                grid.grid_columnconfigure(i % 2, weight=1)
                 tk.Label(
                     f, text=label_text,
-                    fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.SLATE_100,
-                    font=ModernStyle.FONT_SUBHEADING,
-                    width=20, anchor="w"
+                    fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_TERTIARY,
+                    font=ModernStyle.FONT_SUBHEADING, width=18, anchor="w"
                 ).pack(side="left", padx=(0, 10))
-                
-                e = tk.Entry(
+                tk.Entry(
                     f, textvariable=self._metrics_vars[key],
                     bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
-                    font=ModernStyle.FONT_TABLE, relief=tk.FLAT,
+                    font=ModernStyle.FONT_TABLE, relief=tk.FLAT, width=12,
                     highlightthickness=1, highlightbackground=ModernStyle.BORDER_COLOR,
                     highlightcolor=accent_color, insertbackground=ModernStyle.TEXT_PRIMARY
-                )
-                e.pack(side="left", fill="x", expand=True, ipady=7)
-                
-        # Footer buttons embedded in actions_frame of PremiumModal
+                ).pack(side="left", fill="x", expand=True, ipady=6)
+
+        top.set_status("Values are kept in the form; press Save & Close (or Save on the Watchlist page) to store them.")
+
         self._fetch_btn = ModernButton(
-            top.actions_frame, text="🔄 Auto-Fill (yfinance)", command=self._auto_fetch_metrics,
-            bg=ModernStyle.BRAND_GOLD, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.SLATE_50, width=210, height=40, radius=8,
+            top.actions_frame, text="↻ Auto-Fill (yfinance)", command=self._auto_fetch_metrics,
+            bg=ModernStyle.INFO_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+            canvas_bg=ModernStyle.BG_SECONDARY, width=220, height=40, radius=8,
             font=ModernStyle.FONT_TABLE_BOLD
         )
         self._fetch_btn.pack(side="left", padx=(0, 10))
+        if self._autofill_running:
+            self._fetch_btn.set_text("🔄 Fetching…")
+
+        def _save_and_close():
+            if self._on_save():
+                top.destroy()
 
         ModernButton(
-            top.actions_frame, text="✓ Done", command=top.destroy,
-            bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.SLATE_50, width=120, height=40, radius=8,
+            top.actions_frame, text="✕ Close", command=top.destroy,
+            bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+            canvas_bg=ModernStyle.BG_SECONDARY, width=100, height=40, radius=8,
             font=ModernStyle.FONT_TABLE_BOLD
         ).pack(side="right")
+        ModernButton(
+            top.actions_frame, text="✓ Save & Close", command=_save_and_close,
+            bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
+            canvas_bg=ModernStyle.BG_SECONDARY, width=160, height=40, radius=8,
+            font=ModernStyle.FONT_TABLE_BOLD
+        ).pack(side="right", padx=(0, 10))
 
-# ── Double Click Diagnostic Popup ─────────────────────────────────────────
+        top.bind("<Escape>", lambda _e: top.destroy())
+        top.focus_set()
+
+    # ── Double-click diagnostic pop-up ────────────────────────────────────────
+
     def _open_diagnostic_popup(self, row: dict):
         sym = row.get("symbol", "Symbol")
         stock_name = row.get("stock_name", "")
         popup_title = f"{stock_name} ({sym})" if stock_name else sym
-        
-        top = PremiumModal(self, title=popup_title, geometry="1000x1100", icon="📊")
-        top.add_chip("📈", sym, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.SLATE_300)
 
-        # ── Master Scrollable Canvas ──
-        canvas = tk.Canvas(top.content_frame, bg=ModernStyle.SLATE_50, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(top.content_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg=ModernStyle.SLATE_50)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        def _on_canvas_configure(event):
-            canvas.itemconfig(canvas_window, width=event.width)
-        canvas.bind("<Configure>", _on_canvas_configure)
-        canvas.configure(yscrollcommand=scrollbar.set)
+        geometry = _fit_to_screen(self, 1000, 1100)
+        popup_w = int(geometry.split("x")[0])
+        top = PremiumModal(self, title=popup_title, geometry=geometry, icon="📊")
+        top.resizable(True, True)
+        top.minsize(640, 420)
+        top.add_chip("📈", sym, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.TEXT_ON_ACCENT)
 
-        # Mousewheel scrolling support across the entire popup window
-        def _on_mousewheel(event):
-            try:
-                if event.widget.winfo_toplevel() != top:
-                    return
-                delta = event.delta
-                if abs(delta) >= 120:
-                    delta = delta / 120
-                if delta == 0:
-                    delta = 1 if event.delta > 0 else -1
-                canvas.yview_scroll(int(-1 * delta), "units")
-            except: pass
-        def _on_unix_scroll_up(event):
-            try:
-                if event.widget.winfo_toplevel() == top:
-                    canvas.yview_scroll(-1, "units")
-            except: pass
-        def _on_unix_scroll_down(event):
-            try:
-                if event.widget.winfo_toplevel() == top:
-                    canvas.yview_scroll(1, "units")
-            except: pass
-
-        # Bind globally but safely restricted to popup
-        top.bind_all("<MouseWheel>", _on_mousewheel)
-        top.bind_all("<Button-4>", _on_unix_scroll_up)
-        top.bind_all("<Button-5>", _on_unix_scroll_down)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        canvas, scrollable_frame = _make_scroll_area(top.content_frame, ModernStyle.BG_SECONDARY)
+        _bind_popup_scroll(top, canvas)
 
         ModernButton(
             top.actions_frame, text="✕  Close", command=top.destroy,
-            bg=ModernStyle.SALMON, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.SLATE_50, width=100, height=36, radius=8,
+            bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+            canvas_bg=ModernStyle.BG_SECONDARY, width=100, height=36, radius=8,
             font=ModernStyle.FONT_SUBHEADING
         ).pack(side="right")
+        top.set_status("Esc closes this window.")
 
-        # ── Signal Banner ──────────────────────────────────────────────────
-        badge, tip = self._compute_signal(row)
-        badge_colors = {
-            "🟢 Strong Buy": (ModernStyle.SUCCESS, ModernStyle.ACCENT_SECONDARY_PALE),
-            "🟡 Accumulate": (ModernStyle.WARNING, ModernStyle.ACCENT_TERTIARY_PALE),
-            "⏳ Wait / Watch": (ModernStyle.TEXT_TERTIARY, ModernStyle.SLATE_50),
-            "🔴 Avoid": (ModernStyle.ERROR, ModernStyle.ERROR_PALE),
-        }
-        badge_fg, badge_bg = badge_colors.get(badge, (ModernStyle.TEXT_PRIMARY, ModernStyle.BG_SECONDARY))
-        
+        # ── Signal banner ──────────────────────────────────────────────────
+        key, badge, tip = compute_signal(row)
+        badge_fg, badge_bg, _fill = signal_colours(key)
+        wrap = max(360, popup_w - 200)
+
         sig_frame = tk.Frame(scrollable_frame, bg=badge_bg, highlightthickness=1, highlightbackground=badge_fg)
         sig_frame.pack(fill="x", padx=20, pady=(0, 20))
-
         sig_inner = tk.Frame(sig_frame, bg=badge_bg)
         sig_inner.pack(fill="both", padx=12, pady=8)
 
-        tk.Label(
-            sig_inner, text=badge,
-            fg=badge_fg, bg=badge_bg,
-            font=ModernStyle.FONT_MODAL_TITLE
-        ).pack(anchor="w")
-
-        tk.Label(
-            sig_inner, text="ℹ️ Decision Rationale:",
-            fg=badge_fg, bg=badge_bg,
-            font=ModernStyle.FONT_HEADING
-        ).pack(anchor="w", pady=(8, 4))
-
-        # Split tip into lines for better formatting
+        tk.Label(sig_inner, text=badge, fg=badge_fg, bg=badge_bg,
+                 font=ModernStyle.FONT_MODAL_TITLE).pack(anchor="w")
+        tk.Label(sig_inner, text="ℹ️ Decision Rationale:", fg=badge_fg, bg=badge_bg,
+                 font=ModernStyle.FONT_HEADING).pack(anchor="w", pady=(8, 4))
         for line in tip.split("\n"):
-            if not line.strip(): continue
-            font_conf = ModernStyle.FONT_TABLE
-            if "Signal:" in line: font_conf = ModernStyle.FONT_HEADING
-            
+            if not line.strip():
+                continue
+            if line.startswith("✅"):
+                line_fg = ModernStyle.SUCCESS if key != "strong_buy" else badge_fg
+            elif line.startswith("❌"):
+                line_fg = ModernStyle.ERROR if key != "avoid" else badge_fg
+            else:
+                line_fg = ModernStyle.TEXT_PRIMARY
             tk.Label(
-                sig_inner, text=line,
-                fg=badge_fg, bg=badge_bg,
-                font=font_conf,
-                justify="left", anchor="w", wraplength=920
+                sig_inner, text=line, fg=line_fg, bg=badge_bg,
+                font=ModernStyle.FONT_HEADING if line.startswith("Signal:") else ModernStyle.FONT_TABLE,
+                justify="left", anchor="w", wraplength=wrap
             ).pack(anchor="w", padx=5)
 
-        # Helper to parse string values and compare against benchmark
         def evaluate_benchmark(key: str, val_str: str) -> bool | None:
-            if not val_str or val_str in ("-", "None", ""): return None
-            
-            # Clean string for float conversion
-            clean = val_str.replace(",", "").replace("%", "").replace("₹", "").replace("¥", "").replace("$", "").replace("£", "").replace(" ", "")
-            try:
-                val = float(clean)
-            except ValueError:
-                # If it's a fractional string like "500/600" for Support/Resistance, we can't easily eval it as a simple float
+            val = parse_num(val_str)
+            if val is None:
                 return None
-
-            if key in ("eps", "roe", "roce", "opm", "sales_growth", "profit_growth", "ebitda_margin", "net_profit_margin", "revenue_cagr_3y", "profit_cagr_3y"):
+            if key in ("eps", "roe", "roce", "opm", "sales_growth", "profit_growth", "ebitda_margin",
+                       "net_profit_margin", "revenue_cagr_3y", "profit_cagr_3y"):
                 return val >= 10.0
-            if key in ("pe_ratio",):
-                return None # Requires industry comparison
             if key in ("peg_ratio", "pb_ratio"):
-                return val < 2.0  # P/B < 2 is reasonably valued
-            if key in ("debt_to_equity",):
+                return val < 2.0
+            if key == "debt_to_equity":
                 return val < 1.0
             if key in ("free_cash_flow", "qoq_op_profit", "macd"):
                 return val > 0.0
-            if key in ("sharpe_ratio",):
+            if key == "sharpe_ratio":
                 return val >= 1.0
-            if key in ("rsi",):
+            if key == "rsi":
                 return 30.0 <= val <= 65.0
-            if key in ("beta",):
+            if key == "beta":
                 return val < 1.5
-            if key in ("current_ratio",):
+            if key == "current_ratio":
                 return val >= 1.5
-            return None
+            return None  # P/E needs an industry comparison; others are context only
+
+        cy = "¥" if str(sym).upper().endswith(".T") else "₹"
+        gn = graham_number(row)
+        values = dict(row)
+        values["graham_number"] = f"{cy}{gn:,.2f}" if gn else ""
+        values["target_price"] = (f"{cy}{parse_num(row.get('target_price')):,.2f}"
+                                  if (parse_num(row.get("target_price")) or 0) > 0 else "")
+        available = set(row.keys()) | {"graham_number"}
 
         groups = [
             ("Financial Ratios & Valuation Metrics", [
@@ -1532,34 +1405,35 @@ class WatchlistView(BaseView):
                 ("Debt to Equity", "debt_to_equity", "< 1.0"),
                 ("Book Value", "book_value", "Compare to Price"),
                 ("Intrinsic Value", "intrinsic_value", "Higher than Market Price"),
-                ("Graham Number", "graham_number", "Higher than Market Price")
+                ("Graham Number", "graham_number", "Higher than Market Price"),
+                ("My Target Price", "target_price", "Your own buy target"),
             ]),
             ("Profitability & Efficiency Metrics", [
                 ("ROE", "roe", "Double Digits"),
                 ("ROCE", "roce", "Double Digits"),
                 ("OPM (%)", "opm", "> 10% - 15%"),
                 ("Free Cash Flow", "free_cash_flow", "Must be Positive"),
-                ("Inventory Days", "inventory_days", "Lower is generally better")
+                ("Inventory Days", "inventory_days", "Lower is generally better"),
             ]),
-            ("Growth Metrics (3-Year & 5-Year)", [
+            ("Growth Metrics", [
                 ("3Y Rev CAGR", "revenue_cagr_3y", "Consistent > 10%"),
                 ("3Y Profit CAGR", "profit_cagr_3y", "Consistent > 10%"),
                 ("Sales Growth", "sales_growth", "Double Digits"),
                 ("Profit Growth", "profit_growth", "Double Digits"),
-                ("QoQ Op. Profit", "qoq_op_profit", "Positive / Growth")
+                ("QoQ Op. Profit", "qoq_op_profit", "Positive / Growth"),
             ]),
             ("Operational & Ownership Metrics", [
                 ("Promoter Holding", "promoter_holding", "High & Stable"),
                 ("Pledged Shares", "pledged_shares", "Zero (Ideal)"),
                 ("FII / DII Holding", "fii_dii_holding", "Increasing / Stable"),
-                ("Order Book", "order_book", "High Visibility")
+                ("Order Book", "order_book", "High Visibility"),
             ]),
             ("Technical Analysis Metrics (Entry/Exit)", [
                 ("50 & 200 DMA", "dma_50_200", "Above the lines"),
                 ("RSI", "rsi", "30 (Oversold) / 70 (Overbought)"),
                 ("MACD", "macd", "Positive Momentum"),
                 ("Support/Resistance", "support_resistance", "Context Near Support"),
-                ("Volume", "volume", "Increasing")
+                ("Volume", "volume", "Increasing"),
             ]),
             ("Additional Valuation & Risk Metrics", [
                 ("EBITDA Margin (%)", "ebitda_margin", "> 15%"),
@@ -1568,67 +1442,56 @@ class WatchlistView(BaseView):
                 ("Current Ratio", "current_ratio", ">= 1.5 (Liquid)"),
                 ("Beta", "beta", "< 1.5 (Lower Vol)"),
                 ("Dividend Yield", "dividend_yield", "Stable / Growing"),
-                ("Capex", "capex", "Expansion Indicator")
+                ("Capex", "capex", "Expansion Indicator"),
             ]),
             ("Market Overview", [
                 ("Market Cap", "market_cap", "Context Only"),
                 ("52-Week Range", "week52_range", "Context Only"),
                 ("Analyst Target", "analyst_target", "vs Current Price"),
-                ("Sharpe Ratio", "sharpe_ratio", "> 1.0 (Good Risk-Return)")
-            ])
+                ("Sharpe Ratio", "sharpe_ratio", "> 1.0 (Good Risk-Return)"),
+            ]),
         ]
 
-        # Use improved card layout for the groups
-        for i, (group_name, fields) in enumerate(groups):
-            card_outer = tk.Frame(scrollable_frame, bg=ModernStyle.BG_SECONDARY, highlightthickness=1, highlightbackground=ModernStyle.BORDER_COLOR)
+        for group_name, fields in groups:
+            fields = [f for f in fields if f[1] in available]   # no rows for metrics this database can't hold
+            if not fields:
+                continue
+            card_outer = tk.Frame(scrollable_frame, bg=ModernStyle.BG_SECONDARY, highlightthickness=1,
+                                  highlightbackground=ModernStyle.BORDER_COLOR)
             card_outer.pack(fill="x", pady=(0, 20), padx=25)
-            
             tk.Frame(card_outer, bg=ModernStyle.ACCENT_PRIMARY, height=3).pack(fill="x")
-            
+
             card = tk.Frame(card_outer, bg=ModernStyle.BG_SECONDARY)
             card.pack(fill="both", expand=True, padx=20, pady=15)
-            
-            tk.Label(
-                card, text=group_name,
-                fg=ModernStyle.ACCENT_PRIMARY, bg=ModernStyle.BG_SECONDARY,
-                font=ModernStyle.FONT_MODAL_TITLE
-            ).pack(anchor="w", pady=(0, 15))
-            
-            # Header Row
+            tk.Label(card, text=group_name, fg=ModernStyle.TEXT_ACCENT, bg=ModernStyle.BG_SECONDARY,
+                     font=ModernStyle.FONT_MODAL_TITLE).pack(anchor="w", pady=(0, 15))
+
             hdr_row = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
             hdr_row.pack(fill="x", pady=(0, 10))
-            
-            # Text based header
-            is_technical = "Technical" in group_name
-            target_hdr = "Observation" if is_technical else "Ideal Benchmark / Target"
-            
-            tk.Label(hdr_row, text="Metric / Ratio", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_TABLE_BOLD, width=22, anchor="w").pack(side="left")
-            tk.Label(hdr_row, text="Actual Value", fg=ModernStyle.TEXT_ON_ACCENT, bg=ModernStyle.ACCENT_TERTIARY, font=ModernStyle.FONT_SUBHEADING, width=16, anchor="w", padx=10).pack(side="left", padx=20)
-            tk.Label(hdr_row, text=target_hdr, fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_TABLE_BOLD, anchor="w").pack(side="left")
-
+            target_hdr = "Observation" if "Technical" in group_name else "Ideal Benchmark / Target"
+            tk.Label(hdr_row, text="Metric / Ratio", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY,
+                     font=ModernStyle.FONT_TABLE_BOLD, width=22, anchor="w").pack(side="left")
+            tk.Label(hdr_row, text="Actual Value", fg=ModernStyle.TEXT_ON_ACCENT, bg=ModernStyle.WARNING_FILL,
+                     font=ModernStyle.FONT_SUBHEADING, width=16, anchor="w", padx=10).pack(side="left", padx=20)
+            tk.Label(hdr_row, text=target_hdr, fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY,
+                     font=ModernStyle.FONT_TABLE_BOLD, anchor="w").pack(side="left")
             tk.Frame(card, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", pady=(0, 12))
 
-            for label_text, key, target_desc in fields:
-                val_str = str(row.get(key, ""))
-                sym = row.get("symbol", "")
-                cy = "¥" if str(sym).upper().endswith(".T") else "₹"
-                val_str = val_str.replace("₹", cy)
-                
-                # Determine text coloring
-                fg_col = ModernStyle.TEXT_PRIMARY
-                is_pass = evaluate_benchmark(key, val_str)
-                if is_pass is True:
-                    fg_col = ModernStyle.SUCCESS
-                elif is_pass is False:
-                    fg_col = ModernStyle.ERROR
-                
-                display_val = val_str if val_str and val_str not in ("None", "") else "—"
+            for label_text, mkey, target_desc in fields:
+                val_str = str(values.get(mkey) or "").replace("₹", cy).strip()
+                is_pass = evaluate_benchmark(mkey, val_str)
+                fg_col = (ModernStyle.SUCCESS if is_pass is True
+                          else ModernStyle.ERROR if is_pass is False else ModernStyle.TEXT_PRIMARY)
+                display_val = val_str if val_str and val_str != "None" else "—"
 
                 row_fr = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
-                row_fr.pack(fill="x", pady=8)
-                
-                tk.Label(row_fr, text=label_text, fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_HEADING, width=22, anchor="w").pack(side="left")
-                tk.Label(row_fr, text=display_val, fg=fg_col, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_INPUT, width=16, anchor="w").pack(side="left", padx=20)
-                
-                # Benchmarks often bold in screenshot
-                tk.Label(row_fr, text=target_desc, fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_TABLE_BOLD, anchor="w").pack(side="left")
+                row_fr.pack(fill="x", pady=6)
+                tk.Label(row_fr, text=label_text, fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY,
+                         font=ModernStyle.FONT_HEADING, width=22, anchor="w").pack(side="left")
+                tk.Label(row_fr, text=display_val, fg=fg_col, bg=ModernStyle.BG_SECONDARY,
+                         font=ModernStyle.FONT_INPUT, width=16, anchor="w").pack(side="left", padx=20)
+                tk.Label(row_fr, text=target_desc, fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY,
+                         font=ModernStyle.FONT_TABLE_BOLD, anchor="w").pack(side="left")
+
+        top.bind("<Escape>", lambda _e: top.destroy())
+        top.focus_set()

@@ -1209,6 +1209,7 @@ class PopupDatePicker(tk.Toplevel):
         self._navigating = False  # Guard flag to prevent dismissal during navigation
         
         self._build_ui()
+        self._build_footer()
         self._position_popup()
         self.deiconify()
         
@@ -1228,13 +1229,16 @@ class PopupDatePicker(tk.Toplevel):
         
         self.focus_set()
         
-        # Allow pressing Escape to close
+        # Escape closes. A borderless Mac window rarely gets the keyboard, so
+        # listen on the window underneath as well.
         self.bind("<Escape>", lambda e: self.destroy())
-        
-        # Close on outside click — only bind on the main window, NOT on self,
-        # to avoid dismissing the popup when clicking its own nav buttons.
         self._main_window = self.master.winfo_toplevel()
+        self._main_window_esc_id = self._main_window.bind("<Escape>", lambda e: self.destroy(), add="+")
+
+        # Close on an outside click. While the popup holds the grab, clicks
+        # elsewhere in the app arrive here, so check where the pointer was.
         self._main_window_bind_id = self._main_window.bind("<Button-1>", self._check_click_outside, add="+")
+        self.bind("<ButtonPress-1>", self._check_click_outside, add="+")
         
         self.bind("<FocusOut>", self._on_focus_out)
         self.bind("<Destroy>", self._on_destroy)
@@ -1244,6 +1248,7 @@ class PopupDatePicker(tk.Toplevel):
             if hasattr(self, "_main_window") and self._main_window and hasattr(self, "_main_window_bind_id"):
                 try:
                     self._main_window.unbind("<Button-1>", self._main_window_bind_id)
+                    self._main_window.unbind("<Escape>", self._main_window_esc_id)
                     self._main_window = None
                 except Exception:
                     pass
@@ -1474,6 +1479,22 @@ class PopupDatePicker(tk.Toplevel):
                     spacer = tk.Frame(self.grid_frame, bg=ModernStyle.BG_PRIMARY)
                     spacer.grid(row=r, column=c, padx=2, pady=2, sticky="nsew")
                     
+    def _build_footer(self) -> None:
+        """Today and Close links, so the popup can always be closed without picking."""
+        foot = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        foot.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(2, 6))
+        for text, cmd, side, fg in (("Today", self._select_today, tk.LEFT, ModernStyle.TEXT_ACCENT),
+                                    ("✕ Close", self.destroy, tk.RIGHT, ModernStyle.TEXT_SECONDARY)):
+            lbl = tk.Label(foot, text=text, bg=ModernStyle.BG_PRIMARY, fg=fg, font=ModernStyle.FONT_SMALL_BOLD,
+                           cursor="hand2", padx=6, pady=2)
+            lbl.pack(side=side)
+            lbl.bind("<Button-1>", lambda _e, c=cmd: c())
+
+    def _select_today(self) -> None:
+        today = self._datetime.now()
+        self.view_year, self.view_month = today.year, today.month
+        self._select_day(today.day)
+
     def _select_day(self, day):
         # Format the selected date
         val = f"{self.view_year:04d}-{self.view_month:02d}-{day:02d}"

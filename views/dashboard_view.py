@@ -396,14 +396,8 @@ class DashboardView(BaseView):
 
     @staticmethod
     def _greeting(now: datetime | None = None) -> str:
-        hour = (now or datetime.now()).hour
-        if 5 <= hour < 12:
-            text = "Good morning"
-        elif 12 <= hour < 17:
-            text = "Good afternoon"
-        else:
-            text = "Good evening"
-        return f"{text}, Selvakumar  ·  {(now or datetime.now()):%a %d %b}"
+        """The fixed banner title (the clock on the right shows the time)."""
+        return "Portfolio Tracker  ·  Your wealth at a glance"
 
     def _build_header(self) -> None:
         S = ModernStyle
@@ -531,8 +525,8 @@ class DashboardView(BaseView):
         cluster_left = right_x - rw
         avail = max(140, cluster_left - 24 - 20)
 
-        # The biggest greeting that fits; drop the name as a last resort.
-        text, font = self._greeting_text.split(",")[0], self._greeting_fonts[-1]
+        # The biggest title that fits; drop the tagline as a last resort.
+        text, font = self._greeting_text.split("  ·  ")[0], self._greeting_fonts[-1]
         for f in self._greeting_fonts:
             if self._font(f).measure(self._greeting_text) <= avail:
                 text, font = self._greeting_text, f

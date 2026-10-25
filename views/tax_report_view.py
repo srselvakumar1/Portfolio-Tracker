@@ -13,7 +13,7 @@ from datetime import datetime
 
 from views.base_view import BaseView
 from ui.ui_theme import ModernStyle
-from ui.ui_utils import add_treeview_copy_menu, treeview_sort_column, run_in_background, format_money
+from ui.ui_utils import add_treeview_copy_menu, treeview_sort_column, run_in_background, format_money, format_date
 from model.applog import log
 from model.database import db_session
 from model.tax import compute_realised_gains, LONG_TERM, SHORT_TERM
@@ -122,15 +122,15 @@ def build_table_rows(res, disp: str) -> list:
     sym = currency_symbol(disp)
     rows = []
     for u in res.unmatched_sells:
-        rows.append(((u.broker, u.symbol, "—", u.date, f"{u.qty:g}", "—", f"{sym}{u.price:,.2f}",
+        rows.append(((u.broker, u.symbol, "—", format_date(u.date), f"{u.qty:g}", "—", f"{sym}{u.price:,.2f}",
                       "—", "No buy found", "not counted"), "problem"))
     for s in res.skipped:
-        rows.append(((s.broker, s.symbol, "—", s.date or "—", "—", "—", "—", "—", "Bad data",
+        rows.append(((s.broker, s.symbol, "—", format_date(s.date) or "—", "—", "—", "—", "—", "Bad data",
                       "not counted"), "problem"))
     terms = {SHORT_TERM: "Short-term", LONG_TERM: "Long-term"}
     for r in sorted(res.rows, key=lambda x: (x.sell_date, x.buy_date), reverse=True):
         tag = "gain" if r.pnl > 0.005 else ("loss" if r.pnl < -0.005 else "flat")
-        rows.append(((r.broker, r.symbol, r.buy_date, r.sell_date, f"{r.qty:g}",
+        rows.append(((r.broker, r.symbol, format_date(r.buy_date), format_date(r.sell_date), f"{r.qty:g}",
                       f"{sym}{r.buy_price:,.2f}", f"{sym}{r.sell_price:,.2f}", f"{r.days:,}",
                       terms.get(r.term, f"n/a ({r.currency})"), signed_money(r.pnl, disp)), tag))
     return rows

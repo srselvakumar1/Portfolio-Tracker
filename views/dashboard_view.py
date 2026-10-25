@@ -2186,7 +2186,7 @@ class DashboardView(BaseView):
 
                 raw_d = str(getattr(r, "date", ""))
                 try:
-                    disp_d = datetime.strptime(raw_d, "%Y-%m-%d").strftime("%Y-%b-%d")
+                    disp_d = datetime.strptime(raw_d, "%Y-%m-%d").strftime("%d %b %Y")
                 except ValueError:
                     disp_d = raw_d
                 vals = (

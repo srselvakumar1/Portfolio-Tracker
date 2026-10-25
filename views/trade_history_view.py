@@ -61,7 +61,7 @@ def build_rows(df, *, c_filter: str, calc_unrealized: bool, market_prices: dict,
     for idx, row in enumerate(df.itertuples(index=False)):
         row_date = str(getattr(row, "date", ""))
         try:
-            disp_date = datetime.strptime(row_date, "%Y-%m-%d").strftime("%Y-%b-%d")
+            disp_date = datetime.strptime(row_date, "%Y-%m-%d").strftime("%d %b %Y")
         except ValueError:
             disp_date = row_date
         if row_date != current_date:

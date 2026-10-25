@@ -50,6 +50,11 @@ SECTIONS = [
         ]),
         ("note", "Settings and Help have no shortcut: click them in the sidebar."),
         ("bullets", [
+            "**Hide or quit**: the red close button (or **⌘W**) hides PTracker; click its Dock icon to bring "
+            "it back. **⌘Q** or the **⏻** button in the sidebar quits.",
+            "**What a column means**: rest the pointer on a column heading for a short explanation.",
+            "**Pick a date**: click the 📅 button next to a date box. **Today** picks today; **✕ Close**, "
+            "**Esc** or a click outside closes the calendar without changing the date.",
             "**Sort a table**: click a column heading; click it again to reverse the order.",
             "**Copy from a table**: right-click (or Control-click) a row and choose **Copy Selected "
             "Row** or **Copy All Rows**, then paste into Excel or Numbers.",
@@ -59,7 +64,9 @@ SECTIONS = [
 
     ("screens", "🧭  The screens", "purple", [
         ("table", ["Screen", "What it is for"], [
-            ["**Dashboard**", "A summary of the whole portfolio: key numbers, best and worst performers and insights."],
+            ["**Dashboard**", "A summary of the whole portfolio: key numbers, best and worst performers, insights and "
+                              "watchlist alerts. Double-click a card or a row for details; double-click a watchlist "
+                              "alert to buy or sell. Grey alert rows are stocks you are watching, not alerts."],
             ["**My Holdings**", "What you own now, per broker. Double-click a row to see the trades behind it."],
             ["**Trade Entry**", "Add a trade by hand, or import many at once from a CSV file (see Bulk import)."],
             ["**Trade History**", "Search and filter every trade. Double-click a trade to edit it; select several to delete them together."],

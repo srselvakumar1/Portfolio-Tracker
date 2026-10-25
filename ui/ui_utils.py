@@ -211,6 +211,20 @@ def add_treeview_copy_menu(tv) -> None:
         pass
 
 
+def format_date(value) -> str:
+    """Dates in tables, one style everywhere: 02 Aug 2016 (unreadable values as they are)."""
+    from datetime import date, datetime
+    if isinstance(value, (date, datetime)):
+        return value.strftime("%d %b %Y")
+    s = str(value or "").strip()
+    for text, fmt in ((s[:10], "%Y-%m-%d"), (s, "%Y-%b-%d")):
+        try:
+            return datetime.strptime(text, fmt).strftime("%d %b %Y")
+        except ValueError:
+            pass
+    return s
+
+
 def _sort_key(val):
     """Sort key for a table cell: dates, then numbers, then text; blanks last.
 

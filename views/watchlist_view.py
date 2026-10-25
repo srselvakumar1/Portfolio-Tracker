@@ -26,7 +26,7 @@ from model.applog import log
 from views.base_view import BaseView
 from ui.ui_theme import ModernStyle
 from ui.ui_widgets import ModernButton, ModernEntry, ModernCard, PremiumModal
-from ui.ui_utils import (add_treeview_copy_menu, treeview_sort_column, run_in_background,
+from ui.ui_utils import (add_treeview_copy_menu, format_date, treeview_sort_column, run_in_background,
                          call_on_ui, show_toast, ToolTip, HeadingTips)
 
 
@@ -876,7 +876,7 @@ class WatchlistView(BaseView):
                     from_high_str,
                     row.get("tags") or "",
                     row.get("notes") or row.get("stock_name") or "",
-                    row.get("added_on", ""),
+                    format_date(row.get("added_on", "")),
                 ),
                 tags=(row_tag,),
             )

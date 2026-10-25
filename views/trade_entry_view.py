@@ -21,7 +21,7 @@ from views.shared_trade_edit import (
     confirm_unusual, currency_symbol, friendly_error, refresh_after_change, show_stale_warning,
 )
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import ModernButton, ModernCard
+from ui.ui_widgets import RoundedBox, ModernButton, ModernCard
 from ui.ui_utils import add_treeview_copy_menu, center_window, format_money, run_in_background, show_toast
 
 PASTE_HINT = "date,symbol,type,qty,price\n2024-01-15,TCS.NS,BUY,10,3500.00\n2024-01-20,INFY.NS,SELL,5,1800.50"
@@ -101,7 +101,7 @@ class TradeEntryView(BaseView):
 
         def _styled_entry(parent, textvariable, validate=None, vcmd=None):
             """Entry with a focus ring (the ring turns red when the value is wrong)."""
-            wrap = tk.Frame(parent, bg=ModernStyle.BORDER_COLOR, padx=1, pady=1)
+            wrap = RoundedBox(parent)
             wrap.pack(fill="x")
             kw = dict(textvariable=textvariable, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_ACCENT,
                       font=ModernStyle.FONT_INPUT, relief=tk.FLAT, insertbackground=ModernStyle.ACCENT_PRIMARY,
@@ -121,7 +121,7 @@ class TradeEntryView(BaseView):
                     w.configure(bg=ModernStyle.BORDER_COLOR)
             ent.bind("<FocusIn>", _fi)
             ent.bind("<FocusOut>", _fo)
-            ent.pack(fill="x", ipady=4, padx=6)
+            ent.pack(fill="x", ipady=5, padx=8)
             return ent, wrap
 
         # ===== Manual Entry Card =====
@@ -324,11 +324,12 @@ class TradeEntryView(BaseView):
         # ===== Skipped Duplicates Card =====
         self.dupe_card, dupe_inner = _card(left, "Skipped Duplicates", "⚠️", bar=ModernStyle.WARNING_FILL,
                                            fg=ModernStyle.WARNING)
-        dupe_cols = ("Date", "Symbol", "Qty", "Why")
+        dupe_cols = ("#", "Date", "Symbol", "Qty", "Why")
         self.dupe_table = ttk.Treeview(dupe_inner, columns=dupe_cols, show="headings", height=6)
-        for c, w in zip(dupe_cols, (100, 100, 60, 260)):
-            self.dupe_table.heading(c, text=c, anchor="w")
-            self.dupe_table.column(c, width=w, anchor="w")
+        for c, w in zip(dupe_cols, (44, 100, 100, 60, 260)):
+            anchor = "center" if c == "#" else "w"
+            self.dupe_table.heading(c, text=c, anchor=anchor)
+            self.dupe_table.column(c, width=w, anchor=anchor)
         add_treeview_copy_menu(self.dupe_table)
         vsb = ttk.Scrollbar(dupe_inner, orient="vertical", command=self.dupe_table.yview)
         self.dupe_table.configure(yscroll=vsb.set)
@@ -1164,7 +1165,7 @@ class TradeEntryView(BaseView):
         if not dupes:
             self.dupe_card.pack_forget()
         else:
-            for d, s, q, why in dupes[:500]:
-                self.dupe_table.insert("", "end", values=(str(d), str(s), f"{float(q):g}", why))
+            for n, (d, s, q, why) in enumerate(dupes[:500], 1):
+                self.dupe_table.insert("", "end", values=(n, str(d), str(s), f"{float(q):g}", why))
             self.dupe_card.pack(fill="x")
         self._schedule_fit()

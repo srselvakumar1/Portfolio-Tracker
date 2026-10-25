@@ -2241,14 +2241,15 @@ class DashboardView(BaseView):
         table_frame = modal.content_frame
         table_frame.pack_configure(fill="both", expand=True)
 
-        cols = ("Broker", "Value", "% of Total") if is_currency else ("Broker", "Performance Rate")
+        cols = ("#", "Broker", "Value", "% of Total") if is_currency else ("#", "Broker", "Performance Rate")
         tv = ttk.Treeview(table_frame, columns=cols, show="headings", height=16)
         style_name = "Breakdown.Treeview"
         ttk.Style().configure(style_name, rowheight=42, font=S.FONT_DASHBOARD_TABLE)
         tv.configure(style=style_name)
         for c in cols:
             tv.heading(c, text=c, anchor="center")
-            tv.column(c, width=220 if (c == "Broker" or not is_currency) else 160, anchor="center")
+            width = 50 if c == "#" else (220 if (c == "Broker" or not is_currency) else 160)
+            tv.column(c, width=width, stretch=c != "#", anchor="center")
 
         tv.tag_configure("odd", background=S.BG_SECONDARY)
         tv.tag_configure("even", background=S.TABLE_ROW_ALT)
@@ -2303,16 +2304,16 @@ class DashboardView(BaseView):
                 disp = _money(v, c_val) if is_currency else _pct(v)
                 if is_currency:
                     pct = (v / total * 100.0) if total != 0 else 0.0
-                    tv.insert("", "end", iid=b, values=(b, disp, f"{pct:.1f}%"), tags=tuple(tags))
+                    tv.insert("", "end", iid=b, values=(idx + 1, b, disp, f"{pct:.1f}%"), tags=tuple(tags))
                 else:
-                    tv.insert("", "end", iid=b, values=(b, disp), tags=tuple(tags))
+                    tv.insert("", "end", iid=b, values=(idx + 1, b, disp), tags=tuple(tags))
                 for sym, name, val in children.get(b, []):
                     if abs(val) <= 0.01:
                         continue
                     share = f"{abs(val) / abs(v) * 100:.1f}%" if abs(v) > 0 else "0.0%"
                     label = f"   ↳ {name}" if name and name != sym else f"   ↳ {sym}"
                     sym_disp = _money(val, c_val) if is_currency else f"{val:.2f}"
-                    tv.insert(b, "end", values=(label, sym_disp, share), tags=("sym",))
+                    tv.insert(b, "end", values=("", label, sym_disp, share), tags=("sym",))
 
         run_in_background(
             _work, on_done=_populate,
@@ -2458,7 +2459,7 @@ class DashboardView(BaseView):
         body.grid_columnconfigure(1, weight=1, uniform="movers")
         body.grid_rowconfigure(0, weight=1)
 
-        cols = (("Broker", 120, "w"), ("Symbol", 110, "w"), ("Prev Close", 90, "e"),
+        cols = (("#", 40, "center"), ("Broker", 120, "w"), ("Symbol", 110, "w"), ("Prev Close", 90, "e"),
                 ("Price", 90, "e"), ("Change", 100, "e"), ("% Change", 84, "e"))
 
         def _column(col, title, fill, row_tag, row_fg):
@@ -2500,6 +2501,7 @@ class DashboardView(BaseView):
                 for i, g in enumerate(items or []):
                     cur = g.get("currency", currency)
                     tv.insert("", "end", values=(
+                        i + 1,
                         g.get("broker", ""),
                         g.get("symbol", ""),
                         format_money(g.get("prev_close"), cur),

@@ -145,7 +145,111 @@ class ModernEntry(tk.Entry):
         return val
 
 
-class ClearableEntry(tk.Frame):
+class RoundedBox(tk.Frame):
+    """A 1-px bordered box with rounded corners for input fields.
+
+    It behaves like the plain bordered Frame it replaces: its bg is the border
+    colour, so ``configure(bg=...)`` and ``cget("bg")`` still set and read the
+    border (focus and error colours keep working). Pack the field inside it.
+    Four tiny canvases drawn over the corners round them off.
+    """
+    R = 6
+
+    def __init__(self, parent, fill: str | None = None, border: str | None = None, **kw):
+        kw.setdefault("padx", 1)
+        kw.setdefault("pady", 1)
+        self._corners = []
+        super().__init__(parent, bg=border or ModernStyle.BORDER_COLOR, **kw)
+        self._fill = fill or ModernStyle.ENTRY_BG
+        r = self.R
+        for pos, place in (("nw", dict(x=0, y=0)), ("ne", dict(relx=1, x=-r, y=0)),
+                           ("sw", dict(x=0, rely=1, y=-r)), ("se", dict(relx=1, rely=1, x=-r, y=-r))):
+            c = tk.Canvas(self, width=r, height=r, highlightthickness=0, bd=0)
+            c.place(**place)
+            self._corners.append((pos, c))
+        self._paint()
+        # Keep the corners above the field (Canvas.lift means "raise an item", so use Misc.lift)
+        self.bind("<Map>", lambda _e: [tk.Misc.lift(c) for _, c in self._corners], add="+")
+
+    def configure(self, cnf=None, **kw):
+        res = super().configure(cnf, **kw)
+        if self._corners and ("bg" in kw or "background" in kw or
+                              (isinstance(cnf, dict) and ("bg" in cnf or "background" in cnf))):
+            self._paint()
+        return res
+
+    config = configure
+
+    def watch(self, widget: tk.Misc) -> None:
+        """Border in the accent colour while `widget` has the keyboard (red errors are kept)."""
+        def _in(_e):
+            if str(self.cget("bg")) != ModernStyle.ERROR:
+                self.configure(bg=ModernStyle.ACCENT_PRIMARY)
+
+        def _out(_e):
+            if str(self.cget("bg")) != ModernStyle.ERROR:
+                self.configure(bg=ModernStyle.BORDER_COLOR)
+        widget.bind("<FocusIn>", _in, add="+")
+        widget.bind("<FocusOut>", _out, add="+")
+
+    def _paint(self) -> None:
+        r, border = self.R, str(self.cget("bg"))
+        try:
+            outer = str(self.master.cget("bg"))
+        except tk.TclError:
+            outer = ModernStyle.BG_PRIMARY
+        for pos, c in self._corners:
+            c.delete("all")
+            c.configure(bg=outer)
+            cx = r if pos[1] == "w" else 0      # circle centre at the inner corner
+            cy = r if pos[0] == "n" else 0
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=self._fill, outline=border)
+
+
+class EmptyState(tk.Frame):
+    """A friendly empty screen over a table: a big icon in a soft circle, a title,
+    one sentence and an optional button. show(...) places it centred; hide() removes it."""
+
+    def __init__(self, parent, bg: str | None = None):
+        bg = bg or ModernStyle.BG_SECONDARY
+        super().__init__(parent, bg=bg)
+        self._bg = bg
+        d = 84
+        self._circle = tk.Canvas(self, width=d, height=d, bg=bg, highlightthickness=0, bd=0)
+        self._circle.create_oval(2, 2, d - 2, d - 2, fill=ModernStyle.ACCENT_PRIMARY_PALE, outline="")
+        self._icon_id = self._circle.create_text(d // 2, d // 2, text="", font=ModernStyle.FONT_EMPTY_STATE)
+        self._circle.pack(pady=(0, 12))
+        self._title = tk.Label(self, bg=bg, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_TITLE)
+        self._title.pack()
+        self._text = tk.Label(self, bg=bg, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY,
+                              wraplength=460, justify="center")
+        self._text.pack(pady=(4, 14))
+        self._btn_holder = tk.Frame(self, bg=bg)
+        self._btn_holder.pack()
+        self._btn_key = None
+
+    def show(self, icon: str, title: str, text: str = "", button: str | None = None, command=None) -> None:
+        self._circle.itemconfigure(self._icon_id, text=icon)
+        self._title.configure(text=title)
+        self._text.configure(text=text)
+        if (button, command) != self._btn_key:
+            self._btn_key = (button, command)
+            for w in self._btn_holder.winfo_children():
+                w.destroy()
+            if button and command:
+                import tkinter.font as tkfont
+                width = tkfont.Font(font=ModernStyle.FONT_SMALL_BOLD).measure(button) + 48
+                ModernButton(self._btn_holder, text=button, command=command, bg=ModernStyle.ACCENT_PRIMARY,
+                             fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=self._bg, width=max(150, width),
+                             height=36, radius=8, font=ModernStyle.FONT_SMALL_BOLD).pack()
+        self.place(relx=0.5, rely=0.5, anchor="center")
+        self.lift()
+
+    def hide(self) -> None:
+        self.place_forget()
+
+
+class ClearableEntry(RoundedBox):
     """Search entry with a visible ✕ clear button that appears when text is present.
 
     Uses a tk.Frame wrapper so the X label is a true sibling of the entry
@@ -154,9 +258,10 @@ class ClearableEntry(tk.Frame):
 
     def __init__(self, parent, placeholder="Search...", on_change=None, **entry_kwargs):
         bg = entry_kwargs.pop("bg", ModernStyle.ENTRY_BG)
-        super().__init__(parent, bg=bg, highlightthickness=1,
-                         highlightbackground=ModernStyle.BORDER_COLOR,
-                         highlightcolor=ModernStyle.ACCENT_PRIMARY)
+        super().__init__(parent, fill=bg)
+        outer = tk.Frame(self, bg=bg)     # the entry-coloured inside of the rounded box
+        outer.pack(fill=tk.BOTH, expand=True)
+        parent_for_children = outer
 
         self._on_change = on_change
         self._placeholder = placeholder
@@ -164,7 +269,7 @@ class ClearableEntry(tk.Frame):
 
         # ── inner entry (no border — frame handles it) ──────────────────────
         self.entry = ModernEntry(
-            self,
+            parent_for_children,
             placeholder=placeholder,
             bg=bg,
             highlightthickness=0,
@@ -176,7 +281,7 @@ class ClearableEntry(tk.Frame):
 
         # ── clear button (always present, visibility toggled) ───────────────
         self._clear_lbl = tk.Label(
-            self, text="✕",
+            parent_for_children, text="✕",
             fg=ModernStyle.TEXT_TERTIARY, bg=bg,
             font=ModernStyle.FONT_SMALL, cursor="hand2",
             padx=4,
@@ -209,14 +314,17 @@ class ClearableEntry(tk.Frame):
             self._on_change(event)
 
     def _on_focus_in(self, event=None):
-        self.config(highlightcolor=ModernStyle.ACCENT_PRIMARY,
-                    highlightbackground=ModernStyle.ACCENT_PRIMARY)
+        self.configure(bg=ModernStyle.ACCENT_PRIMARY)
 
     def _on_focus_out(self, event=None):
-        self.config(highlightbackground=ModernStyle.BORDER_COLOR)
+        self.configure(bg=ModernStyle.BORDER_COLOR)
         self._sync_clear()
 
     # ── public API ─────────────────────────────────────────────────────────
+    def clear(self):
+        """Empty the box (as the ✕ does)."""
+        self._on_clear()
+
     def get(self):
         return self.entry.get_value()
 
@@ -293,9 +401,11 @@ class ModernButton(tk.Canvas):
         soft_hover = None
         if variant == "soft":
             accent = bg
-            bg = self._blend(accent, canvas_bg, 0.13)
-            soft_hover = self._blend(accent, canvas_bg, 0.24)
-            fg = self._blend("#000000", accent, 0.22)   # a shade darker: readable on the tint
+            dark = getattr(ModernStyle, "IS_DARK", False)
+            bg = self._blend(accent, canvas_bg, 0.2 if dark else 0.13)
+            soft_hover = self._blend(accent, canvas_bg, 0.32 if dark else 0.24)
+            # text a shade darker on light pages, a shade lighter on dark ones
+            fg = self._blend("#FFFFFF", accent, 0.55) if dark else self._blend("#000000", accent, 0.22)
 
         self._bg_normal = bg
         self._bg_hover = soft_hover or self._lighten_color(bg, 18)

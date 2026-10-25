@@ -209,7 +209,7 @@ _SCALE = TEXT_SCALES.get(_SETTINGS.get("text_size", "normal"), 1.0)
 
 _FAMILY = (
     "Segoe UI" if sys.platform == "win32"
-    else (".AppleSystemUIFont" if sys.platform == "darwin" else "Ubuntu")
+    else ("Avenir Next" if sys.platform == "darwin" else "Ubuntu")   # softer, rounder than the system font
 )
 
 
@@ -288,7 +288,7 @@ class ModernStyle:
     # ──────────────────────────────────────────────────────────────
     # COMPONENT LAYOUT TOKENS
     # ──────────────────────────────────────────────────────────────
-    KPI_CARD_HEIGHT          = round(110 * _SCALE)
+    KPI_CARD_HEIGHT          = round(120 * _SCALE)   # Avenir Next lines are a little taller
     KPI_ACCENT_BAR_HEIGHT    = 3
     DASH_GRID_CARD_HEIGHT    = round(240 * _SCALE)
     DASH_SECTION_CARD_HEIGHT = round(300 * _SCALE)
@@ -358,6 +358,14 @@ class ModernStyle:
             selectbackground=[("readonly", cls.ENTRY_BG)],
             selectforeground=[("readonly", cls.TEXT_PRIMARY)],
         )
+        # Same height as the other inputs, and the accent border while it has the keyboard
+        style.configure("TCombobox", padding=(6, 4))
+        style.map("TCombobox", bordercolor=[("focus", cls.ACCENT_PRIMARY)],
+                  lightcolor=[("focus", cls.ACCENT_PRIMARY)])
+        # Inside a RoundedBox the box draws the border, so the combobox has none
+        style.configure("Boxed.TCombobox", bordercolor=cls.ENTRY_BG, lightcolor=cls.ENTRY_BG,
+                        darkcolor=cls.ENTRY_BG)
+        style.map("Boxed.TCombobox", bordercolor=[("focus", cls.ENTRY_BG)], lightcolor=[("focus", cls.ENTRY_BG)])
         # The drop-down list of a Combobox is a plain Listbox
         root.option_add("*TCombobox*Listbox.background", cls.ENTRY_BG)
         root.option_add("*TCombobox*Listbox.foreground", cls.TEXT_PRIMARY)

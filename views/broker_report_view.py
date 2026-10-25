@@ -54,7 +54,7 @@ class BrokerReportView(BaseView):
         self._build_kpis()
         self._status = tk.Label(self._content, text="", font=ModernStyle.FONT_BODY, anchor="w",
                                 bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY)
-        self._status.pack(fill="x", padx=22, pady=(2, 2))
+        self._status.pack(fill="x", padx=20, pady=(2, 2))
         self._build_table()
         self._build_chart()
 
@@ -142,7 +142,7 @@ class BrokerReportView(BaseView):
                              highlightbackground=ModernStyle.BORDER_COLOR)
         container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(4, 12))
 
-        columns = ("broker", "invested", "current_val", "unrealized_pnl", "unrealized_loss",
+        columns = ("num", "broker", "invested", "current_val", "unrealized_pnl", "unrealized_loss",
                    "realized_pnl", "realized_loss", "total_pnl", "xirr")
         style = ttk.Style()
         style.configure("BrokerReport.Treeview", font=ModernStyle.FONT_REPORT_TABLE, rowheight=ModernStyle.TABLE_ROW_HEIGHT)
@@ -155,13 +155,13 @@ class BrokerReportView(BaseView):
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         headers = {
-            "broker": ("Broker", 150), "invested": ("Invested", 120), "current_val": ("Current Value", 130),
+            "num": ("#", 44), "broker": ("Broker", 150), "invested": ("Invested", 120), "current_val": ("Current Value", 130),
             "unrealized_pnl": ("Unrealised P&L", 140), "unrealized_loss": ("Unrealised Loss", 135),
             "realized_pnl": ("Realised P&L", 135), "realized_loss": ("Realised Loss", 130),
             "total_pnl": ("Total P&L", 140), "xirr": ("XIRR", 95),
         }
         for col, (title, width) in headers.items():
-            anchor = "w" if col == "broker" else "e"
+            anchor = "w" if col == "broker" else ("center" if col == "num" else "e")
             self.tree.heading(col, text=title, anchor=anchor, command=lambda c=col: treeview_sort_column(self.tree, c, False))
             self.tree.column(col, width=width, minwidth=30, anchor=anchor, stretch=False)
         # Narrow window: hide the two Loss columns first (Copy All Rows still copies them)
@@ -189,7 +189,7 @@ class BrokerReportView(BaseView):
                 "realized_pnl", "realized_loss", "overall_pnl")
         for c in shown:
             if len(shown) > 1:
-                self.tree.insert("", tk.END, values=(f"{c} brokers",) + ("",) * 8, tags=('group',))
+                self.tree.insert("", tk.END, values=("", f"{c} brokers") + ("",) * 8, tags=('group',))
             totals = dict.fromkeys(keys, 0.0)
             rows = sorted(grouped[c], key=lambda item: item[1].get("overall_pnl", 0.0), reverse=True)
             for idx, (broker, data) in enumerate(rows):
@@ -199,6 +199,7 @@ class BrokerReportView(BaseView):
                 xirr = float(data.get("overall_xirr", 0.0) or 0.0)
                 xirr_txt = "0.00%" if abs(xirr) < 0.005 else f"{'▲' if xirr > 0 else '▼'} {abs(xirr):.2f}%"
                 self.tree.insert("", tk.END, values=(
+                    idx + 1,
                     broker,
                     format_money(v["total_invested"], c),
                     format_money(v["total_value"], c),
@@ -210,6 +211,7 @@ class BrokerReportView(BaseView):
                     xirr_txt,
                 ), tags=('odd' if idx % 2 else 'even', 'profit' if v["overall_pnl"] >= 0 else 'loss'))
             self.tree.insert("", tk.END, values=(
+                "",
                 f"TOTAL ({c})",
                 format_money(totals["total_invested"], c),
                 format_money(totals["total_value"], c),

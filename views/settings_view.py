@@ -14,7 +14,7 @@ from datetime import datetime
 from views.base_view import BaseView
 from model.applog import log
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import ModernButton, ModernCard, ModernEntry
+from ui.ui_widgets import RoundedBox, ModernButton, ModernCard, ModernEntry
 from ui.ui_utils import call_on_ui
 
 class SettingsView(BaseView):
@@ -33,7 +33,7 @@ class SettingsView(BaseView):
 
         # Main content area using a 2-column layout to avoid vertical scroll
         content = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        content.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        content.pack(fill="both", expand=True, padx=20, pady=(4, 16))
 
         left_col = tk.Frame(content, bg=ModernStyle.BG_PRIMARY)
         left_col.pack(side="left", fill="both", expand=True, padx=(0, 7))
@@ -70,8 +70,12 @@ class SettingsView(BaseView):
         self.new_broker_var = tk.StringVar(value="")
         self.new_broker_currency_var = tk.StringVar(value="INR")
         
-        entry = ModernEntry(add_frame, textvariable=self.new_broker_var, font=ModernStyle.FONT_BODY)
-        entry.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+        box = RoundedBox(add_frame)
+        entry = ModernEntry(box, textvariable=self.new_broker_var, font=ModernStyle.FONT_INPUT,
+                            highlightthickness=0, bg=ModernStyle.ENTRY_BG)
+        entry.pack(fill="x", ipady=5, padx=8)
+        box.watch(entry)
+        box.grid(row=1, column=0, sticky="ew", padx=(0, 6))
         
         import tkinter.ttk as ttk
         curr_cb = ttk.Combobox(add_frame, textvariable=self.new_broker_currency_var, values=["INR", "JPY", "USD"], width=6, state="readonly", font=ModernStyle.FONT_BODY)

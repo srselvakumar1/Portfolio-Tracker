@@ -16,17 +16,18 @@ def _create_date_input(parent: tk.Misc, text_var: tk.StringVar) -> tk.Widget:
         init_dt = _DT.now()
         text_var.set(init_dt.strftime("%Y-%m-%d"))
 
-    container = tk.Frame(parent, bg=ModernStyle.BG_PRIMARY)
-    
+    from ui.ui_widgets import RoundedBox
+    container = RoundedBox(parent)   # one rounded box holds the date and the 📅 button
+
     # Text entry for the date
     entry = tk.Entry(
         container, textvariable=text_var, width=11,
-        font=ModernStyle.FONT_BODY, bg=ModernStyle.ENTRY_BG,
-        fg=ModernStyle.TEXT_PRIMARY, relief=tk.FLAT,
-        highlightthickness=1, highlightbackground=ModernStyle.BORDER_COLOR,
-        highlightcolor=ModernStyle.ACCENT_PRIMARY
+        font=ModernStyle.FONT_INPUT, bg=ModernStyle.ENTRY_BG,
+        fg=ModernStyle.TEXT_PRIMARY, relief=tk.FLAT, bd=0, highlightthickness=0,
+        insertbackground=ModernStyle.TEXT_ACCENT
     )
-    entry.pack(side="left", fill="y", padx=(0, 2))
+    entry.pack(side="left", fill="y", ipady=5, padx=(8, 0))
+    container.watch(entry)
     
     def _open_picker():
         top = parent.winfo_toplevel()
@@ -35,8 +36,8 @@ def _create_date_input(parent: tk.Misc, text_var: tk.StringVar) -> tk.Widget:
     # Calendar button
     btn = tk.Button(
         container, text="📅", font=ModernStyle.FONT_BODY,
-        bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_ACCENT,
-        activebackground=ModernStyle.BG_SECONDARY,
+        bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_ACCENT,
+        activebackground=ModernStyle.ENTRY_BG, highlightthickness=0,
         relief=tk.FLAT, bd=0, padx=6, pady=0,
         cursor="hand2", command=_open_picker
     )

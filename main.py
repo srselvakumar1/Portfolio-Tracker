@@ -598,7 +598,7 @@ class Sidebar(tk.Frame):
 
         # Tickers container directly in the frame
         self.tickers_container = tk.Frame(self._ticker_frame, bg=self.sidebar_bg)
-        self.tickers_container.pack(fill=tk.BOTH, expand=True, padx=10)
+        self.tickers_container.pack(fill=tk.BOTH, expand=True, padx=8)
 
         import model.tickers as tck
         cached_data = tck.get_mini_tickers()
@@ -993,7 +993,7 @@ class Sidebar(tk.Frame):
         else:
             for name, info in data.items():
                 row = tk.Frame(self.tickers_container, bg=self.sidebar_bg)
-                row.pack(fill=tk.X, pady=1)
+                row.pack(fill=tk.X, pady=0)
 
                 lbl1 = tk.Label(row, text=name, bg=self.sidebar_bg, fg=ModernStyle.SIDEBAR_FG, font=ModernStyle.FONT_TICKER_SYMBOL, padx=0)
                 lbl1.pack(side=tk.LEFT)
@@ -1046,10 +1046,20 @@ class Sidebar(tk.Frame):
         need = self.middle_content.winfo_reqheight()
         have = self._middle_canvas.winfo_height()
         logo_h = self._logo_container.winfo_reqheight() + 8
-        shown = self._logo_container.winfo_ismapped()
-        if shown and need > have:
-            self._logo_container.pack_forget()
-        elif not shown and need + logo_h <= have:
+        status_h = self._status_row.winfo_reqheight() + 6
+        logo_on = self._logo_container.winfo_ismapped()
+        status_on = self._status_row.winfo_ismapped()
+        # Give way in two steps: the logo first, then the "85 active · prices …" line
+        # (the status bar at the bottom of the window shows the same). Each change
+        # resizes the sidebar, which runs this again.
+        if need > have:
+            if logo_on:
+                self._logo_container.pack_forget()
+            elif status_on:
+                self._status_row.pack_forget()
+        elif not status_on and need + status_h <= have:
+            self._status_row.pack(fill=tk.X, pady=(6, 0))
+        elif status_on and not logo_on and need + logo_h <= have:
             self._logo_container.pack(fill=tk.X, pady=(8, 0), after=self._title_stack.master)
 
 

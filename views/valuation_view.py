@@ -19,7 +19,7 @@ from tkinter import ttk
 from model.applog import log
 from views.base_view import BaseView, _enable_canvas_mousewheel
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import ModernButton, LoadingOverlay, ModernCard, ModernEntry
+from ui.ui_widgets import RoundedBox, ModernButton, LoadingOverlay, ModernCard, ModernEntry
 from ui.ui_utils import run_in_background
 import pandas as pd
 
@@ -255,6 +255,10 @@ def collect_valuation_data(symbol: str) -> dict:
 
     # ── Profitability ─────────────────────────────────────────────────────────
     eps_raw = info.get("trailingEps")
+    from model.engine import is_placeholder_eps
+    if is_placeholder_eps(eps_raw, raw.get("pe_ratio"), cur_price):
+        eps_raw = None              # EPS 1.00 with P/E = price: earnings unknown
+        extract("pe_ratio", None)
     extract("eps", eps_raw)
     roe = info.get("returnOnEquity")
     extract("roe", roe * 100 if roe is not None else scr_data.get("roe"))
@@ -433,17 +437,18 @@ class ValuationView(BaseView):
         ).pack(side="left", padx=(0, 10))
 
         self._v_symbol = tk.StringVar()
+        sym_box = RoundedBox(input_inner)
         self._e_symbol = ModernEntry(
-            input_inner, textvariable=self._v_symbol, width=15,
+            sym_box, textvariable=self._v_symbol, width=15,
             bg=ModernStyle.ENTRY_BG, fg=ModernStyle.ACCENT_PRIMARY,
             font=ModernStyle.FONT_INPUT,
             relief=tk.FLAT,
-            highlightthickness=1,
-            highlightcolor=ModernStyle.ACCENT_PRIMARY,
-            highlightbackground=ModernStyle.BORDER_COLOR,
+            highlightthickness=0,
             insertbackground=ModernStyle.ACCENT_PRIMARY,
         )
-        self._e_symbol.pack(side="left", ipady=5, padx=(0, 15))
+        self._e_symbol.pack(ipady=5, padx=8)
+        sym_box.watch(self._e_symbol)
+        sym_box.pack(side="left", padx=(0, 15))
 
         # Enter starts an analysis too (ignored while one is running)
         self._fetching = False

@@ -28,7 +28,7 @@ from model.data_cache import DataCache, HoldingsFilters, TradeHistoryFilters
 from ui.ui_theme import ModernStyle
 from ui.ui_utils import (HeadingTips, ToolTip, format_money, run_in_background, show_toast,
                          treeview_sort_column)
-from ui.ui_widgets import ClearableEntry, ModernButton, ModernCard, PremiumModal
+from ui.ui_widgets import EmptyState, RoundedBox, ClearableEntry, ModernButton, ModernCard, PremiumModal
 from views.base_view import BaseView
 
 
@@ -776,17 +776,7 @@ class HoldingsView(BaseView):
         inner.grid_columnconfigure(0, weight=1)
 
         # Empty / loading message shown over the table
-        self._empty_frame = tk.Frame(inner, bg=ModernStyle.BG_SECONDARY)
-        self._empty_icon = tk.Label(self._empty_frame, text="⏳", font=ModernStyle.FONT_EMPTY_STATE,
-                                    bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_TERTIARY)
-        self._empty_icon.pack(pady=(0, 4))
-        self._empty_title = tk.Label(self._empty_frame, text="Loading holdings…", font=ModernStyle.FONT_HEADING,
-                                     fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY)
-        self._empty_title.pack()
-        self._empty_hint = tk.Label(self._empty_frame, text="", font=ModernStyle.FONT_BODY,
-                                    fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY,
-                                    wraplength=520, justify="center")
-        self._empty_hint.pack()
+        self._empty = EmptyState(inner)
         self._empty_shown = None
         self._show_empty("⏳", "Loading holdings…", "")
 
@@ -795,19 +785,23 @@ class HoldingsView(BaseView):
         for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
             self.tree.bind(seq, self._on_tree_right_click)
 
-    def _show_empty(self, icon: Optional[str], title: str = "", hint: str = "") -> None:
-        """Show a message over the table, or hide it when icon is None."""
-        state = (icon, title, hint)
+    def _show_empty(self, icon: Optional[str], title: str = "", hint: str = "",
+                    button: Optional[str] = None, command=None) -> None:
+        """Show a friendly message over the table, or hide it when icon is None."""
+        state = (icon, title, hint, button)
         if state == self._empty_shown:
             return
         self._empty_shown = state
         if icon is None:
-            self._empty_frame.place_forget()
+            self._empty.hide()
             return
-        self._empty_icon.configure(text=icon)
-        self._empty_title.configure(text=title)
-        self._empty_hint.configure(text=hint)
-        self._empty_frame.place(relx=0.5, rely=0.5, anchor="center")
+        self._empty.show(icon, title, hint, button, command)
+
+    def _clear_filters(self) -> None:
+        """Every broker, symbol, signal and status (the empty screen's button)."""
+        self.broker_var.set("All")
+        self.signal_var.set("All")
+        self._symbol_bar.clear()
 
     # ── Column chooser ────────────────────────────────────────────────────
     def _load_hidden_columns(self) -> list:
@@ -1066,16 +1060,16 @@ class HoldingsView(BaseView):
 
         def _entry(row, var):
             # 1-px border frame (turns blue while typing) around an entry-coloured box
-            wrap = tk.Frame(form, bg=ModernStyle.BORDER_COLOR, padx=1, pady=1)
+            wrap = RoundedBox(form)
             wrap.grid(row=row, column=0, sticky="ew", pady=(0, 4))
             box = tk.Frame(wrap, bg=ModernStyle.ENTRY_BG)
             box.pack(fill="both", expand=True)
             ent = tk.Entry(box, textvariable=var, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
-                           font=ModernStyle.FONT_HEADING, relief=tk.FLAT, bd=0,
+                           font=ModernStyle.FONT_INPUT, relief=tk.FLAT, bd=0,
                            insertbackground=ModernStyle.TEXT_ACCENT, highlightthickness=0)
             ent.bind("<FocusIn>", lambda _e: wrap.configure(bg=ModernStyle.ACCENT_PRIMARY))
             ent.bind("<FocusOut>", lambda _e: wrap.configure(bg=ModernStyle.BORDER_COLOR))
-            ent.pack(fill="both", expand=True, ipady=6, padx=10)
+            ent.pack(fill="both", expand=True, ipady=5, padx=10)
             return ent
 
         def _note(row, text):
@@ -1738,7 +1732,7 @@ class HoldingsView(BaseView):
             broker_cur = str(self._broker_currency.get(params["broker"]) or "").upper()
             if params["broker"] != "All" and broker_cur and broker_cur != params["currency"]:
                 hint = f"{params['broker']} holds {broker_cur} shares: switch the currency at the top right to {broker_cur}."
-            self._show_empty("🪹", "No holdings match these filters", hint)
+            self._show_empty("🔍", "No holdings match these filters", hint, "↺ Clear filters", self._clear_filters)
 
     def _update_totals(self, params: dict, res: dict) -> None:
         cur = params["currency"] if params["currency"] != "All" else "INR"

@@ -25,7 +25,7 @@ import pandas as pd
 from model.applog import log
 from views.base_view import BaseView
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import ModernButton, ModernEntry, ModernCard, PremiumModal
+from ui.ui_widgets import EmptyState, RoundedBox, ModernButton, ModernEntry, ModernCard, PremiumModal
 from ui.ui_utils import (add_treeview_copy_menu, format_date, treeview_sort_column, run_in_background,
                          call_on_ui, show_toast, ToolTip, HeadingTips)
 
@@ -112,6 +112,10 @@ def compute_signal(row: dict) -> tuple[str, str, str]:
     patchy data is judged on what is known instead of drifting to "Avoid".
     Pure function: safe to call from a background thread.
     """
+    from model.engine import is_placeholder_eps
+    if is_placeholder_eps(row.get("eps"), row.get("pe_ratio"), row.get("current_value")):
+        # EPS 1.00 with P/E = price is missing data: don't score P/E, fair value or Graham on it
+        row = {k: v for k, v in row.items() if k not in ("eps", "pe_ratio", "intrinsic_value")}
     score = 0
     max_score = 0
     reasons_pass: list[str] = []
@@ -311,6 +315,13 @@ def fetch_watchlist_metrics(symbol: str, columns: set[str]) -> tuple[str, dict[s
     put("peg_ratio", info.get("pegRatio") or info.get("trailingPegRatio"), "{:.2f}")
     put("pb_ratio", info.get("priceToBook"), "{:.2f}")
     eps = info.get("trailingEps")
+    from model.engine import is_placeholder_eps
+    if is_placeholder_eps(eps, info.get("trailingPE"), cur_price):
+        # Earnings unknown (EPS 1.00, P/E = price): clear the old figures, not store fake ones
+        eps = None
+        for key in ("eps", "pe_ratio", "intrinsic_value"):
+            if key in columns:
+                out[key] = ""
     put("eps", eps, f"{cy}{{:,.2f}}")
     put("book_value", info.get("bookValue"), f"{cy}{{:,.2f}}")
     de = info.get("debtToEquity")
@@ -557,20 +568,21 @@ class WatchlistView(BaseView):
                 col, text=label, bg=ModernStyle.BG_SECONDARY,
                 fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD
             ).pack(anchor="w", pady=(0, 2))
+            box = RoundedBox(col)
             e = ModernEntry(
-                col, placeholder="",
+                box, placeholder="",
                 textvariable=var,
                 bg=ModernStyle.ENTRY_BG,
                 fg=ModernStyle.TEXT_PRIMARY,
                 insertbackground=ModernStyle.TEXT_PRIMARY,
-                highlightthickness=1,
-                highlightcolor=ModernStyle.ACCENT_PRIMARY,
-                highlightbackground=ModernStyle.BORDER_COLOR,
+                highlightthickness=0,
                 relief=tk.FLAT,
                 font=ModernStyle.FONT_INPUT,
                 width=width
             )
-            e.pack(anchor="w", fill="x" if expand else None, ipady=3)
+            e.pack(fill="x", ipady=5, padx=8)
+            box.watch(e)
+            box.pack(anchor="w", fill="x" if expand else None)
             e.bind("<Return>", lambda _e: self._on_save())
             e.bind("<Escape>", self._clear_form, add="+")
             return e
@@ -682,6 +694,7 @@ class WatchlistView(BaseView):
         table_frame.pack(fill="both", expand=True, padx=20, pady=(6, 20))
         table_frame.content.grid_rowconfigure(0, weight=1)
         table_frame.content.grid_columnconfigure(0, weight=1)
+        self._empty = EmptyState(table_frame.content)
 
         cols = ("#", "Symbol", "Signal", "Sector / Industry", "Current Px", "IV (DCF)", "MoS %",
                 "Graham No.", "Analyst Tgt", "My Target", "P/E", "PEG", "Div. Yield", "From 52W H",
@@ -881,6 +894,19 @@ class WatchlistView(BaseView):
                 tags=(row_tag,),
             )
             shown += 1
+
+        # A friendly empty screen when nothing is listed (once the data has loaded)
+        if shown == 0 and (data is not None or self._data_loaded):
+            if not self._data:
+                self._empty.show("👀", "Your watchlist is empty",
+                                 "Type a symbol in the form above and press Add to follow a stock.",
+                                 "+ Add a stock", lambda: self._e_symbol.focus_set())
+            else:
+                self._empty.show("🔍", "No stocks with this signal",
+                                 "Pick another signal above, or show them all.",
+                                 "↺ Show all", lambda: self._set_signal_filter("all"))
+        else:
+            self._empty.hide()
 
         total = len(self._data)
         for key, pill in self._filter_pills.items():
@@ -1272,13 +1298,15 @@ class WatchlistView(BaseView):
                     fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_TERTIARY,
                     font=ModernStyle.FONT_SUBHEADING, width=18, anchor="w"
                 ).pack(side="left", padx=(0, 10))
-                tk.Entry(
-                    f, textvariable=self._metrics_vars[key],
+                box = RoundedBox(f)
+                box.pack(side="left", fill="x", expand=True)
+                ent = tk.Entry(
+                    box, textvariable=self._metrics_vars[key],
                     bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
-                    font=ModernStyle.FONT_TABLE, relief=tk.FLAT, width=12,
-                    highlightthickness=1, highlightbackground=ModernStyle.BORDER_COLOR,
-                    highlightcolor=accent_color, insertbackground=ModernStyle.TEXT_PRIMARY
-                ).pack(side="left", fill="x", expand=True, ipady=6)
+                    font=ModernStyle.FONT_INPUT, relief=tk.FLAT, bd=0, width=12,
+                    highlightthickness=0, insertbackground=ModernStyle.TEXT_PRIMARY)
+                ent.pack(fill="x", ipady=5, padx=8)
+                box.watch(ent)
 
         top.set_status("Values are kept in the form; press Save & Close (or Save on the Watchlist page) to store them.")
 

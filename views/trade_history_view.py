@@ -21,7 +21,7 @@ from views.shared_trade_edit import (
     number_text, refresh_after_change, save_trade_edit, show_stale_warning,
 )
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import ModernButton, ModernCard
+from ui.ui_widgets import EmptyState, RoundedBox, ModernButton, ModernCard
 from ui.ui_utils import (HeadingTips, ToolTip, add_treeview_copy_menu, format_money, run_in_background,
                          show_toast, treeview_sort_column)
 
@@ -209,10 +209,10 @@ class TradeHistoryView(BaseView):
         # Filters card
         filters = ModernCard(self, bg=ModernStyle.BG_SECONDARY, highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
                              highlight_thickness=1, radius=10)
-        filters.pack(fill="x", padx=15, pady=(0, 5))
+        filters.pack(fill="x", padx=20, pady=(4, 6))
 
         header_row = tk.Frame(filters.content, bg=ModernStyle.BG_SECONDARY)
-        header_row.pack(fill="x", padx=12, pady=(5, 0))
+        header_row.pack(fill="x", padx=14, pady=(10, 0))
         tk.Label(header_row, text="🔍 Filters", fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY,
                  font=ModernStyle.FONT_SUBHEADING).pack(side="left")
         self.th_date_range_info = tk.Label(header_row, text="", fg=ModernStyle.TEXT_SECONDARY,
@@ -233,43 +233,43 @@ class TradeHistoryView(BaseView):
         self.th_end_var = tk.StringVar(value=today.strftime("%Y-%m-%d"))
 
         filter_row = tk.Frame(filters.content, bg=ModernStyle.BG_SECONDARY)
-        filter_row.pack(fill=tk.X, padx=12, pady=(4, 6))
+        filter_row.pack(fill=tk.X, padx=14, pady=(6, 12))
 
         LBL = ModernStyle.FONT_SMALL_BOLD
         BG = ModernStyle.BG_SECONDARY
 
-        def _caption(text, padx=(2, 4), fg=None):
-            tk.Label(filter_row, text=text, bg=BG, fg=fg or ModernStyle.TEXT_SECONDARY, font=LBL).pack(side=tk.LEFT, padx=padx)
-
-        def _sep():
-            tk.Frame(filter_row, bg=ModernStyle.DIVIDER_COLOR, width=2).pack(side=tk.LEFT, fill=tk.Y, pady=1, padx=10)
+        def _group(caption):
+            """A filter: small grey caption above its box, with even gaps between filters."""
+            g = tk.Frame(filter_row, bg=BG)
+            g.pack(side=tk.LEFT, padx=(0, 18), anchor="s")
+            tk.Label(g, text=caption, bg=BG, fg=ModernStyle.TEXT_SECONDARY,
+                     font=ModernStyle.FONT_SMALL).pack(anchor="w", pady=(0, 3))
+            return g
 
         # Broker
-        _caption("Broker", (4, 4), fg=ModernStyle.TEXT_PURPLE)
+        g = _group("Broker")
         brokers = list(getattr(self.app_state, "brokers_cache", None) or []) if self.app_state else []
-        self.th_broker_cb = ttk.Combobox(filter_row, textvariable=self.th_broker_var,
+        self.th_broker_cb = ttk.Combobox(g, textvariable=self.th_broker_var,
                                          values=["All"] + sorted(set(brokers)), state="readonly", width=14,
-                                         font=ModernStyle.FONT_BODY)
-        self.th_broker_cb.pack(side=tk.LEFT, padx=(0, 2))
-        _sep()
+                                         font=ModernStyle.FONT_INPUT)
+        self.th_broker_cb.pack(anchor="w")
 
         # Symbol
-        _caption("Symbol", fg=ModernStyle.TEXT_ACCENT)
-        sym_wrap = tk.Frame(filter_row, bg=ModernStyle.BORDER_COLOR, padx=1, pady=1)
-        sym_wrap.pack(side=tk.LEFT, padx=(0, 2))
+        g = _group("Symbol")
+        sym_wrap = RoundedBox(g)
+        sym_wrap.pack(anchor="w")
         self.th_symbol_entry = tk.Entry(sym_wrap, textvariable=self.th_symbol_var, bg=ModernStyle.ENTRY_BG,
-                                        fg=ModernStyle.TEXT_ACCENT, font=ModernStyle.FONT_BODY, relief=tk.FLAT,
-                                        bd=0, width=14, insertbackground=ModernStyle.ACCENT_PRIMARY)
-        self.th_symbol_entry.pack(ipady=4, padx=4)
-        self.th_symbol_entry.bind("<FocusIn>", lambda e: sym_wrap.config(bg=ModernStyle.ACCENT_PRIMARY))
-        self.th_symbol_entry.bind("<FocusOut>", lambda e: sym_wrap.config(bg=ModernStyle.BORDER_COLOR))
-        _sep()
+                                        fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_INPUT, relief=tk.FLAT,
+                                        bd=0, width=14, highlightthickness=0,
+                                        insertbackground=ModernStyle.ACCENT_PRIMARY)
+        self.th_symbol_entry.pack(ipady=5, padx=8)
+        sym_wrap.watch(self.th_symbol_entry)
 
         # Type
-        _caption("Type", fg=ModernStyle.WARNING)
-        type_wrap = tk.Frame(filter_row, bg=ModernStyle.BG_TERTIARY, highlightbackground=ModernStyle.BORDER_COLOR,
+        g = _group("Type")
+        type_wrap = tk.Frame(g, bg=ModernStyle.BG_TERTIARY, highlightbackground=ModernStyle.BORDER_COLOR,
                              highlightthickness=1)
-        type_wrap.pack(side=tk.LEFT, padx=(0, 2))
+        type_wrap.pack(anchor="w")
 
         def _on_type(val):
             self.th_type_var.set(val)
@@ -278,22 +278,21 @@ class TradeHistoryView(BaseView):
 
         def _type_btn(text):
             b = tk.Label(type_wrap, text=text, bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY,
-                         font=LBL, padx=12, pady=4, cursor="hand2")
+                         font=LBL, padx=14, pady=6, cursor="hand2")
             b.pack(side=tk.LEFT)
             b.bind("<Button-1>", lambda e: _on_type(text))
             return b
         self._type_all_btn = _type_btn("All")
         self._type_buy_btn = _type_btn("Buy")
         self._type_sell_btn = _type_btn("Sell")
-        _sep()
 
         # Date range
-        _caption("From", (2, 3), fg=ModernStyle.INFO)
-        self.th_start_entry = _create_date_input(filter_row, self.th_start_var)
-        self.th_start_entry.pack(side=tk.LEFT, padx=(0, 4))
-        _caption("To", (2, 3), fg=ModernStyle.INFO)
-        self.th_end_entry = _create_date_input(filter_row, self.th_end_var)
-        self.th_end_entry.pack(side=tk.LEFT, padx=(0, 4))
+        g = _group("From")
+        self.th_start_entry = _create_date_input(g, self.th_start_var)
+        self.th_start_entry.pack(anchor="w")
+        g = _group("To")
+        self.th_end_entry = _create_date_input(g, self.th_end_var)
+        self.th_end_entry.pack(anchor="w")
 
         # Every filter change goes through one debounced, generation-checked load
         self.th_broker_var.trace_add("write", lambda *_: self._on_broker_selected())
@@ -308,7 +307,7 @@ class TradeHistoryView(BaseView):
 
         # Summary pills
         summary = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        summary.pack(fill="x", padx=15, pady=3)
+        summary.pack(fill="x", padx=20, pady=4)
         sum_row = tk.Frame(summary, bg=ModernStyle.BG_PRIMARY)
         sum_row.pack(fill="x", padx=0, pady=4)
 
@@ -349,7 +348,7 @@ class TradeHistoryView(BaseView):
 
         # Table
         table_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        table_frame.pack(fill="both", expand=True, padx=15, pady=10)
+        table_frame.pack(fill="both", expand=True, padx=20, pady=(8, 16))
         self.trade_table = ttk.Treeview(table_frame, columns=tuple(c for c, _ in COLUMNS), show="headings",
                                         height=18, selectmode="extended")
         HeadingTips(self.trade_table, _COLUMN_TIPS)
@@ -380,15 +379,7 @@ class TradeHistoryView(BaseView):
         table_frame.grid_columnconfigure(0, weight=1)
 
         # Empty-state overlay (shown when the filters match nothing)
-        self._empty_frame = tk.Frame(table_frame, bg=ModernStyle.BG_SECONDARY)
-        tk.Label(self._empty_frame, text="🪹", font=ModernStyle.FONT_EMPTY_STATE, bg=ModernStyle.BG_SECONDARY,
-                 fg=ModernStyle.TEXT_PRIMARY).pack(pady=(0, 4))
-        self._empty_title = tk.Label(self._empty_frame, text="No trades found for the selected filters",
-                                     font=ModernStyle.FONT_HEADING, fg=ModernStyle.TEXT_SECONDARY,
-                                     bg=ModernStyle.BG_SECONDARY)
-        self._empty_title.pack()
-        tk.Label(self._empty_frame, text="Adjust your search criteria or add a new trade.", font=ModernStyle.FONT_BODY,
-                 fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY).pack()
+        self._empty = EmptyState(table_frame)
 
         self.trade_table.bind("<Double-1>", self._on_double_click)
         # Right-click (Button-2 on a macOS mouse, Button-3 elsewhere)
@@ -931,6 +922,15 @@ class TradeHistoryView(BaseView):
         except Exception:
             return None
 
+    def _reset_filters(self) -> None:
+        """Every broker, symbol, type and date (the empty screen's button)."""
+        self.th_broker_var.set("All")
+        self.th_symbol_var.set("")
+        self.th_type_var.set("All")
+        self._sync_type_btns()
+        self._show_all_dates()
+        self._schedule_filter(0)
+
     def _show_all_dates(self) -> None:
         self._first_trade_date = self._earliest_trade_date() or self._first_trade_date
         self.th_start_var.set(self._first_trade_date)
@@ -1011,8 +1011,8 @@ class TradeHistoryView(BaseView):
         def _failed(e):
             if gen == self._th_gen:
                 self._data_loaded = False
-                self._empty_title.config(text="Trades couldn't be loaded. Press ⟳ Refresh to try again.")
-                self._empty_frame.place(relx=0.5, rely=0.5, anchor="center")
+                self._empty.show("⚠️", "Trades couldn't be loaded",
+                                 "Something went wrong while reading your trades.", "↻ Try again", self.refresh)
 
         run_in_background(_work, _done, _failed, widget=self, name="history-load")
 
@@ -1038,10 +1038,11 @@ class TradeHistoryView(BaseView):
                             fg=ModernStyle.SUCCESS if total_pnl >= 0 else ModernStyle.ERROR)
 
         if not rows:
-            self._empty_title.config(text="No trades found for the selected filters")
-            self._empty_frame.place(relx=0.5, rely=0.5, anchor="center")
+            self._empty.show("🔍", "No trades match these filters",
+                             "Try another broker, symbol, type or date range.", "↺ Show all trades",
+                             self._reset_filters)
             return
-        self._empty_frame.place_forget()
+        self._empty.hide()
         for iid, values, tags in rows:
             try:
                 tv.insert("", "end", iid=iid, values=values, tags=tags)

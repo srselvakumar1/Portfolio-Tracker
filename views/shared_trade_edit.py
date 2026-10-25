@@ -23,7 +23,7 @@ from model.applog import log
 from model.importer import CURRENCY_SYMBOLS, parse_number, sanity_warnings
 from ui.ui_theme import ModernStyle
 from ui.ui_utils import center_window, run_in_background, show_toast
-from ui.ui_widgets import ModernButton
+from ui.ui_widgets import RoundedBox, ModernButton
 from views.base_view import _create_date_input
 
 
@@ -213,13 +213,14 @@ class TradeForm:
         lbl.grid(row=r * 2, column=c, sticky="w", pady=(10 if r > 0 else 0, 4), padx=(0, 12 if c == 0 else 0))
         return lbl
 
-    def _wrap(self, r, c):
-        wrap = tk.Frame(self.frame, bg=ModernStyle.BORDER_COLOR, padx=1, pady=1)
+    def _wrap(self, r, c, plain: bool = False):
+        # Rounded bordered box; a date input brings its own box, so it gets a plain frame
+        wrap = tk.Frame(self.frame, bg=self.bg) if plain else RoundedBox(self.frame)
         wrap.grid(row=r * 2 + 1, column=c, sticky="ew", pady=(0, 4), padx=(0, 12 if c == 0 else 0))
         return wrap
 
     def entry(self, r, c, var, *, is_date=False):
-        wrap = self._wrap(r, c)
+        wrap = self._wrap(r, c, plain=is_date)
         if is_date:
             ent = _create_date_input(wrap, var)
             ent.pack(fill="both", expand=True)
@@ -229,13 +230,15 @@ class TradeForm:
                        insertbackground=self.accent)
         ent.bind("<FocusIn>", lambda e, w=wrap: w.configure(bg=self.accent))
         ent.bind("<FocusOut>", lambda e, w=wrap: w.configure(bg=ModernStyle.BORDER_COLOR))
-        ent.pack(fill="both", expand=True, ipady=6, padx=8)
+        ent.pack(fill="both", expand=True, ipady=5, padx=8)
         return ent
 
     def broker_box(self, r, c, var, brokers):
         wrap = self._wrap(r, c)
-        cb = ttk.Combobox(wrap, textvariable=var, values=brokers, font=ModernStyle.FONT_TABLE, state="normal")
-        cb.pack(fill="both", expand=True, ipady=4, padx=4)
+        cb = ttk.Combobox(wrap, textvariable=var, values=brokers, font=ModernStyle.FONT_INPUT, state="normal",
+                          style="Boxed.TCombobox")
+        cb.pack(fill="both", expand=True, ipady=4, padx=4, pady=1)
+        wrap.watch(cb)
         return cb
 
     def money_labels(self, price_rc, fee_rc, currency_var):

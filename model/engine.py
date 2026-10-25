@@ -312,6 +312,24 @@ def get_exchange_rate(currency: str) -> float:
         _fx_estimated.add(currency)
     return fallbacks.get(currency, 1.0)
 
+def is_placeholder_eps(eps, pe, price) -> bool:
+    """True when EPS looks like a stand-in for missing earnings rather than a real figure:
+    exactly 1.00, with a P/E equal to the share price (price ÷ 1). Such a P/E, and any
+    fair value worked out from that EPS, are meaningless.  Values may be text like '₹1.00'."""
+    import re
+
+    def num(v):
+        try:
+            return float(re.sub(r"[^0-9.\-]", "", str(v)) or "nan")
+        except ValueError:
+            return float("nan")
+
+    e, p, c = num(eps), num(pe), num(price)
+    if not (e == e and p == p and c == c) or c <= 0:   # any value missing (NaN)
+        return False
+    return abs(e - 1.0) < 0.005 and abs(p - c) <= 0.005 * c
+
+
 def calculate_intrinsic_value(eps: float, growth_rate: float = 0.12, discount_rate: float = 0.10, terminal_multiple: float = 15.0) -> float:
     """Calculates Intrinsic Value using a 5-year DCF snapshot."""
     if eps is None or (isinstance(eps, float) and math.isnan(eps)) or eps <= 0:
@@ -481,6 +499,9 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
                 pass
 
         eps = float(full_info.get('trailingEps', 0.0) or 0.0)
+        pe = float(full_info.get('trailingPE', 0.0) or 0.0)
+        if is_placeholder_eps(eps, pe, current_price):
+            eps = pe = 0.0   # no real earnings figure: store "unknown", not 1.00
         iv = calculate_intrinsic_value(eps)
         signal = get_iv_signal(current_price, iv)
 
@@ -488,7 +509,7 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
             orig_sym, current_price, previous_close,
             float(full_info.get('fiftyTwoWeekLow', 0.0) or 0.0),
             float(full_info.get('fiftyTwoWeekHigh', 0.0) or 0.0),
-            float(full_info.get('trailingPE', 0.0) or 0.0),
+            pe,
             eps,
             float(full_info.get('priceToBook', 0.0) or 0.0),
             float(full_info.get('returnOnEquity', 0.0) or 0.0),
@@ -1229,6 +1250,9 @@ def get_actionable_insights(limit: int = 10, currency_filter: str = "All") -> li
         _insights_cache["currency"] = currency_filter
     return result
 
+_ALERT_MIN_UPSIDE = -30.0   # % : skip alerts whose target is more than 30% below the price
+
+
 def get_watchlist_alerts(currency_filter: str = "All", fill_to: int = 0) -> list:
     """Watchlist stocks marked Accumulate or Strong Buy, with PE and EPS.
 
@@ -1277,16 +1301,24 @@ def get_watchlist_alerts(currency_filter: str = "All", fill_to: int = 0) -> list
             if currency_filter != "All" and currency != currency_filter.upper():
                 continue
             
-            # Fallbacks for target price
+            # A placeholder EPS (1.00, P/E = price) makes P/E and the fair value meaningless
+            fake_eps = is_placeholder_eps(eps, pe, current)
+            if fake_eps:
+                pe = eps = None
+
+            # Fallbacks for target price (the fair value only when its EPS was real)
             if not target or target <= 0:
                 target = _parse_num(analyst_t)
-            if not target or target <= 0:
+            if (not target or target <= 0) and not fake_eps:
                 target = _parse_num(intrinsic_v)
                 
             diff = target - current if target > 0 and current > 0 else 0
             # signed: negative when the price is already above the target
             pct = (diff / current) * 100 if current > 0 and target > 0 else 0
             if not is_alert and not (target > 0 and current > 0):
+                continue
+            # An "Accumulate" whose target is far below today's price contradicts itself
+            if is_alert and target > 0 and current > 0 and pct < _ALERT_MIN_UPSIDE:
                 continue
             (alerts if is_alert else watching).append({
                 "symbol": symbol,

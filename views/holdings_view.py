@@ -28,7 +28,7 @@ from model.data_cache import DataCache, HoldingsFilters, TradeHistoryFilters
 from ui.ui_theme import ModernStyle
 from ui.ui_utils import (HeadingTips, ToolTip, format_money, run_in_background, show_toast,
                          treeview_sort_column)
-from ui.ui_widgets import EmptyState, RoundedBox, ClearableEntry, ModernButton, ModernCard, PremiumModal
+from ui.ui_widgets import rounded_combobox, EmptyState, RoundedBox, ClearableEntry, ModernButton, ModernCard, PremiumModal
 from views.base_view import BaseView
 
 
@@ -543,11 +543,9 @@ class HoldingsView(BaseView):
         # Broker
         broker_grp = _group("Broker", "Show one broker's account, or All", divider=False, fg=ModernStyle.TEXT_PURPLE)
         self.broker_var = tk.StringVar(value="All")
-        self.broker_combo = ttk.Combobox(
-            broker_grp, textvariable=self.broker_var, values=["All"],
-            state="readonly", width=10, font=ModernStyle.FONT_TABLE,
-        )
-        self.broker_combo.pack(side=tk.LEFT, padx=(0, 8), pady=6)
+        box, self.broker_combo = rounded_combobox(
+            broker_grp, textvariable=self.broker_var, values=["All"], state="readonly", width=10)
+        box.pack(side=tk.LEFT, padx=(0, 8), pady=6)
         self.broker_var.trace_add("write", lambda *_: self._on_broker_selected())
 
         # Symbol search

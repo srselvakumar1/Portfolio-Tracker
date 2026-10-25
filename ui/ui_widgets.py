@@ -206,6 +206,18 @@ class RoundedBox(tk.Frame):
             c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=self._fill, outline=border)
 
 
+def rounded_combobox(parent, **kw):
+    """A drop-down in the same rounded box as the text inputs. Returns (box, combobox):
+    place the box, use the combobox."""
+    from tkinter import ttk
+    box = RoundedBox(parent)
+    kw.setdefault("font", ModernStyle.FONT_INPUT)
+    cb = ttk.Combobox(box, style="Boxed.TCombobox", **kw)
+    cb.pack(fill="both", expand=True, padx=4, pady=1, ipady=3)
+    box.watch(cb)
+    return box, cb
+
+
 class EmptyState(tk.Frame):
     """A friendly empty screen over a table: a big icon in a soft circle, a title,
     one sentence and an optional button. show(...) places it centred; hide() removes it."""

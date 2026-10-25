@@ -21,7 +21,7 @@ from views.shared_trade_edit import (
     number_text, refresh_after_change, save_trade_edit, show_stale_warning,
 )
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import EmptyState, RoundedBox, ModernButton, ModernCard
+from ui.ui_widgets import rounded_combobox, EmptyState, RoundedBox, ModernButton, ModernCard
 from ui.ui_utils import (HeadingTips, ToolTip, add_treeview_copy_menu, format_money, run_in_background,
                          show_toast, treeview_sort_column)
 
@@ -249,10 +249,9 @@ class TradeHistoryView(BaseView):
         # Broker
         g = _group("Broker")
         brokers = list(getattr(self.app_state, "brokers_cache", None) or []) if self.app_state else []
-        self.th_broker_cb = ttk.Combobox(g, textvariable=self.th_broker_var,
-                                         values=["All"] + sorted(set(brokers)), state="readonly", width=14,
-                                         font=ModernStyle.FONT_INPUT)
-        self.th_broker_cb.pack(anchor="w")
+        box, self.th_broker_cb = rounded_combobox(g, textvariable=self.th_broker_var,
+                                                  values=["All"] + sorted(set(brokers)), state="readonly", width=14)
+        box.pack(anchor="w")
 
         # Symbol
         g = _group("Symbol")

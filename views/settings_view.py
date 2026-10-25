@@ -14,7 +14,7 @@ from datetime import datetime
 from views.base_view import BaseView
 from model.applog import log
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import RoundedBox, ModernButton, ModernCard, ModernEntry
+from ui.ui_widgets import rounded_combobox, RoundedBox, ModernButton, ModernCard, ModernEntry
 from ui.ui_utils import call_on_ui
 
 class SettingsView(BaseView):
@@ -78,8 +78,9 @@ class SettingsView(BaseView):
         box.grid(row=1, column=0, sticky="ew", padx=(0, 6))
         
         import tkinter.ttk as ttk
-        curr_cb = ttk.Combobox(add_frame, textvariable=self.new_broker_currency_var, values=["INR", "JPY", "USD"], width=6, state="readonly", font=ModernStyle.FONT_BODY)
-        curr_cb.grid(row=1, column=1, sticky="w", padx=(0, 6))
+        curr_box, curr_cb = rounded_combobox(add_frame, textvariable=self.new_broker_currency_var,
+                                             values=["INR", "JPY", "USD"], width=6, state="readonly")
+        curr_box.grid(row=1, column=1, sticky="w", padx=(0, 6))
         
         btn_frame = tk.Frame(add_frame, bg=ModernStyle.BG_SECONDARY)
         btn_frame.grid(row=1, column=2, sticky="e", pady=(0,0))

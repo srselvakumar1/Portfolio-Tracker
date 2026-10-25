@@ -504,6 +504,8 @@ def install_row_hover(root: tk.Misc) -> None:
         old = getattr(tv, "_hover_row", "")
         if row == old:
             return
+        if row and "_sel" in tv.item(row, "tags"):
+            row = ""      # a selected row keeps its selection colour
         try:
             if not getattr(tv, "_hover_ready", False):
                 tv.tag_configure("hover", background=ModernStyle.BG_HOVER)
@@ -527,6 +529,31 @@ def install_row_hover(root: tk.Misc) -> None:
 
     root.bind_class("Treeview", "<Motion>", _move, add="+")
     root.bind_class("Treeview", "<Leave>", _leave, add="+")
+
+    # Selected rows: white text on the selection blue, whatever colour the row's
+    # text normally has (amber, green, red rows were hard to read when selected)
+    def _select(e):
+        tv = e.widget
+        if not isinstance(tv, tk.Misc):
+            return
+        try:
+            if not getattr(tv, "_sel_ready", False):
+                tv.tag_configure("_sel", background=ModernStyle.TABLE_SELECTED_BG,
+                                 foreground=ModernStyle.TABLE_SELECTED_FG)
+                tv._sel_ready = True
+            now = set(tv.selection())
+            for iid in getattr(tv, "_sel_items", set()) - now:
+                if tv.exists(iid):
+                    tv.item(iid, tags=[t for t in tv.item(iid, "tags") if t != "_sel"])
+            for iid in now:
+                tags = [t for t in tv.item(iid, "tags") if t != "hover"]
+                if "_sel" not in tags:
+                    tv.item(iid, tags=[*tags, "_sel"])
+            tv._sel_items = now
+        except tk.TclError:
+            pass
+
+    root.bind_class("Treeview", "<<TreeviewSelect>>", _select, add="+")
 
 
 class HeadingTips(ToolTip):

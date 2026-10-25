@@ -245,7 +245,7 @@ class TradeForm:
         wrap = self._wrap(r, c)
         cb = ttk.Combobox(wrap, textvariable=var, values=brokers, font=ModernStyle.FONT_INPUT, state="normal",
                           style="Boxed.TCombobox")
-        cb.pack(fill="both", expand=True, ipady=4, padx=4, pady=1)
+        cb.pack(fill="both", expand=True, ipady=3, padx=4, pady=1)
         wrap.watch(cb)
         return cb
 

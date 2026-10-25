@@ -2079,11 +2079,7 @@ class DashboardView(BaseView):
                                   font=S.FONT_SMALL_BOLD, padx=8, pady=2)
         modal.sell_lbl.pack()
 
-        close_btn = ModernButton(
-            modal.inner_hdr, text="✕  Close", command=modal.destroy,
-            bg=S.NEUTRAL_FILL, fg=S.TEXT_ON_ACCENT, canvas_bg=S.BG_PRIMARY,
-            width=110, height=36, radius=8, font=S.FONT_BODY_BOLD)
-        close_btn.pack(side="right", anchor="e")
+        modal.make_compact()   # slim: Close in this row, no footer bar, Esc closes
 
         # Treeview Area
         table_frame = modal.content_frame
@@ -2130,9 +2126,9 @@ class DashboardView(BaseView):
                 log.exception("Copying drilldown trades failed")
                 show_toast(modal, f"Couldn't copy the trades: {e}", type="error")
 
-        ModernButton(modal.actions_frame, text="⧉  Copy Trades", command=_copy, bg=S.ACCENT_PRIMARY,
-                     fg=S.TEXT_ON_ACCENT, canvas_bg=S.BG_SECONDARY, width=150, height=40, radius=8,
-                     font=S.FONT_SUBHEADING).pack(side="left")
+        ModernButton(modal.chips_row, text="⧉ Copy Trades", command=_copy, bg=S.ACCENT_PRIMARY, variant="soft",
+                     canvas_bg=S.BG_PRIMARY, width=130, height=30, radius=8,
+                     font=S.FONT_SMALL_BOLD).pack(side="right", padx=(0, 8))
 
         app_state = self.app_state
 
@@ -2227,11 +2223,7 @@ class DashboardView(BaseView):
         modal.add_chip("🏦", "Per broker", bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
         modal.add_chip("💱", f"{c_val} holdings", bg_color=S.ACCENT_PRIMARY_PALE, fg_color=S.TEXT_ACCENT)
 
-        close_btn = ModernButton(
-            modal.inner_hdr, text="✕  Close", command=modal.destroy,
-            bg=S.NEUTRAL_FILL, fg=S.TEXT_ON_ACCENT, canvas_bg=S.BG_PRIMARY,
-            width=110, height=36, radius=8, font=S.FONT_BODY_BOLD)
-        close_btn.pack(side="right", anchor="e")
+        modal.make_compact()   # slim: Close in this row, no footer bar, Esc closes
 
         # The thin accent line under the header takes the KPI card's colour
         for w in modal.body_card.winfo_children():

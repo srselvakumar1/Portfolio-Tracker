@@ -21,7 +21,7 @@ from views.shared_trade_edit import (
     confirm_unusual, currency_symbol, friendly_error, refresh_after_change, show_stale_warning,
 )
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import RoundedBox, ModernButton, ModernCard
+from ui.ui_widgets import rounded_combobox, RoundedBox, ModernButton, ModernCard
 from ui.ui_utils import add_treeview_copy_menu, center_window, format_money, run_in_background, show_toast
 
 PASTE_HINT = "date,symbol,type,qty,price\n2024-01-15,TCS.NS,BUY,10,3500.00\n2024-01-20,INFY.NS,SELL,5,1800.50"
@@ -138,9 +138,9 @@ class TradeEntryView(BaseView):
         broker_col = tk.Frame(r1, bg=BG_SEC)
         broker_col.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         _caption(broker_col, "🏦 Broker")
-        self.te_broker_cb = ttk.Combobox(broker_col, textvariable=self.te_broker_var, width=18, state="readonly",
-                                         font=ModernStyle.FONT_SUBHEADING)
-        self.te_broker_cb.pack(fill="x", ipady=2, pady=5)
+        box, self.te_broker_cb = rounded_combobox(broker_col, textvariable=self.te_broker_var, width=18,
+                                                  state="readonly")
+        box.pack(fill="x", pady=5)
 
         date_col = tk.Frame(r1, bg=BG_SEC)
         date_col.grid(row=0, column=1, sticky="nsew")
@@ -905,8 +905,9 @@ class TradeEntryView(BaseView):
         tk.Label(opts, text="🏦  Broker for rows without one:" if has_broker else "🏦  Broker:",
                  fg=ModernStyle.TEXT_SECONDARY, bg=BG, font=ModernStyle.FONT_HEADING).pack(side="left")
         broker_var = tk.StringVar(value=self.te_broker_var.get() if self.te_broker_var.get() in self._brokers else "")
-        broker_cb = ttk.Combobox(opts, textvariable=broker_var, state="readonly", width=18, values=self._brokers)
-        broker_cb.pack(side="left", padx=(8, 12))
+        box, broker_cb = rounded_combobox(opts, textvariable=broker_var, state="readonly", width=18,
+                                          values=self._brokers)
+        box.pack(side="left", padx=(8, 12))
         currency_lbl = tk.Label(opts, text="", fg=ModernStyle.TEXT_SECONDARY, bg=BG, font=ModernStyle.FONT_BODY)
         currency_lbl.pack(side="left")
 

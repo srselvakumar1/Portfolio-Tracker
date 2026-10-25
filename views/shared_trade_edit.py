@@ -206,6 +206,7 @@ class TradeForm:
             self.frame.grid_columnconfigure(i, weight=1, uniform="tf")
         self.price_label = None
         self.fee_label = None
+        self.cols = 2
         self._roles = {}        # (r, c) -> "qty" / "price" / "fee", for the live total
         self._vars = {}         # role -> StringVar
 
@@ -214,13 +215,14 @@ class TradeForm:
             self._roles[(r, c)] = "qty"
         lbl = tk.Label(self.frame, text=text, bg=self.bg, fg=ModernStyle.TEXT_SECONDARY,
                        font=ModernStyle.FONT_BODY_BOLD)
-        lbl.grid(row=r * 2, column=c, sticky="w", pady=(10 if r > 0 else 0, 4), padx=(0, 12 if c == 0 else 0))
+        lbl.grid(row=r * 2, column=c, sticky="w", pady=(10 if r > 0 else 0, 4),
+                 padx=(0, 12 if c < self.cols - 1 else 0))
         return lbl
 
     def _wrap(self, r, c, plain: bool = False):
         # Rounded bordered box; a date input brings its own box, so it gets a plain frame
         wrap = tk.Frame(self.frame, bg=self.bg) if plain else RoundedBox(self.frame)
-        wrap.grid(row=r * 2 + 1, column=c, sticky="ew", pady=(0, 4), padx=(0, 12 if c == 0 else 0))
+        wrap.grid(row=r * 2 + 1, column=c, sticky="ew", pady=(0, 4), padx=(0, 12 if c < self.cols - 1 else 0))
         return wrap
 
     def entry(self, r, c, var, *, is_date=False):
@@ -266,33 +268,47 @@ class TradeForm:
         currency_var.trace_add("write", _sync)
         _sync()
 
-    def choice_rows(self, grid_row, type_var, currency_var, currencies):
-        """'Trade Type' + 'Currency' captions on grid_row and the radio buttons below."""
-        bg = self.bg
-        cap = tk.Frame(self.frame, bg=bg)
-        cap.grid(row=grid_row, column=0, columnspan=2, sticky="w", pady=(12, 4))
-        tk.Label(cap, text="🚦  Trade Type", bg=bg, fg=ModernStyle.TEXT_SECONDARY,
-                 font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
-        tk.Frame(cap, width=16, bg=bg).pack(side="left")
-        tk.Label(cap, text="💱  Currency", bg=bg, fg=ModernStyle.TEXT_SECONDARY,
-                 font=ModernStyle.FONT_BODY_BOLD).pack(side="left")
+    def three_rows(self, *, broker_var, brokers, date_var, qty_var, price_var, fee_var, type_var,
+                   currency_var, symbol_var=None):
+        """The compact trade form in three rows:
+        1. Broker · Symbol · Date   (without a Symbol box: Broker · Date · Buy/Sell)
+        2. Quantity · Price · Fees
+        3. the live total (with the Buy/Sell toggle in front when row 1 has a Symbol)
+        Returns (symbol entry or None, quantity entry)."""
+        self.cols = 3
+        for i in range(3):
+            self.frame.grid_columnconfigure(i, weight=1, uniform="tf")
+        self.label("🏦  Broker", 0, 0)
+        self.broker_box(0, 0, broker_var, brokers)
+        sym_ent = None
+        if symbol_var is not None:
+            self.label("🔠  Symbol", 0, 1)
+            sym_ent = self.entry(0, 1, symbol_var)
+            self.label("📅  Date", 0, 2)
+            self.entry(0, 2, date_var, is_date=True)
+        else:
+            self.label("📅  Date", 0, 1)
+            self.entry(0, 1, date_var, is_date=True)
+            self.label("🚦  Trade Type", 0, 2)
+            cell = self._wrap(0, 2, plain=True)
+            _type_toggle(cell, type_var).pack(anchor="w", fill="y", expand=True)
+        self.label("💎  Quantity", 1, 0)
+        qty_ent = self.entry(1, 0, qty_var)
+        self.money_labels((1, 1), (1, 2), currency_var)
+        self.entry(1, 1, price_var)
+        self.entry(1, 2, fee_var)
+        self._total_line(4, type_var, currency_var, with_type=symbol_var is not None)
+        return sym_ent, qty_ent
 
-        row = tk.Frame(self.frame, bg=bg)
-        row.grid(row=grid_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        # Toggle buttons: the chosen one is filled (green Buy, red Sell, blue currency)
-        _segmented(row, type_var, (("BUY", "▲ Buy", ModernStyle.SUCCESS_FILL),
-                                   ("SELL", "▼ Sell", ModernStyle.ERROR_FILL))).pack(side="left")
-        tk.Frame(row, width=24, bg=bg).pack(side="left")
-        _segmented(row, currency_var, tuple((c, c, ModernStyle.ACCENT_PRIMARY) for c in currencies)).pack(side="left")
-        if "qty" in self._vars and "price" in self._vars:
-            self._total_line(grid_row + 2, type_var, currency_var)
-        return row
-
-    def _total_line(self, grid_row, type_var, currency_var):
+    def _total_line(self, grid_row, type_var, currency_var, with_type: bool = False):
         """'Total to pay ₹16,507.78 (100 × ₹165.00 + ₹7.78 fees)', updated as you type."""
-        lbl = tk.Label(self.frame, text="", bg=ModernStyle.ACCENT_PRIMARY_PALE, fg=ModernStyle.TEXT_ACCENT,
+        holder = tk.Frame(self.frame, bg=self.bg)
+        holder.grid(row=grid_row, column=0, columnspan=self.cols, sticky="ew", pady=(12, 0))
+        if with_type:
+            _type_toggle(holder, type_var).pack(side="left", fill="y", padx=(0, 12))
+        lbl = tk.Label(holder, text="", bg=ModernStyle.ACCENT_PRIMARY_PALE, fg=ModernStyle.TEXT_ACCENT,
                        font=ModernStyle.FONT_BODY_BOLD, anchor="w", padx=12, pady=8)
-        lbl.grid(row=grid_row, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        lbl.pack(side="left", fill="both", expand=True)
         qty_v, price_v, fee_v = self._vars["qty"], self._vars["price"], self._vars.get("fee")
 
         def _num(var):
@@ -322,6 +338,31 @@ class TradeForm:
             if v is not None:
                 v.trace_add("write", _sync)
         _sync()
+
+
+def _type_toggle(parent, type_var):
+    return _segmented(parent, type_var, (("BUY", "▲ Buy", ModernStyle.SUCCESS_FILL),
+                                         ("SELL", "▼ Sell", ModernStyle.ERROR_FILL)))
+
+
+def currency_toggle(parent, currency_var, currencies):
+    """INR / JPY / USD toggle (the chosen one filled blue)."""
+    return _segmented(parent, currency_var, tuple((c, c, ModernStyle.ACCENT_PRIMARY) for c in currencies))
+
+
+def dialog_header(win, title: str, subtitle: str, title_fg: str):
+    """Compact header: the title, then a row with the subtitle on the left (returned as
+    (row, label) so a currency toggle can go at its right end) and a divider."""
+    bg = ModernStyle.BG_PRIMARY
+    header = tk.Frame(win, bg=bg)
+    header.pack(fill="x", padx=24, pady=(12, 0))
+    tk.Label(header, text=title, bg=bg, fg=title_fg, font=ModernStyle.FONT_SYMBOL_LARGE).pack(anchor="w")
+    row = tk.Frame(header, bg=bg)
+    row.pack(fill="x", pady=(2, 10))
+    lbl = tk.Label(row, text=subtitle, bg=bg, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY, anchor="w")
+    lbl.pack(side="left")
+    tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+    return row, lbl
 
 
 def _segmented(parent, var, options):
@@ -448,14 +489,9 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
         messagebox.showerror("Edit Trade", "This row has no broker or trade id, so it can't be edited.", parent=parent)
         return
 
-    win = make_dialog(parent, "✏️ Edit Trade", "600x560", ModernStyle.ACCENT_PRIMARY)
-    header = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
-    header.pack(fill="x", padx=28, pady=(18, 0))
-    tk.Label(header, text=symbol.upper() if symbol else "Edit Trade", bg=ModernStyle.BG_PRIMARY,
-             fg=ModernStyle.TEXT_ACCENT, font=ModernStyle.FONT_SYMBOL_LARGE).pack(anchor="w")
-    tk.Label(header, text=f"✏️  Editing Trade  ·  {trade_id}", bg=ModernStyle.BG_PRIMARY,
-             fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY).pack(anchor="w", pady=(2, 12))
-    tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+    win = make_dialog(parent, "✏️ Edit Trade", "700x400", ModernStyle.ACCENT_PRIMARY)
+    head_row, _ = dialog_header(win, symbol.upper() if symbol else "Edit Trade",
+                                f"✏️  Editing Trade  ·  {trade_id}", ModernStyle.TEXT_ACCENT)
 
     card = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
     card.pack(fill="both", expand=True, padx=24, pady=16)
@@ -469,20 +505,12 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
     fee_var = tk.StringVar(value=number_text(fee))
     currency_var = tk.StringVar(value=(currency or "INR").strip().upper())
 
+    currency_toggle(head_row, currency_var, currency_choices(app_state, currency_var.get())).pack(side="right")
     form = TradeForm(card)
     form.frame.pack(fill="x")
-    form.label("🏦  Broker", 0, 0)
-    form.broker_box(0, 0, broker_var, known_brokers(app_state, broker))
-    form.label("📅  Trade Date", 0, 1)
-    form.entry(0, 1, date_var, is_date=True)
-    form.label("🔠  Symbol", 1, 0)
-    form.entry(1, 0, symbol_var)
-    form.label("💎  Quantity", 1, 1)
-    form.entry(1, 1, qty_var)
-    form.money_labels((2, 0), (2, 1), currency_var)
-    form.entry(2, 0, price_var)
-    form.entry(2, 1, fee_var)
-    form.choice_rows(8, type_var, currency_var, currency_choices(app_state, currency_var.get()))
+    form.three_rows(broker_var=broker_var, brokers=known_brokers(app_state, broker), date_var=date_var,
+                    qty_var=qty_var, price_var=price_var, fee_var=fee_var, type_var=type_var,
+                    currency_var=currency_var, symbol_var=symbol_var)
 
     status, actions = dialog_footer(win)
     saving = [False]
@@ -544,18 +572,10 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
 def open_quick_add_trade_modal(parent, reload_cb, symbol="", broker="", stock_name="", keep_open=False,
                                app_state=None, trade_type="BUY", currency="INR") -> None:
     accent = ModernStyle.ACCENT_PRIMARY if keep_open else ModernStyle.SUCCESS_FILL
-    win = make_dialog(parent, "➕ Add Trade & Continue" if keep_open else "+ Add Trade",
-                      "600x600" if keep_open else "600x580", accent)
-    header = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
-    header.pack(fill="x", padx=28, pady=(16, 0))
-    tk.Label(header, text=symbol, bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_ACCENT,
-             font=ModernStyle.FONT_SYMBOL_LARGE).pack(anchor="w")
-    tk.Label(header, text=stock_name or "", bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY,
-             font=ModernStyle.FONT_SUBHEADING).pack(anchor="w", pady=(0, 8))
-    tk.Label(header, text="➕  Quick Add Trade • Continue Mode" if keep_open else "➕  Quick Add Trade",
-             bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.TEXT_SECONDARY,
-             font=ModernStyle.FONT_BODY).pack(anchor="w", pady=(0, 10))
-    tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+    win = make_dialog(parent, "➕ Add Trade & Continue" if keep_open else "+ Add Trade", "700x400", accent)
+    what = "➕  Quick Add Trade • Continue Mode" if keep_open else "➕  Quick Add Trade"
+    head_row, _ = dialog_header(win, symbol, f"{stock_name}  ·  {what}" if stock_name else what,
+                                ModernStyle.TEXT_ACCENT)
 
     card = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
     card.pack(fill="both", expand=True, padx=24, pady=12)
@@ -566,18 +586,12 @@ def open_quick_add_trade_modal(parent, reload_cb, symbol="", broker="", stock_na
     qty_var, price_var, fee_var = tk.StringVar(value=""), tk.StringVar(value=""), tk.StringVar(value="0.0")
     currency_var = tk.StringVar(value=(currency or "INR").upper())
 
+    currency_toggle(head_row, currency_var, currency_choices(app_state, currency_var.get())).pack(side="right")
     form = TradeForm(card, accent=ModernStyle.SUCCESS_FILL)
     form.frame.pack(fill="x")
-    form.label("🏦  Broker", 0, 0)
-    form.broker_box(0, 0, broker_var, known_brokers(app_state, broker))
-    form.label("📅  Date", 0, 1)
-    form.entry(0, 1, date_var, is_date=True)
-    form.label("💎  Quantity", 1, 0)
-    qty_entry = form.entry(1, 0, qty_var)
-    form.money_labels((1, 1), (2, 0), currency_var)
-    form.entry(1, 1, price_var)
-    form.entry(2, 0, fee_var)
-    form.choice_rows(6, type_var, currency_var, currency_choices(app_state, currency_var.get()))
+    _sym, qty_entry = form.three_rows(broker_var=broker_var, brokers=known_brokers(app_state, broker),
+                                      date_var=date_var, qty_var=qty_var, price_var=price_var, fee_var=fee_var,
+                                      type_var=type_var, currency_var=currency_var)
     follow_broker_currency(broker_var, currency_var, app_state)
 
     status_lbl, act = dialog_footer(win)

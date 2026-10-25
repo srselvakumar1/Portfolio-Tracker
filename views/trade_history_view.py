@@ -16,8 +16,8 @@ from model.applog import log
 from model.data_cache import TradeHistoryFilters
 from views.base_view import BaseView, _create_date_input
 from views.shared_trade_edit import (
-    TradeForm, check_trade_fields, confirm_unusual, currency_choices, currency_symbol, dialog_button,
-    dialog_footer, follow_broker_currency, friendly_error, known_brokers, make_dialog,
+    TradeForm, check_trade_fields, confirm_unusual, currency_choices, currency_symbol, currency_toggle, dialog_button,
+    dialog_footer, dialog_header, follow_broker_currency, friendly_error, known_brokers, make_dialog,
     number_text, refresh_after_change, save_trade_edit, show_stale_warning,
 )
 from ui.ui_theme import ModernStyle
@@ -481,15 +481,10 @@ class TradeHistoryView(BaseView):
         self._close_popup()
         self._edit_saving = False
 
-        win = make_dialog(self, "✏️ Edit Trade", "600x560", ModernStyle.ACCENT_PRIMARY)
+        win = make_dialog(self, "✏️ Edit Trade", "700x400", ModernStyle.ACCENT_PRIMARY)
         self._th_edit_popup = win
-        header = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
-        header.pack(fill="x", padx=28, pady=(18, 0))
-        tk.Label(header, text=symbol.upper() if symbol else "Edit Trade", bg=ModernStyle.BG_PRIMARY,
-                 fg=ModernStyle.TEXT_ACCENT, font=ModernStyle.FONT_SYMBOL_LARGE).pack(anchor="w")
-        tk.Label(header, text=f"✏️  Editing Trade  ·  {trade_id}", bg=ModernStyle.BG_PRIMARY,
-                 fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY).pack(anchor="w", pady=(2, 12))
-        tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+        head_row, _ = dialog_header(win, symbol.upper() if symbol else "Edit Trade",
+                                    f"✏️  Editing Trade  ·  {trade_id}", ModernStyle.TEXT_ACCENT)
 
         card = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
         card.pack(fill="both", expand=True, padx=24, pady=16)
@@ -505,21 +500,14 @@ class TradeHistoryView(BaseView):
         self._edit_currency_var = tk.StringVar(value=(currency or "INR").strip().upper())
         self._edit_orig_date = (date or "").strip()
 
+        currency_toggle(head_row, self._edit_currency_var,
+                        currency_choices(self.app_state, self._edit_currency_var.get())).pack(side="right")
         form = TradeForm(card)
         form.frame.pack(fill="x")
-        form.label("🏦  Broker", 0, 0)
-        form.broker_box(0, 0, self._edit_broker_var, known_brokers(self.app_state, broker))
-        form.label("📅  Trade Date", 0, 1)
-        form.entry(0, 1, self._edit_date_var, is_date=True)
-        form.label("🔠  Symbol", 1, 0)
-        form.entry(1, 0, self._edit_symbol_var)
-        form.label("💎  Quantity", 1, 1)
-        form.entry(1, 1, self._edit_qty_var)
-        form.money_labels((2, 0), (2, 1), self._edit_currency_var)
-        form.entry(2, 0, self._edit_price_var)
-        form.entry(2, 1, self._edit_fee_var)
-        form.choice_rows(8, self._edit_type_var, self._edit_currency_var,
-                         currency_choices(self.app_state, self._edit_currency_var.get()))
+        form.three_rows(broker_var=self._edit_broker_var, brokers=known_brokers(self.app_state, broker),
+                        date_var=self._edit_date_var, qty_var=self._edit_qty_var, price_var=self._edit_price_var,
+                        fee_var=self._edit_fee_var, type_var=self._edit_type_var,
+                        currency_var=self._edit_currency_var, symbol_var=self._edit_symbol_var)
 
         status, actions = dialog_footer(win)
         self._edit_save_btn = dialog_button(actions, "✓ Update Trade",
@@ -595,17 +583,10 @@ class TradeHistoryView(BaseView):
     def _open_add_trade_dialog(self) -> None:
         self._close_popup()
         self._add_saving = False
-        win = make_dialog(self, "➕ New Trade", "600x580", ModernStyle.SUCCESS_FILL)
+        win = make_dialog(self, "➕ New Trade", "700x400", ModernStyle.SUCCESS_FILL)
         self._th_edit_popup = win
-
-        header = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
-        header.pack(fill="x", padx=28, pady=(18, 0))
-        tk.Label(header, text="➕  New Trade", bg=ModernStyle.BG_PRIMARY, fg=ModernStyle.SUCCESS,
-                 font=ModernStyle.FONT_SYMBOL_LARGE).pack(anchor="w")
-        name_lbl = tk.Label(header, text="Add a new historical or manual trade entry", bg=ModernStyle.BG_PRIMARY,
-                            fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY)
-        name_lbl.pack(anchor="w", pady=(2, 12))
-        tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+        head_row, name_lbl = dialog_header(win, "➕  New Trade", "Add a new historical or manual trade entry",
+                                           ModernStyle.SUCCESS)
 
         card = tk.Frame(win, bg=ModernStyle.BG_PRIMARY)
         card.pack(fill="both", expand=True, padx=24, pady=16)
@@ -622,20 +603,14 @@ class TradeHistoryView(BaseView):
         self._add_fee_var = tk.StringVar(value="0.0")
         self._add_currency_var = tk.StringVar(value="INR")
 
+        currency_toggle(head_row, self._add_currency_var, currency_choices(self.app_state)).pack(side="right")
         form = TradeForm(card, accent=ModernStyle.SUCCESS_FILL)
         form.frame.pack(fill="x")
-        form.label("🏦  Broker", 0, 0)
-        form.broker_box(0, 0, self._add_broker_var, known_brokers(self.app_state, initial_broker))
-        form.label("📅  Trade Date", 0, 1)
-        form.entry(0, 1, self._add_date_var, is_date=True)
-        form.label("🔠  Symbol", 1, 0)
-        sym_ent = form.entry(1, 0, self._add_symbol_var)
-        form.label("💎  Quantity", 1, 1)
-        form.entry(1, 1, self._add_qty_var)
-        form.money_labels((2, 0), (2, 1), self._add_currency_var)
-        form.entry(2, 0, self._add_price_var)
-        form.entry(2, 1, self._add_fee_var)
-        form.choice_rows(6, self._add_type_var, self._add_currency_var, currency_choices(self.app_state))
+        sym_ent, _qty = form.three_rows(
+            broker_var=self._add_broker_var, brokers=known_brokers(self.app_state, initial_broker),
+            date_var=self._add_date_var, qty_var=self._add_qty_var, price_var=self._add_price_var,
+            fee_var=self._add_fee_var, type_var=self._add_type_var, currency_var=self._add_currency_var,
+            symbol_var=self._add_symbol_var)
         # The currency follows the broker (NOMURA -> JPY ...)
         follow_broker_currency(self._add_broker_var, self._add_currency_var, self.app_state)
         if initial_broker:

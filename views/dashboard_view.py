@@ -45,7 +45,7 @@ from ui.ui_utils import (
     show_toast,
     start_ui_dispatcher,
 )
-from ui.ui_widgets import ModernButton, ModernCard, PremiumModal
+from ui.ui_widgets import EmptyState, ModernButton, ModernCard, PremiumModal
 from views.base_view import BaseView
 
 try:
@@ -2092,8 +2092,8 @@ class DashboardView(BaseView):
         cols = ("#", "Date", "Trade ID", "Type", "Qty", "Price", "Fees", "Running Qty", "Avg Cost", "Running P&L", "Broker")
         tv = ttk.Treeview(table_frame, columns=cols, show="headings", height=16)
 
-        style_name = "PremiumDrilldown.Treeview"
-        ttk.Style().configure(style_name, rowheight=36, font=S.FONT_TABLE)
+        style_name = "PremiumDrilldown.Treeview"   # same look as the Holdings trade drill-down
+        ttk.Style().configure(style_name, rowheight=S.TABLE_ROW_HEIGHT, font=S.FONT_TABLE)
         tv.configure(style=style_name)
 
         widths = [40, 100, 100, 80, 80, 100, 80, 100, 100, 110, 110]
@@ -2105,8 +2105,8 @@ class DashboardView(BaseView):
 
         tv.tag_configure("odd", background=S.BG_SECONDARY)
         tv.tag_configure("even", background=S.TABLE_ROW_ALT)
-        tv.tag_configure("buy", foreground=S.SUCCESS, font=S.FONT_TABLE_BOLD)
-        tv.tag_configure("sell", foreground=S.ERROR, font=S.FONT_TABLE_BOLD)
+        tv.tag_configure("buy", foreground=S.SUCCESS)
+        tv.tag_configure("sell", foreground=S.ERROR)
 
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tv.yview)
         tv.configure(yscroll=vsb.set)
@@ -2244,7 +2244,7 @@ class DashboardView(BaseView):
         cols = ("#", "Broker", "Value", "% of Total") if is_currency else ("#", "Broker", "Performance Rate")
         tv = ttk.Treeview(table_frame, columns=cols, show="headings", height=16)
         style_name = "Breakdown.Treeview"
-        ttk.Style().configure(style_name, rowheight=42, font=S.FONT_DASHBOARD_TABLE)
+        ttk.Style().configure(style_name, rowheight=S.TABLE_ROW_HEIGHT, font=S.FONT_TABLE)
         tv.configure(style=style_name)
         for c in cols:
             tv.heading(c, text=c, anchor="center")
@@ -2254,8 +2254,8 @@ class DashboardView(BaseView):
         tv.tag_configure("odd", background=S.BG_SECONDARY)
         tv.tag_configure("even", background=S.TABLE_ROW_ALT)
         tv.tag_configure("sym", foreground=S.TEXT_SECONDARY, font=S.FONT_BODY)
-        tv.tag_configure("profit", foreground=S.SUCCESS, font=S.FONT_DASHBOARD_TABLE_BOLD)
-        tv.tag_configure("loss", foreground=S.ERROR, font=S.FONT_DASHBOARD_TABLE_BOLD)
+        tv.tag_configure("profit", foreground=S.SUCCESS)
+        tv.tag_configure("loss", foreground=S.ERROR)
         add_treeview_copy_menu(tv)
 
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tv.yview)
@@ -2450,7 +2450,7 @@ class DashboardView(BaseView):
         S = ModernStyle
         currency = self.currency_var.get()  # read on the Tk thread, before the worker starts
 
-        modal = PremiumModal(self, title="Daily Top 10 Portfolio Movers", geometry="1200x640", icon="🏆")
+        modal = PremiumModal(self, title="Daily Top 10 Portfolio Movers", geometry="1200x600", icon="🏆")
         modal.add_chip("💱", f"{currency} holdings", bg_color=S.ACCENT_PRIMARY_PALE, fg_color=S.TEXT_ACCENT)
         modal.add_chip("🕐", "Price vs previous close", bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
 
@@ -2459,7 +2459,7 @@ class DashboardView(BaseView):
         body.grid_columnconfigure(1, weight=1, uniform="movers")
         body.grid_rowconfigure(0, weight=1)
 
-        cols = (("#", 40, "center"), ("Broker", 120, "w"), ("Symbol", 110, "w"), ("Prev Close", 90, "e"),
+        cols = (("#", 40, "center"), ("Symbol", 120, "w"), ("Broker", 120, "w"), ("Prev Close", 90, "e"),
                 ("Price", 90, "e"), ("Change", 100, "e"), ("% Change", 84, "e"))
 
         def _column(col, title, fill, row_tag, row_fg):
@@ -2480,14 +2480,28 @@ class DashboardView(BaseView):
             base = tuple((name, width) for name, width, _a in cols)
             tv.bind("<Configure>", lambda e, t=tv, b=base: self._fit_tree_columns(t, b, e.width))
             add_treeview_copy_menu(tv)
+            HeadingTips(tv, {
+                "Prev Close": "Yesterday's closing price",
+                "Price": "Latest price",
+                "Change": "Change per share since yesterday's close",
+                "% Change": "Change as a % of yesterday's close",
+            })
+
+            def _open(e, t=tv):   # double-click a row: that stock's trades
+                row = t.identify_row(e.y)
+                vals = t.item(row, "values") if row else ()
+                if len(vals) > 1 and str(vals[1]).strip():
+                    self._open_trade_drilldown(str(vals[1]).strip())
+            tv.bind("<Double-1>", _open)
+            tv._empty = EmptyState(frame)
             return tv
 
         gainers_tv = _column(0, "▲  Top 10 Gainers", S.SUCCESS_FILL, "gain", S.SUCCESS)
         losers_tv = _column(1, "▼  Top 10 Losers", S.ERROR_FILL, "loss", S.ERROR)
 
-        ModernButton(modal.actions_frame, text="✕  Close", command=modal.destroy,
-                     bg=S.NEUTRAL_FILL, fg=S.TEXT_ON_ACCENT, canvas_bg=S.BG_SECONDARY,
-                     width=110, height=38, radius=8, font=S.FONT_BODY_BOLD).pack(side="right")
+        # Slim: the Close button sits at the end of the chips row, and the window fits its tables
+        modal.make_compact()
+        modal.fit_to_content(width=1200)
         modal.set_status("Loading today's movers…")
 
         def _work():
@@ -2500,17 +2514,23 @@ class DashboardView(BaseView):
             for tv, items, arrow, tag in ((gainers_tv, gainers, "▲", "gain"), (losers_tv, losers, "▼", "loss")):
                 for i, g in enumerate(items or []):
                     cur = g.get("currency", currency)
+                    # Held at several brokers: show the first and how many more ("Bahee-Kite +1")
+                    brokers = [b for b in str(g.get("broker", "")).split(", ") if b]
+                    broker = brokers[0] + (f" +{len(brokers) - 1}" if len(brokers) > 1 else "") if brokers else ""
                     tv.insert("", "end", values=(
                         i + 1,
-                        g.get("broker", ""),
                         g.get("symbol", ""),
+                        broker,
                         format_money(g.get("prev_close"), cur),
                         format_money(g.get("current_price"), cur),
                         f"{arrow} {format_money(abs(_num(g.get('price_change'))), cur)}",
                         f"{arrow} {abs(_num(g.get('pct_change'))):.2f}%",
                     ), tags=("evenrow" if i % 2 == 0 else "oddrow", tag))
+                if not items:
+                    tv._empty.show("😴", "No gainers today" if tag == "gain" else "No losers today",
+                                   "Prices may not have moved yet, or the market is closed.")
             modal.set_status(f"{len(gainers or [])} gainers and {len(losers or [])} losers today "
-                             f"among your {currency} holdings.")
+                             f"among your {currency} holdings. Double-click a row to see its trades.")
 
         run_in_background(
             _work, on_done=_populate,

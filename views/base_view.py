@@ -26,7 +26,7 @@ def _create_date_input(parent: tk.Misc, text_var: tk.StringVar) -> tk.Widget:
         fg=ModernStyle.TEXT_PRIMARY, relief=tk.FLAT, bd=0, highlightthickness=0,
         insertbackground=ModernStyle.TEXT_ACCENT
     )
-    entry.pack(side="left", fill="y", ipady=5, padx=(8, 0))
+    entry.pack(side="left", fill="both", expand=True, ipady=5, padx=(8, 0))   # fills a stretched box
     container.watch(entry)
     
     def _open_picker():

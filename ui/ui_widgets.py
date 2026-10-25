@@ -1036,10 +1036,50 @@ class PremiumModal(tk.Toplevel):
         self.status_lbl.pack(anchor="w", padx=24, pady=(0, 8), fill="x")
         
         # Divider before buttons
-        tk.Frame(self.body_card, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20, pady=(0, 12))
+        self._footer_divider = tk.Frame(self.body_card, bg=ModernStyle.BORDER_COLOR, height=1)
+        self._footer_divider.pack(fill="x", padx=20, pady=(0, 12))
 
         self.actions_frame = tk.Frame(self.body_card, bg=ModernStyle.BG_SECONDARY)
         self.actions_frame.pack(fill="x", padx=24, pady=(0, 20))
+        # Once the caller has filled the window, grow it if its content (and the
+        # buttons at the bottom) would not fit; fonts and text size change heights.
+        self.after_idle(self._grow_to_fit)
+
+    def _grow_to_fit(self) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+            self.update_idletasks()
+            need = min(self.winfo_reqheight(), self.winfo_screenheight() - 120)
+            if need > self.winfo_height():
+                self.geometry(f"{self.winfo_width()}x{need}")
+                from .ui_utils import center_window
+                center_window(self, parent=self.master.winfo_toplevel())
+        except tk.TclError:
+            pass
+
+    def make_compact(self) -> None:
+        """Slim layout for read-only pop-ups: no footer bar, tighter padding, and a small
+        Close button at the right end of the chips row (Esc closes too)."""
+        self._footer_divider.pack_forget()
+        self.actions_frame.pack_forget()
+        self.content_frame.pack_configure(padx=16, pady=(12, 4))
+        ModernButton(self.chips_row, text="✕ Close", command=self.destroy, bg=ModernStyle.NEUTRAL_FILL,
+                     variant="soft", canvas_bg=ModernStyle.BG_PRIMARY, width=96, height=30, radius=8,
+                     font=ModernStyle.FONT_SMALL_BOLD).pack(side="right")
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def fit_to_content(self, width: int | None = None) -> None:
+        """Make the window just tall enough for what it holds (never taller than the screen)."""
+        self.update_idletasks()
+        w = width or self.winfo_width()
+        h = min(self.winfo_reqheight(), self.winfo_screenheight() - 120)
+        self.geometry(f"{w}x{h}")
+        try:
+            from .ui_utils import center_window
+            center_window(self, parent=self.master.winfo_toplevel())
+        except Exception:
+            pass
 
     def set_status(self, text: str, is_error: bool = False):
         color = ModernStyle.ERROR if is_error else ModernStyle.TEXT_TERTIARY

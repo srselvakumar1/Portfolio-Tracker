@@ -206,8 +206,12 @@ class TradeForm:
             self.frame.grid_columnconfigure(i, weight=1, uniform="tf")
         self.price_label = None
         self.fee_label = None
+        self._roles = {}        # (r, c) -> "qty" / "price" / "fee", for the live total
+        self._vars = {}         # role -> StringVar
 
     def label(self, text, r, c):
+        if "Quantity" in text:
+            self._roles[(r, c)] = "qty"
         lbl = tk.Label(self.frame, text=text, bg=self.bg, fg=ModernStyle.TEXT_SECONDARY,
                        font=ModernStyle.FONT_BODY_BOLD)
         lbl.grid(row=r * 2, column=c, sticky="w", pady=(10 if r > 0 else 0, 4), padx=(0, 12 if c == 0 else 0))
@@ -220,6 +224,8 @@ class TradeForm:
         return wrap
 
     def entry(self, r, c, var, *, is_date=False):
+        if (r, c) in self._roles:
+            self._vars[self._roles[(r, c)]] = var
         wrap = self._wrap(r, c, plain=is_date)
         if is_date:
             ent = _create_date_input(wrap, var)
@@ -245,6 +251,9 @@ class TradeForm:
         """Price / Fees labels whose symbol follows the currency choice."""
         self.price_label = self.label("", *price_rc)
         self.fee_label = self.label("", *fee_rc) if fee_rc else None
+        self._roles[tuple(price_rc)] = "price"
+        if fee_rc:
+            self._roles[tuple(fee_rc)] = "fee"
 
         def _sync(*_):
             sym = currency_symbol(currency_var.get())
@@ -270,16 +279,74 @@ class TradeForm:
 
         row = tk.Frame(self.frame, bg=bg)
         row.grid(row=grid_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        for val, color in (("BUY", ModernStyle.SUCCESS), ("SELL", ModernStyle.ERROR)):
-            tk.Radiobutton(row, text=val, variable=type_var, value=val, bg=bg, fg=color,
-                           activebackground=bg, activeforeground=color, selectcolor=bg,
-                           font=ModernStyle.FONT_TABLE_BOLD).pack(side="left", padx=(0, 20))
-        tk.Frame(row, bg=ModernStyle.DIVIDER_COLOR, width=2, height=20).pack(side="left", padx=12)
-        for val in currencies:
-            tk.Radiobutton(row, text=val, variable=currency_var, value=val, bg=bg, fg=ModernStyle.TEXT_ACCENT,
-                           activebackground=bg, activeforeground=ModernStyle.TEXT_ACCENT, selectcolor=bg,
-                           font=ModernStyle.FONT_TABLE_BOLD).pack(side="left", padx=(0, 16))
+        # Toggle buttons: the chosen one is filled (green Buy, red Sell, blue currency)
+        _segmented(row, type_var, (("BUY", "▲ Buy", ModernStyle.SUCCESS_FILL),
+                                   ("SELL", "▼ Sell", ModernStyle.ERROR_FILL))).pack(side="left")
+        tk.Frame(row, width=24, bg=bg).pack(side="left")
+        _segmented(row, currency_var, tuple((c, c, ModernStyle.ACCENT_PRIMARY) for c in currencies)).pack(side="left")
+        if "qty" in self._vars and "price" in self._vars:
+            self._total_line(grid_row + 2, type_var, currency_var)
         return row
+
+    def _total_line(self, grid_row, type_var, currency_var):
+        """'Total to pay ₹16,507.78 (100 × ₹165.00 + ₹7.78 fees)', updated as you type."""
+        lbl = tk.Label(self.frame, text="", bg=ModernStyle.ACCENT_PRIMARY_PALE, fg=ModernStyle.TEXT_ACCENT,
+                       font=ModernStyle.FONT_BODY_BOLD, anchor="w", padx=12, pady=8)
+        lbl.grid(row=grid_row, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        qty_v, price_v, fee_v = self._vars["qty"], self._vars["price"], self._vars.get("fee")
+
+        def _num(var):
+            try:
+                return float(str(var.get()).replace(",", "").strip() or "0")
+            except (ValueError, tk.TclError):
+                return None
+
+        def _sync(*_):
+            qty, price = _num(qty_v), _num(price_v)
+            fee = _num(fee_v) if fee_v is not None else 0.0
+            sym = currency_symbol(currency_var.get())
+            if not qty or not price or fee is None:
+                text = "Enter the quantity and price to see the total."
+            else:
+                value = qty * price
+                is_sell = str(type_var.get()).upper() == "SELL"
+                total = value - fee if is_sell else value + fee
+                what = "You receive" if is_sell else "Total to pay"
+                text = (f"{what}  {sym}{total:,.2f}   ({qty:g} × {sym}{price:,.2f} "
+                        f"{'−' if is_sell else '+'} {sym}{fee:,.2f} fees)")
+            try:
+                lbl.configure(text=text)
+            except tk.TclError:
+                pass
+        for v in (qty_v, price_v, fee_v, type_var, currency_var):
+            if v is not None:
+                v.trace_add("write", _sync)
+        _sync()
+
+
+def _segmented(parent, var, options):
+    """A row of joined toggle buttons for a StringVar: options = ((value, text, fill), ...)."""
+    wrap = tk.Frame(parent, bg=ModernStyle.BG_TERTIARY, highlightthickness=1,
+                    highlightbackground=ModernStyle.BORDER_COLOR)
+    labels = {}
+    for value, text, fill in options:
+        lbl = tk.Label(wrap, text=text, font=ModernStyle.FONT_SMALL_BOLD, padx=16, pady=6, cursor="hand2")
+        lbl.pack(side="left")
+        lbl.bind("<Button-1>", lambda _e, v=value: var.set(v))
+        labels[value] = (lbl, fill)
+
+    def _sync(*_):
+        cur = str(var.get()).upper()
+        for value, (lbl, fill) in labels.items():
+            on = cur == str(value).upper()
+            try:
+                lbl.configure(bg=fill if on else ModernStyle.BG_TERTIARY,
+                              fg=ModernStyle.TEXT_ON_ACCENT if on else ModernStyle.TEXT_SECONDARY)
+            except tk.TclError:
+                pass
+    var.trace_add("write", _sync)
+    _sync()
+    return wrap
 
 
 def follow_broker_currency(broker_var, currency_var, app_state=None) -> None:
@@ -312,7 +379,23 @@ def make_dialog(parent, title: str, size: str, accent: str):
     except Exception:
         pass
     tk.Frame(win, bg=accent, height=4).pack(fill="x")
+    win.bind("<Escape>", lambda _e: _safe_destroy(win))
+    # Once the form is built, make the window just tall enough for it, so the
+    # buttons at the bottom are never cut off (fonts and text size change heights)
+    win.after_idle(lambda: _fit_dialog(win, parent))
     return win
+
+
+def _fit_dialog(win, parent) -> None:
+    try:
+        if not win.winfo_exists():
+            return
+        win.update_idletasks()
+        h = min(win.winfo_reqheight(), win.winfo_screenheight() - 120)
+        win.geometry(f"{win.winfo_width()}x{h}")
+        center_window(win, parent=parent.winfo_toplevel())
+    except tk.TclError:
+        pass
 
 
 def dialog_footer(win):
@@ -327,9 +410,16 @@ def dialog_footer(win):
 
 
 def dialog_button(parent, text, command, fill, width):
+    """Footer button. Cancel (grey) is a soft button; the first main button also answers Return."""
+    secondary = fill == ModernStyle.NEUTRAL_FILL
+    if not secondary:
+        win = parent.winfo_toplevel()
+        if not win.bind("<Return>"):
+            win.bind("<Return>", lambda _e: command())
     return ModernButton(parent, text=text, command=command, bg=fill, fg=ModernStyle.TEXT_ON_ACCENT,
-                        canvas_bg=ModernStyle.BG_PRIMARY, width=width, height=42, radius=8,
-                        font=ModernStyle.FONT_SUBHEADING)
+                        variant="soft" if secondary else "solid",
+                        canvas_bg=ModernStyle.BG_PRIMARY, width=width, height=38, radius=8,
+                        font=ModernStyle.FONT_BODY_BOLD)
 
 
 def _safe_destroy(win):

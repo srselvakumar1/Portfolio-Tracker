@@ -20,9 +20,14 @@ from views.base_view import BaseView, _create_date_input
 from views.shared_trade_edit import (
     confirm_unusual, currency_symbol, friendly_error, refresh_after_change, show_stale_warning,
 )
+from ui import icons
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import rounded_combobox, RoundedBox, ModernButton, ModernCard
-from ui.ui_utils import add_treeview_copy_menu, center_window, format_money, run_in_background, show_toast
+from ui.ui_widgets import (GradientHeader, icon_tile, rounded_combobox, RoundedBox, ModernButton, ModernCard,
+                           action_button, add_broker_logos, secondary_button)
+from ui.broker_logos import logo_column, show_logos
+from views.tax_report_view import fit_columns
+from ui.ui_utils import (add_treeview_copy_menu, color_buy_sell, enhance_table, format_money, place_centered,
+                         run_in_background, show_toast)
 
 PASTE_HINT = "date,symbol,type,qty,price\n2024-01-15,TCS.NS,BUY,10,3500.00\n2024-01-20,INFY.NS,SELL,5,1800.50"
 PREVIEW_READY_ROWS = 1000   # ready rows listed in the preview (problem rows are always all listed)
@@ -31,279 +36,298 @@ PREVIEW_READY_ROWS = 1000   # ready rows listed in the preview (problem rows are
 class TradeEntryView(BaseView):
     """Form for entering new trades."""
 
+    _FIELD_IPADY = 9                       # text boxes as tall as the broker drop-down (44 px)
+    _CSV_PROMPT = "Choose a CSV file of trades"
+    _RECENT_ROWS = 30                      # trades listed under Recent Trades
+
     def build(self):
         """Build Trade Entry view with premium look."""
         self._data_loaded = False
         self._saving = False
         self._snapshot_gen = 0
-        self._sum_tint = None
+        self._sum_tint = ModernStyle.SUCCESS_PALE
+        self._recent_gen = 0
         self._brokers: list = []
         self.pending_csv_df = None
         self.pending_csv_name = ""
         self.pending_paste_df = None
         self._import_preview_win = None
 
-        self.add_gradient_header(self, "❇️ Trade Entry", "Record a manual trade or bulk-import via CSV",
+        S = ModernStyle
+        self.add_gradient_header(self, "❇️ Trade Entry", "Record one trade by hand, or import many at once",
                                  show_divider=False)
 
         # The page scrolls when the window is too short for it; otherwise it fills the window.
-        scroller = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
+        scroller = tk.Frame(self, bg=S.BG_PRIMARY)
         scroller.pack(fill="both", expand=True)
-        self._page_canvas = tk.Canvas(scroller, bg=ModernStyle.BG_PRIMARY, highlightthickness=0, bd=0)
+        self._page_canvas = tk.Canvas(scroller, bg=S.BG_PRIMARY, highlightthickness=0, bd=0)
         self._page_vsb = ttk.Scrollbar(scroller, orient="vertical", command=self._page_canvas.yview)
         self._page_canvas.configure(yscrollcommand=self._page_vsb.set)
         self._page_canvas.pack(side="left", fill="both", expand=True)
-        page = tk.Frame(self._page_canvas, bg=ModernStyle.BG_PRIMARY)
+        page = tk.Frame(self._page_canvas, bg=S.BG_PRIMARY)
         self._page = page
         self._page_item = self._page_canvas.create_window(0, 0, window=page, anchor="nw")
         self._page_canvas.bind("<Configure>", lambda e: self._fit_page())
         self._page_canvas.bind("<Enter>", lambda e: self._page_canvas.bind_all("<MouseWheel>", self._on_page_wheel))
         self._page_canvas.bind("<Leave>", lambda e: self._page_canvas.unbind_all("<MouseWheel>"))
 
-        body = tk.Frame(page, bg=ModernStyle.BG_PRIMARY)
-        body.pack(fill="both", expand=True, padx=20, pady=10)
+        body = tk.Frame(page, bg=S.BG_PRIMARY)
+        body.pack(fill="both", expand=True, padx=20, pady=(6, 12))
         body.grid_columnconfigure(0, weight=3, uniform="te")
         body.grid_columnconfigure(1, weight=2, uniform="te")
         body.grid_rowconfigure(0, weight=1)
-        left = tk.Frame(body, bg=ModernStyle.BG_PRIMARY)
-        right = tk.Frame(body, bg=ModernStyle.BG_PRIMARY)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left = tk.Frame(body, bg=S.BG_PRIMARY)
+        right = tk.Frame(body, bg=S.BG_PRIMARY)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         right.grid(row=0, column=1, sticky="nsew")
 
         vcmd = (self.register(self._validate_number), "%P")
         vcmd_qty = (self.register(self._validate_qty), "%P")
-        BG_SEC = ModernStyle.BG_SECONDARY
+        BG_SEC = S.BG_SECONDARY
+        # The manual form sits on a mild tint of its blue; its "off" buttons are a shade stronger
+        MANUAL_BG = ModernButton._blend(S.ACCENT_PRIMARY, BG_SEC, 0.06)
+        self._toggle_off = ModernButton._blend(S.ACCENT_PRIMARY, BG_SEC, 0.14)
 
-        def _card(parent, title: str, icon: str = "", bar=ModernStyle.ACCENT_PRIMARY,
-                  fg=ModernStyle.TEXT_ACCENT, expand_height=False):
-            """Section card: coloured top bar (`bar`) and title text (`fg`)."""
-            frame = ModernCard(parent, bg=BG_SEC, highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1,
-                               radius=10, canvas_bg=ModernStyle.BG_PRIMARY, expand_height=expand_height)
-            tk.Frame(frame.content, bg=bar, height=3).pack(fill="x")
-            hdr = tk.Frame(frame.content, bg=BG_SEC)
-            hdr.pack(fill="x", padx=14, pady=(10, 6))
-            if icon:
-                tk.Label(hdr, text=icon, fg=fg, bg=BG_SEC, font=ModernStyle.FONT_TITLE).pack(side="left", padx=(0, 6))
-            tk.Label(hdr, text=title, fg=fg, bg=BG_SEC, font=ModernStyle.FONT_TITLE).pack(side="left")
-            tk.Frame(frame.content, bg=ModernStyle.DIVIDER_COLOR, height=1).pack(fill="x", padx=12)
-            inner = tk.Frame(frame.content, bg=BG_SEC)
-            inner.pack(fill="both", expand=True, padx=14, pady=(10, 14))
+        def _glyph(parent, name, emoji, color, px, bg=BG_SEC):
+            """A Lucide line icon as a label (the emoji when the icon font is missing)."""
+            g = icons.glyph(name)
+            return tk.Label(parent, text=g or emoji, fg=color, bg=bg, bd=0, padx=0, pady=0,
+                            font=icons.font(px) if g else S.FONT_BODY)
+
+        def _card(parent, title: str, subtitle: str, icon: str, emoji: str, accent, pale, tint_fg,
+                  expand_height=False, bg=BG_SEC):
+            """Section card: soft shadow, coloured top bar, icon tile, title and a short subtitle."""
+            frame = ModernCard(parent, bg=bg, highlight_color=bg, highlight_thickness=1, shadow=True,
+                               radius=ModernStyle.RADIUS_CARD, canvas_bg=S.BG_PRIMARY, expand_height=expand_height)
+            tk.Frame(frame.content, bg=accent, height=ModernStyle.ACCENT_BAR).pack(fill="x")
+            hdr = tk.Frame(frame.content, bg=bg)
+            hdr.pack(fill="x", padx=16, pady=(12, 12))
+            icon_tile(hdr, icon, emoji, tint_fg, pale).pack(side="left")
+            words = tk.Frame(hdr, bg=bg)
+            words.pack(side="left", padx=(10, 0))
+            tk.Label(words, text=title, fg=S.TEXT_PRIMARY, bg=bg, font=S.FONT_CARD_TITLE).pack(anchor="w")
+            if subtitle:
+                tk.Label(words, text=subtitle, fg=S.TEXT_SECONDARY, bg=bg, font=S.FONT_SMALL).pack(anchor="w")
+            inner = tk.Frame(frame.content, bg=bg)
+            inner.pack(fill="both", expand=True, padx=16, pady=(0, 16))
             frame.header_frame = hdr
             return frame, inner
 
-        def _caption(parent, text, **grid):
-            lbl = tk.Label(parent, text=text, fg=ModernStyle.TEXT_SECONDARY, bg=BG_SEC, font=ModernStyle.FONT_HEADING)
-            if grid:
-                lbl.grid(**grid)
-            else:
-                lbl.pack(anchor="w", pady=(0, 4))
-            return lbl
+        def _caption(parent, text, icon, emoji, color):
+            """A field label: small coloured icon and quiet bold text."""
+            bg = parent.cget("bg")
+            row = tk.Frame(parent, bg=bg)
+            row.pack(anchor="w", pady=(0, 6))
+            ico = _glyph(row, icon, emoji, color, 16, bg)
+            ico.pack(side="left", padx=(0, 6))
+            lbl = tk.Label(row, text=text, fg=S.TEXT_SECONDARY, bg=bg, font=S.FONT_SMALL_BOLD)
+            lbl.pack(side="left")
+            return lbl, ico
 
-        def _styled_entry(parent, textvariable, validate=None, vcmd=None):
-            """Entry with a focus ring (the ring turns red when the value is wrong)."""
+        def _styled_entry(parent, textvariable, placeholder: str, validate=None, vcmd=None):
+            """Entry in a rounded box with grey hint text; the border is blue while typing, red when wrong."""
             wrap = RoundedBox(parent)
             wrap.pack(fill="x")
-            kw = dict(textvariable=textvariable, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_ACCENT,
-                      font=ModernStyle.FONT_INPUT, relief=tk.FLAT, insertbackground=ModernStyle.ACCENT_PRIMARY,
-                      highlightthickness=0)
+            kw = dict(textvariable=textvariable, bg=S.ENTRY_BG, fg=S.TEXT_PRIMARY, font=S.FONT_INPUT, relief=tk.FLAT,
+                      insertbackground=S.ACCENT_PRIMARY, highlightthickness=0, bd=0)
             if validate:
                 kw["validate"] = validate
             if vcmd:
                 kw["validatecommand"] = vcmd
             ent = tk.Entry(wrap, **kw)
+            ent.pack(fill="x", ipady=self._FIELD_IPADY, padx=10)
+            wrap.watch(ent)
 
-            def _fi(e, w=wrap):
-                if w.cget("bg") != ModernStyle.ERROR:
-                    w.configure(bg=ModernStyle.ACCENT_PRIMARY)
+            hint = tk.Label(wrap, text=placeholder, fg=S.TEXT_TERTIARY, bg=S.ENTRY_BG, font=S.FONT_INPUT,
+                            bd=0, padx=0, cursor="xterm")
+            hint.bind("<Button-1>", lambda _e: ent.focus_set())
 
-            def _fo(e, w=wrap):
-                if w.cget("bg") != ModernStyle.ERROR:
-                    w.configure(bg=ModernStyle.BORDER_COLOR)
-            ent.bind("<FocusIn>", _fi)
-            ent.bind("<FocusOut>", _fo)
-            ent.pack(fill="x", ipady=5, padx=8)
+            def _sync_hint(*_):
+                if textvariable.get():
+                    hint.place_forget()
+                else:
+                    hint.place(in_=ent, x=1, rely=0.5, anchor="w")
+            textvariable.trace_add("write", _sync_hint)
+            _sync_hint()
             return ent, wrap
 
-        # ===== Manual Entry Card =====
-        manual_card, manual = _card(left, "Manual Trade Entry", "✍️")
-        manual_card.pack(fill="x", pady=(0, 10))
+        def _row(parent, cols: int, pady=(0, 14)):
+            """A row of equal-width cells."""
+            bg = parent.cget("bg")
+            row = tk.Frame(parent, bg=bg)
+            row.pack(fill="x", pady=pady)
+            cells = []
+            for i in range(cols):
+                row.grid_columnconfigure(i, weight=1, uniform=f"row{id(row)}")
+                cell = tk.Frame(row, bg=bg)
+                cell.grid(row=0, column=i, sticky="nsew", padx=(0, 12) if i < cols - 1 else 0)
+                cells.append(cell)
+            return cells
 
-        r1 = tk.Frame(manual, bg=BG_SEC)
-        r1.pack(fill="x", pady=(0, 12))
-        r1.grid_columnconfigure(0, weight=1, uniform="r1")
-        r1.grid_columnconfigure(1, weight=1, uniform="r1")
+        def _toggle(parent, text, command, width, glyph=""):
+            g = icons.glyph(glyph) if glyph else ""
+            return ModernButton(parent, text=text, command=command, bg=self._toggle_off, fg=S.TEXT_SECONDARY,
+                                canvas_bg=parent.cget("bg"), width=width, height=38, radius=16, font=S.FONT_BODY_BOLD,
+                                glyph=g, glyph_font=icons.font(16))   # choices are pills; actions are rounded boxes
+
+        # ===== Manual Entry Card =====
+        manual_card, manual = _card(left, "Manual Trade Entry", "Record one buy or sell by hand",
+                                    "square-pen", "✍️", S.ACCENT_PRIMARY, S.ACCENT_PRIMARY_PALE, S.TEXT_ACCENT,
+                                    bg=MANUAL_BG)
+        manual_card.pack(fill="x", pady=(0, 14))
+
         self.te_broker_var = tk.StringVar(value="")
         self.te_date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
-
-        broker_col = tk.Frame(r1, bg=BG_SEC)
-        broker_col.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        _caption(broker_col, "🏦 Broker")
-        box, self.te_broker_cb = rounded_combobox(broker_col, textvariable=self.te_broker_var, width=18,
-                                                  state="readonly")
-        box.pack(fill="x", pady=5)
-
-        date_col = tk.Frame(r1, bg=BG_SEC)
-        date_col.grid(row=0, column=1, sticky="nsew")
-        _caption(date_col, "📅 Date")
-        self.te_date_entry = _create_date_input(date_col, self.te_date_var)
-        self.te_date_entry.pack(fill="x", pady=(2, 0))
-
-        # Row 2: Type | Currency (the currency follows the broker)
-        r2 = tk.Frame(manual, bg=BG_SEC)
-        r2.pack(fill="x", pady=(0, 10))
-        r2.grid_columnconfigure(0, weight=1, uniform="r2")
-        r2.grid_columnconfigure(1, weight=1, uniform="r2")
         self.te_symbol_var = tk.StringVar(value="")
         self.te_type_var = tk.StringVar(value="BUY")
         self.te_currency_var = tk.StringVar(value="INR")
+        self.te_qty_var = tk.StringVar(value="")
+        self.te_price_var = tk.StringVar(value="")
 
-        type_col = tk.Frame(r2, bg=BG_SEC)
-        type_col.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        _caption(type_col, "🚦 Type")
-        type_btn_frame = tk.Frame(type_col, bg=BG_SEC)
-        type_btn_frame.pack(anchor="w", pady=(2, 0))
+        # Row 1: Broker | Date
+        broker_col, date_col = _row(manual, 2)
+        _caption(broker_col, "Broker", "landmark", "🏦", S.TEXT_ACCENT)
+        box, self.te_broker_cb = rounded_combobox(broker_col, textvariable=self.te_broker_var, width=18,
+                                                  state="readonly")
+        add_broker_logos(box, self.te_broker_cb)
+        box.pack(fill="x")
+        _caption(date_col, "Trade date", "calendar-days", "📅", S.ERROR)
+        self.te_date_entry = _create_date_input(date_col, self.te_date_var, ipady=self._FIELD_IPADY)
+        self.te_date_entry.pack(fill="x")
+
+        # Row 2: Buy or sell | Currency (the currency follows the broker)
+        type_col, cur_col = _row(manual, 2)
+        _caption(type_col, "Buy or sell", "arrow-left-right", "🚦", S.WARNING)
+        type_btn_frame = tk.Frame(type_col, bg=MANUAL_BG)
+        type_btn_frame.pack(anchor="w")
 
         def _on_type_select(val):
             self.te_type_var.set(val)
             self._sync_te_type_buttons()
             self._update_summary()
 
-        def _toggle(parent, text, command, width):
-            return ModernButton(parent, text=text, command=command, bg=ModernStyle.BG_TERTIARY,
-                                fg=ModernStyle.TEXT_SECONDARY, canvas_bg=BG_SEC, width=width, height=30, radius=6,
-                                font=ModernStyle.FONT_TABLE_BOLD)
-
-        self.te_buy_btn = _toggle(type_btn_frame, "BUY", lambda: _on_type_select("BUY"), 64)
-        self.te_buy_btn.pack(side="left", padx=(0, 6))
-        self.te_sell_btn = _toggle(type_btn_frame, "SELL", lambda: _on_type_select("SELL"), 64)
+        self.te_buy_btn = _toggle(type_btn_frame, "BUY", lambda: _on_type_select("BUY"), 104, "trending-up")
+        self.te_buy_btn.pack(side="left", padx=(0, 8))
+        self.te_sell_btn = _toggle(type_btn_frame, "SELL", lambda: _on_type_select("SELL"), 104, "trending-down")
         self.te_sell_btn.pack(side="left")
 
         # Currency toggles: INR and JPY, plus any other currency a broker uses (added in load_data)
-        cur_col = tk.Frame(r2, bg=BG_SEC)
-        cur_col.grid(row=0, column=1, sticky="nsew")
-        _caption(cur_col, "💱 Currency")
-        self._currency_btn_frame = tk.Frame(cur_col, bg=BG_SEC)
-        self._currency_btn_frame.pack(anchor="w", pady=(2, 0))
+        _caption(cur_col, "Currency", "coins", "💱", S.SUCCESS)
+        self._currency_btn_frame = tk.Frame(cur_col, bg=MANUAL_BG)
+        self._currency_btn_frame.pack(anchor="w")
         self._cur_btns: dict = {}
         self._make_toggle = _toggle
+
+        # Row 3: Symbol | Quantity | Price
+        sym_col, qty_col, price_col = _row(manual, 3, pady=(0, 16))
+        _caption(sym_col, "Symbol", "tag", "🔠", S.INFO)
+        self.te_symbol_entry, self._sym_wrap = _styled_entry(sym_col, self.te_symbol_var, "e.g. TCS.NS")
+        _caption(qty_col, "Quantity", "hash", "💎", S.TEXT_PURPLE)
+        self.te_qty_entry, self._qty_wrap = _styled_entry(qty_col, self.te_qty_var, "0",
+                                                          validate="key", vcmd=vcmd_qty)
+        self.lbl_price, self._price_icon = _caption(price_col, "Price (₹)", "indian-rupee", "💰", S.WARNING)
+        self.te_price_entry, self._price_wrap = _styled_entry(price_col, self.te_price_var, "0.00",
+                                                              validate="key", vcmd=vcmd)
         self._add_currency_buttons(["INR", "JPY"])
         self.te_inr_btn = self._cur_btns["INR"]
         self.te_jpy_btn = self._cur_btns["JPY"]
 
-        # Row 3: Symbol | Quantity | Price
-        r3 = tk.Frame(manual, bg=BG_SEC)
-        r3.pack(fill="x", pady=(0, 10))
-        for i in range(3):
-            r3.grid_columnconfigure(i, weight=1, uniform="r3")
-        self.te_qty_var = tk.StringVar(value="")
-        self.te_price_var = tk.StringVar(value="")
+        # Footer: the fee estimate on the left, the buttons on the right
+        tk.Frame(manual, bg=S.DIVIDER_COLOR, height=1).pack(fill="x", pady=(0, 14))
+        foot = tk.Frame(manual, bg=MANUAL_BG)
+        foot.pack(fill="x")
+        self.te_save_btn = action_button(foot, "✓ Save Trade", self._save_trade, kind="success", width=150,
+                                         canvas_bg=MANUAL_BG)
+        self.te_save_btn.pack(side="right")
+        secondary_button(foot, "Clear", self._clear_form, canvas_bg=MANUAL_BG,
+                         icon="eraser").pack(side="right", padx=(0, 10))
+        _glyph(foot, "receipt", "💸", S.TEXT_SECONDARY, 16, MANUAL_BG).pack(side="left", padx=(0, 6))
+        self.te_fee_label = tk.Label(foot, text="Estimated fee ₹0.00", fg=S.TEXT_SECONDARY, bg=MANUAL_BG,
+                                     font=S.FONT_SMALL_BOLD, anchor="w")
+        self.te_fee_label.pack(side="left", fill="x", expand=True)
 
-        sym_col = tk.Frame(r3, bg=BG_SEC)
-        sym_col.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        _caption(sym_col, "🔠 Symbol")
-        self.te_symbol_entry, self._sym_wrap = _styled_entry(sym_col, self.te_symbol_var)
+        # ===== Import Card: a CSV file or pasted rows, one tab each =====
+        import_card, imp = _card(left, "Import Trades", "Add many trades at once", "upload", "📥",
+                                 S.WARNING_FILL, S.WARNING_PALE, S.WARNING, expand_height=True)
+        import_card.pack(fill="both", expand=True)
+        tabs = tk.Frame(import_card.header_frame, bg=BG_SEC)
+        tabs.pack(side="right")
+        self._imp_tab_btns: dict = {}
+        for key, text, icon, emoji in (("csv", "CSV file", "file-spreadsheet", "📄"),
+                                       ("paste", "Paste rows", "clipboard-paste", "📋")):
+            g = icons.glyph(icon)
+            btn = ModernButton(tabs, text=text if g else f"{emoji} {text}",
+                               command=lambda k=key: self._show_import_tab(k), bg=S.BG_TERTIARY,
+                               fg=S.TEXT_SECONDARY, canvas_bg=BG_SEC, width=126, height=32, radius=14,
+                               font=S.FONT_SMALL_BOLD, glyph=g, glyph_font=icons.font(14))
+            btn.pack(side="left", padx=(6, 0))
+            self._imp_tab_btns[key] = btn
 
-        qty_col = tk.Frame(r3, bg=BG_SEC)
-        qty_col.grid(row=0, column=1, sticky="nsew", padx=(0, 10))
-        _caption(qty_col, "💎 Quantity")
-        self.te_qty_entry, self._qty_wrap = _styled_entry(qty_col, self.te_qty_var, validate="key", vcmd=vcmd_qty)
-
-        price_col = tk.Frame(r3, bg=BG_SEC)
-        price_col.grid(row=0, column=2, sticky="nsew")
-        self.lbl_price = _caption(price_col, "💰 Price (₹)")
-        self.te_price_entry, self._price_wrap = _styled_entry(price_col, self.te_price_var, validate="key", vcmd=vcmd)
-
-        self.te_fee_label = tk.Label(manual, text="💸  Estimated Fee: ₹0.00", fg=ModernStyle.TEXT_SECONDARY,
-                                     bg=BG_SEC, font=ModernStyle.FONT_HEADING)
-        self.te_fee_label.pack(anchor="w", pady=(4, 0))
-        tk.Frame(manual, bg=ModernStyle.DIVIDER_COLOR, height=1).pack(fill="x", pady=(8, 0))
-
-        btns = tk.Frame(manual, bg=BG_SEC)
-        btns.pack(fill="x", pady=(8, 0))
-        tk.Frame(btns, bg=BG_SEC).pack(side="left", expand=True, fill="x")
-        ModernButton(btns, text="Clear Form", command=self._clear_form, bg=ModernStyle.BG_TERTIARY,
-                     fg=ModernStyle.TEXT_SECONDARY, canvas_bg=BG_SEC, width=120, height=40).pack(side="left", padx=(0, 12))
-        self.te_save_btn = ModernButton(btns, text="✓ Save Trade", command=self._save_trade,
-                                        bg=ModernStyle.SUCCESS_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-                                        canvas_bg=BG_SEC, width=160, height=40)
-        self.te_save_btn.pack(side="left")
-
-        self.recent_trades_label = tk.Label(manual, text="", fg=ModernStyle.SUCCESS, bg=BG_SEC,
-                                            font=ModernStyle.FONT_BODY_BOLD, anchor="w", justify="left")
-
-        # ===== Bulk Import Card =====
-        import_card, import_inner = _card(left, "Bulk Import (CSV)", "📥", bar=ModernStyle.WARNING_FILL,
-                                          fg=ModernStyle.WARNING)
-        import_card.pack(fill="x", pady=(0, 10))
-        cols_hint = tk.Label(import_inner,
-                             text="Columns: date, symbol, type, qty, price (needed); broker, fee, currency, trade_id "
-                                  "(optional). Dates like 2024-01-15 or 15-01-2024.",
-                             fg=ModernStyle.TEXT_SECONDARY, bg=BG_SEC, font=ModernStyle.FONT_SMALL, justify="left",
+        csv_tab = tk.Frame(imp, bg=BG_SEC)
+        cols_hint = tk.Label(csv_tab,
+                             text="Needed columns: date, symbol, type, qty, price. Optional: broker, fee, currency, "
+                                  "trade_id. Dates like 2024-01-15 or 15-01-2024.",
+                             fg=S.TEXT_SECONDARY, bg=BG_SEC, font=S.FONT_SMALL, justify="left",
                              anchor="w", wraplength=420)
         cols_hint.pack(fill="x", pady=(0, 10))
         self._auto_wrap(cols_hint)
-
-        dropzone = tk.Frame(import_inner, bg=ModernStyle.BG_TERTIARY, highlightbackground=ModernStyle.BORDER_COLOR,
-                            highlightthickness=1)
-        dropzone.pack(fill="x", pady=(2, 4), ipady=4)
-        self.import_path_label = tk.Label(dropzone, text="Select a CSV file to import trades", fg=ModernStyle.TEXT_SECONDARY,
-                                          bg=ModernStyle.BG_TERTIARY, font=ModernStyle.FONT_BODY_BOLD)
-        self.import_path_label.pack(pady=(8, 8))
-        imp_btns = tk.Frame(dropzone, bg=ModernStyle.BG_TERTIARY)
-        imp_btns.pack(fill="x")
-        tk.Frame(imp_btns, bg=ModernStyle.BG_TERTIARY).pack(side="left", expand=True, fill="x")
-        ModernButton(imp_btns, text="Select CSV", variant="soft", command=self._select_import_file, bg=ModernStyle.WARNING_FILL,
-                     fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=ModernStyle.BG_TERTIARY, width=148, height=36
-                     ).pack(side="left", padx=(0, 10))
-        self.import_confirm_btn = ModernButton(imp_btns, text="Preview Import",
-                                               command=lambda: self._open_import_preview_dialog(source="csv"),
-                                               bg=ModernStyle.SUCCESS_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-                                               canvas_bg=ModernStyle.BG_TERTIARY, width=160, height=36)
+        # The drop zone fills the card; its contents stay in the middle
+        dropzone = RoundedBox(csv_tab, fill=S.BG_TERTIARY, padx=5, pady=5)
+        dropzone.pack(fill="both", expand=True)
+        tk.Frame(dropzone, bg=S.BG_TERTIARY).pack(fill="both", expand=True)
+        _glyph(dropzone, "file-spreadsheet", "📄", S.WARNING, 30, S.BG_TERTIARY).pack(pady=(14, 4))
+        self.import_path_label = tk.Label(dropzone, text=self._CSV_PROMPT, fg=S.TEXT_PRIMARY,
+                                          bg=S.BG_TERTIARY, font=S.FONT_BODY_BOLD)
+        self.import_path_label.pack(pady=(0, 10), padx=12)
+        imp_btns = tk.Frame(dropzone, bg=S.BG_TERTIARY)
+        imp_btns.pack(pady=(0, 14))
+        action_button(imp_btns, "Select CSV", self._select_import_file, soft=True, icon="folder-open",
+                      canvas_bg=S.BG_TERTIARY).pack(side="left", padx=(0, 10))
+        self.import_confirm_btn = action_button(imp_btns, "Preview Import",
+                                                lambda: self._open_import_preview_dialog(source="csv"),
+                                                kind="success", icon="scan-eye", canvas_bg=S.BG_TERTIARY)
         self.import_confirm_btn.pack(side="left")
         self.import_confirm_btn.set_disabled(True)
-        tk.Frame(imp_btns, bg=ModernStyle.BG_TERTIARY).pack(side="left", expand=True, fill="x")
-
-        self.import_status = tk.Label(import_inner, text="", fg=ModernStyle.TEXT_SECONDARY, bg=BG_SEC,
-                                      font=ModernStyle.FONT_SMALL_BOLD, justify="left", anchor="w", wraplength=420)
-        self.import_status.pack(fill="x", pady=(2, 0))
+        tk.Frame(dropzone, bg=S.BG_TERTIARY).pack(fill="both", expand=True)
+        self.import_status = tk.Label(csv_tab, text="", fg=S.TEXT_SECONDARY, bg=BG_SEC,
+                                      font=S.FONT_SMALL_BOLD, justify="left", anchor="w", wraplength=420)
+        self.import_status.pack(fill="x", pady=(8, 0))
         self._auto_wrap(self.import_status)
 
-        # ===== Paste Import Card =====
-        paste_card, paste_inner = _card(left, "Paste Import", "📋", bar=ModernStyle.PURPLE_FILL,
-                                        fg=ModernStyle.TEXT_PURPLE, expand_height=True)
-        paste_card.pack(fill="both", expand=True, pady=(0, 5))
-
-        hint_text = tk.Text(paste_inner, height=2, bg=BG_SEC, font=ModernStyle.FONT_SMALL, relief="flat",
+        paste_tab = tk.Frame(imp, bg=BG_SEC)
+        hint_text = tk.Text(paste_tab, height=2, bg=BG_SEC, font=S.FONT_SMALL, relief="flat",
                             highlightthickness=0, wrap="word", cursor="arrow")
-        hint_text.pack(fill="x", pady=(0, 5))
-        hint_text.tag_configure("normal", foreground=ModernStyle.TEXT_SECONDARY)
-        hint_text.tag_configure("highlight", foreground=ModernStyle.TEXT_ACCENT)
+        hint_text.pack(fill="x", pady=(0, 6))
+        hint_text.tag_configure("normal", foreground=S.TEXT_SECONDARY)
+        hint_text.tag_configure("highlight", foreground=S.TEXT_ACCENT)
         hint_text.insert("end", "Tab- or comma-separated", "highlight")
         hint_text.insert("end", " rows with a header: ", "normal")
         hint_text.insert("end", "date, symbol, type, qty, price, [broker], [fee], [trade_id]", "highlight")
         hint_text.config(state="disabled")
 
-        ModernButton(paste_card.header_frame, text="Parse & Preview", command=self._parse_and_preview_pasted,
-                     bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=BG_SEC, width=150,
-                     height=32, font=ModernStyle.FONT_SMALL_BOLD).pack(side="right", padx=(10, 0))
-        ModernButton(paste_card.header_frame, text="Clear", command=self._clear_paste_area, bg=ModernStyle.BG_TERTIARY,
-                     fg=ModernStyle.TEXT_SECONDARY, canvas_bg=BG_SEC, width=80, height=32,
-                     font=ModernStyle.FONT_SMALL_BOLD).pack(side="right")
-
-        self._paste_status = tk.Label(paste_inner, text="", fg=ModernStyle.TEXT_SECONDARY, bg=BG_SEC,
-                                      font=ModernStyle.FONT_SMALL_BOLD, justify="left", anchor="w", wraplength=420)
-        self._paste_status.pack(side="bottom", fill="x", pady=(8, 0))
+        paste_foot = tk.Frame(paste_tab, bg=BG_SEC)
+        paste_foot.pack(side="bottom", fill="x", pady=(10, 0))
+        action_button(paste_foot, "Parse & Preview", self._parse_and_preview_pasted, kind="success",
+                      icon="scan-eye", canvas_bg=BG_SEC).pack(side="right")
+        secondary_button(paste_foot, "Clear", self._clear_paste_area,
+                         canvas_bg=BG_SEC, icon="eraser").pack(side="right", padx=(0, 10))
+        self._paste_status = tk.Label(paste_foot, text="", fg=S.TEXT_SECONDARY, bg=BG_SEC,
+                                      font=S.FONT_SMALL_BOLD, justify="left", anchor="w", wraplength=300)
+        self._paste_status.pack(side="left", fill="x", expand=True)
         self._auto_wrap(self._paste_status)
 
-        ta_frame = tk.Frame(paste_inner, bg=ModernStyle.BORDER_COLOR, padx=1, pady=1)
-        ta_frame.pack(side="top", fill="both", expand=True)
-        ta_scroll = ttk.Scrollbar(ta_frame, orient="vertical")
-        self._paste_area = tk.Text(ta_frame, height=5, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
-                                   font=ModernStyle.FONT_TABLE, relief=tk.FLAT, wrap="none", undo=True,
-                                   insertbackground=ModernStyle.ACCENT_PRIMARY, yscrollcommand=ta_scroll.set)
+        ta_box = RoundedBox(paste_tab)
+        ta_box.pack(side="top", fill="both", expand=True)
+        ta_scroll = ttk.Scrollbar(ta_box, orient="vertical")
+        self._paste_area = tk.Text(ta_box, height=3, bg=S.ENTRY_BG, fg=S.TEXT_PRIMARY,
+                                   font=S.FONT_TABLE, relief=tk.FLAT, wrap="none", undo=True, bd=0,
+                                   highlightthickness=0, insertbackground=S.ACCENT_PRIMARY,
+                                   yscrollcommand=ta_scroll.set)
         ta_scroll.config(command=self._paste_area.yview)
-        self._paste_area.pack(side="left", fill="both", expand=True, padx=6, ipady=3)
-        ta_scroll.pack(side="right", fill="y")
+        ta_scroll.pack(side="right", fill="y", padx=(0, 2), pady=4)
+        self._paste_area.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=6)
+        ta_box.watch(self._paste_area)
+        self._imp_tabs = {"csv": csv_tab, "paste": paste_tab}
 
         # The example rows are only a placeholder (grey); they are never imported.
         self._paste_hint_shown = False
@@ -312,23 +336,23 @@ class TradeEntryView(BaseView):
         def _on_paste_focus_in(_e):
             if self._paste_hint_shown:
                 self._paste_area.delete("1.0", "end")
-                self._paste_area.config(fg=ModernStyle.TEXT_PRIMARY)
+                self._paste_area.config(fg=S.TEXT_PRIMARY)
                 self._paste_hint_shown = False
 
         def _on_paste_focus_out(_e):
             if not self._paste_area.get("1.0", "end-1c").strip():
                 self._show_paste_hint()
-        self._paste_area.bind("<FocusIn>", _on_paste_focus_in)
-        self._paste_area.bind("<FocusOut>", _on_paste_focus_out)
+        self._paste_area.bind("<FocusIn>", _on_paste_focus_in, add="+")
+        self._paste_area.bind("<FocusOut>", _on_paste_focus_out, add="+")
 
-        # ===== Skipped Duplicates Card =====
-        self.dupe_card, dupe_inner = _card(left, "Skipped Duplicates", "⚠️", bar=ModernStyle.WARNING_FILL,
-                                           fg=ModernStyle.WARNING)
+        # ===== Skipped Duplicates Card (shown after an import that skipped some) =====
+        self.dupe_card, dupe_inner = _card(left, "Skipped Duplicates", "Already in your trades, so not imported",
+                                           "triangle-alert", "⚠️", S.WARNING_FILL, S.WARNING_PALE, S.WARNING)
         dupe_cols = ("#", "Date", "Symbol", "Qty", "Why")
         self.dupe_table = ttk.Treeview(dupe_inner, columns=dupe_cols, show="headings", height=6)
         for c, w in zip(dupe_cols, (44, 100, 100, 60, 260)):
-            anchor = "center" if c == "#" else "w"
-            self.dupe_table.heading(c, text=c, anchor=anchor)
+            anchor = "center" if c == "#" else ("e" if c == "Qty" else "w")
+            self.dupe_table.heading(c, text=c, anchor="center")
             self.dupe_table.column(c, width=w, anchor=anchor)
         add_treeview_copy_menu(self.dupe_table)
         vsb = ttk.Scrollbar(dupe_inner, orient="vertical", command=self.dupe_table.yview)
@@ -337,14 +361,15 @@ class TradeEntryView(BaseView):
         vsb.pack(side="right", fill="y")
 
         # ===== Transaction Summary Card (right column) =====
-        self.sum_card, sum_inner = _card(right, "Transaction Summary", "")
+        self.sum_card, sum_inner = _card(right, "Transaction Summary", "Updates as you type", "calculator", "🧮",
+                                         S.INFO_FILL, S.INFO_PALE, S.INFO)
         self.sum_card.pack(fill="x", pady=(0, 14))
 
         def _sum_row(lbl: str, init: str):
             row = tk.Frame(sum_inner, bg=BG_SEC)
-            row.pack(fill="x", pady=6)
-            tk.Label(row, text=lbl, fg=ModernStyle.TEXT_SECONDARY, bg=BG_SEC, font=ModernStyle.FONT_BODY).pack(side="left")
-            val = tk.Label(row, text=init, fg=ModernStyle.TEXT_PRIMARY, bg=BG_SEC, font=ModernStyle.FONT_BODY_BOLD)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=lbl, fg=S.TEXT_SECONDARY, bg=BG_SEC, font=S.FONT_BODY).pack(side="left")
+            val = tk.Label(row, text=init, fg=S.TEXT_PRIMARY, bg=BG_SEC, font=S.FONT_BODY_BOLD)
             val.pack(side="right")
             return val
 
@@ -353,52 +378,63 @@ class TradeEntryView(BaseView):
         self.sum_price_label = _sum_row("Unit price", "—")
         self.sum_subtotal_label = _sum_row("Subtotal", "—")
         self.sum_fee_label = _sum_row("Est. fee", "0.00")
-        tk.Frame(sum_inner, bg=ModernStyle.DIVIDER_COLOR, height=1).pack(fill="x", pady=(8, 6))
-        total_row = tk.Frame(sum_inner, bg=BG_SEC)
-        total_row.pack(fill="x", pady=(4, 0))
-        tk.Label(total_row, text="Total value", fg=ModernStyle.TEXT_PRIMARY, bg=BG_SEC,
-                 font=ModernStyle.FONT_SUBHEADING).pack(side="left")
-        self.sum_total_label = tk.Label(total_row, text="0.00", fg=ModernStyle.SUCCESS, bg=BG_SEC,
-                                        font=ModernStyle.FONT_KPI_VALUE)
-        self.sum_total_label.pack(side="right")
+        # The total on a soft green (BUY) or red (SELL) panel
+        self._sum_total_box = RoundedBox(sum_inner, fill=S.SUCCESS_PALE, border=S.SUCCESS_PALE)
+        self._sum_total_box.pack(fill="x", pady=(10, 0))
+        self._sum_total_title = tk.Label(self._sum_total_box, text="Total value", fg=S.TEXT_PRIMARY,
+                                         bg=S.SUCCESS_PALE, font=S.FONT_BODY_BOLD)
+        self._sum_total_title.pack(side="left", padx=12, pady=10)
+        self.sum_total_label = tk.Label(self._sum_total_box, text="0.00", fg=S.SUCCESS, bg=S.SUCCESS_PALE,
+                                        font=S.FONT_KPI_VALUE)
+        self.sum_total_label.pack(side="right", padx=12, pady=6)
 
         # ===== Portfolio Snapshot Card =====
-        snap_card, snap_inner = _card(right, "Portfolio Snapshot", "📊", bar=ModernStyle.INFO_FILL, fg=ModernStyle.INFO)
-        snap_card.pack(fill="x")
+        snap_card, snap_inner = _card(right, "Portfolio Snapshot", "All brokers, in ₹", "chart-pie", "📊",
+                                      S.PURPLE_FILL, S.ACCENT_PURPLE_PALE, S.TEXT_PURPLE)
+        snap_card.pack(fill="x", pady=(0, 14))
         snap_grid = tk.Frame(snap_inner, bg=BG_SEC)
         snap_grid.pack(fill="both", expand=True)
         snap_grid.grid_columnconfigure(0, weight=1, uniform="snap")
         snap_grid.grid_columnconfigure(1, weight=1, uniform="snap")
         self._snap_labels = {}
 
-        def _snap_tile(row, col, icon, title, key, bar, fg):
-            tile = tk.Frame(snap_grid, bg=ModernStyle.BG_TERTIARY, padx=1, pady=1)
-            tile.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
-            inner = tk.Frame(tile, bg=BG_SEC)
-            inner.pack(fill="both", expand=True, padx=1, pady=1)
-            tk.Frame(inner, bg=bar, height=3).pack(fill="x")
-            tbody = tk.Frame(inner, bg=BG_SEC)
-            tbody.pack(fill="both", expand=True, padx=10, pady=(8, 10))
-            hdr = tk.Frame(tbody, bg=BG_SEC)
-            hdr.pack(fill="x")
-            tk.Label(hdr, text=icon, fg=fg, bg=BG_SEC, font=ModernStyle.FONT_BODY).pack(side="left", padx=(0, 4))
-            tk.Label(hdr, text=title, fg=ModernStyle.TEXT_SECONDARY, bg=BG_SEC,
-                     font=ModernStyle.FONT_KPI_LABEL).pack(side="left")
-            val_lbl = tk.Label(tbody, text="—", fg=fg, bg=BG_SEC, font=ModernStyle.FONT_KPI_VALUE)
-            val_lbl.pack(anchor="w", pady=(4, 0))
+        def _snap_tile(row, col, icon, emoji, title, key, fg):
+            tile = RoundedBox(snap_grid, fill=S.BG_TERTIARY, border=S.BG_TERTIARY, padx=5, pady=5)
+            tile.grid(row=row, column=col, sticky="nsew", padx=(0, 8) if col == 0 else 0, pady=(0, 8) if row == 0 else 0)
+            hdr = tk.Frame(tile, bg=S.BG_TERTIARY)
+            hdr.pack(fill="x", padx=12, pady=(10, 0))
+            _glyph(hdr, icon, emoji, fg, 16, S.BG_TERTIARY).pack(side="left", padx=(0, 6))
+            tk.Label(hdr, text=title, fg=S.TEXT_SECONDARY, bg=S.BG_TERTIARY, font=S.FONT_SMALL_BOLD).pack(side="left")
+            val_lbl = tk.Label(tile, text="—", fg=fg, bg=S.BG_TERTIARY, font=S.FONT_KPI_VALUE)
+            val_lbl.pack(anchor="w", padx=12, pady=(2, 10))
             self._snap_labels[key] = val_lbl
 
-        _snap_tile(0, 0, "📦", "Holdings", "snap_holdings", ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ACCENT)
-        _snap_tile(0, 1, "📥", "Invested", "snap_invested", ModernStyle.SUCCESS_FILL, ModernStyle.SUCCESS)
-        _snap_tile(1, 0, "💼", "Current Value", "snap_current", ModernStyle.INFO_FILL, ModernStyle.INFO)
-        _snap_tile(1, 1, "📈", "Overall P&L", "snap_pnl", ModernStyle.PURPLE_FILL, ModernStyle.TEXT_PURPLE)
-        self._snap_hint = tk.Label(snap_inner, text="", fg=ModernStyle.TEXT_SECONDARY, bg=BG_SEC,
-                                   font=ModernStyle.FONT_BODY_BOLD)
-        self._snap_hint.pack(anchor="w", pady=(6, 0))
+        _snap_tile(0, 0, "layers", "📦", "Holdings", "snap_holdings", S.TEXT_ACCENT)
+        _snap_tile(0, 1, "piggy-bank", "📥", "Invested", "snap_invested", S.SUCCESS)
+        _snap_tile(1, 0, "wallet", "💼", "Current Value", "snap_current", S.INFO)
+        _snap_tile(1, 1, "trending-up", "📈", "Overall P&L", "snap_pnl", S.TEXT_PURPLE)
+        self._snap_hint = tk.Label(snap_inner, text="", fg=S.TEXT_SECONDARY, bg=BG_SEC, font=S.FONT_SMALL_BOLD)
+        self._snap_hint.pack(anchor="w", pady=(8, 0))
+
+        # ===== Recent Trades Card: fills the rest of the column (fewer rows on small windows) =====
+        recent_card, recent_inner = _card(right, "Recent Trades", "The latest ones added", "history", "🕒",
+                                          S.SUCCESS_FILL, S.SUCCESS_PALE, S.SUCCESS, expand_height=True)
+        recent_card.pack(fill="both", expand=True)
+        cols = (("date", "Date", 84, "w"), ("symbol", "Symbol", 104, "w"), ("type", "Type", 70, "w"),
+                ("qty", "Qty", 56, "e"), ("price", "Price", 96, "e"))
+        self.recent_table = ttk.Treeview(recent_inner, columns=[c[0] for c in cols], show="headings", height=1,
+                                         selectmode="browse")
+        for cid, text, width, anchor in cols:
+            self.recent_table.heading(cid, text=text, anchor="center")
+            self.recent_table.column(cid, width=width, minwidth=40, anchor=anchor, stretch=True)
+        self.recent_table.tag_configure("evenrow", background=S.TABLE_ROW_ALT)
+        self.recent_table.tag_configure("oddrow", background=BG_SEC)
+        add_treeview_copy_menu(self.recent_table)
+        self.recent_table.pack(fill="both", expand=True)
 
         # Cards change height as they lay out (or when one is shown): re-fit the scrolling page.
         self._fit_pending = False
-        for card in (manual_card, import_card, paste_card, self.dupe_card, self.sum_card, snap_card):
+        for card in (manual_card, import_card, self.dupe_card, self.sum_card, snap_card, recent_card):
             card.bind("<Configure>", lambda e: self._schedule_fit(), add="+")
 
         # Live updates. The currency follows the broker, and the buttons follow the currency.
@@ -407,6 +443,7 @@ class TradeEntryView(BaseView):
         for v in (self.te_qty_var, self.te_price_var):
             v.trace_add("write", lambda *_: self._update_summary())
 
+        self._show_import_tab("csv")
         self._sync_te_type_buttons()
         self._on_currency_change()
 
@@ -484,34 +521,47 @@ class TradeEntryView(BaseView):
             return 0.0
 
     def _add_currency_buttons(self, currencies) -> None:
+        currencies = [c for c in currencies if (c or "").strip().upper() in ("INR", "JPY")]
         for code in currencies:
             code = (code or "").strip().upper()
             if not code or code in self._cur_btns:
                 continue
-            btn = self._make_toggle(self._currency_btn_frame, code, lambda c=code: self.te_currency_var.set(c), 58)
-            btn.pack(side="left", padx=(0, 6))
+            sym = currency_symbol(code).strip()
+            label_text = f"{sym} {code}".strip()
+            btn = self._make_toggle(self._currency_btn_frame, label_text,
+                                    lambda c=code: self.te_currency_var.set(c), 104)
+            btn.pack(side="left", padx=(0, 8))
             self._cur_btns[code] = btn
         if hasattr(self, "lbl_price"):
             self._sync_currency_buttons()
 
     def _sync_te_type_buttons(self) -> None:
-        """Colour the BUY/SELL toggles."""
+        """Colour the BUY/SELL toggles; the Save button takes the same green or red."""
         if (self.te_type_var.get() or "BUY").upper() == "BUY":
             self.te_buy_btn.set_palette(bg=ModernStyle.SUCCESS_FILL, fg=ModernStyle.TEXT_ON_ACCENT)
-            self.te_sell_btn.set_palette(bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY)
+            self.te_sell_btn.set_palette(bg=self._toggle_off, fg=ModernStyle.TEXT_SECONDARY)
+            self.te_save_btn.set_palette(bg=ModernStyle.SUCCESS_FILL, fg=ModernStyle.TEXT_ON_ACCENT)
         else:
             self.te_sell_btn.set_palette(bg=ModernStyle.ERROR_FILL, fg=ModernStyle.TEXT_ON_ACCENT)
-            self.te_buy_btn.set_palette(bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY)
+            self.te_buy_btn.set_palette(bg=self._toggle_off, fg=ModernStyle.TEXT_SECONDARY)
+            self.te_save_btn.set_palette(bg=ModernStyle.ERROR_FILL, fg=ModernStyle.TEXT_ON_ACCENT)
 
     def _sync_currency_buttons(self) -> None:
         """Colour the currency toggles and show the right symbol on the price label."""
         cur = (self.te_currency_var.get() or "INR").upper()
+        fills = {"INR": ModernStyle.SUCCESS_FILL, "JPY": ModernStyle.PURPLE_FILL}
         for code, btn in self._cur_btns.items():
+            sym = currency_symbol(code).strip()
             if code == cur:
-                btn.set_palette(bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT)
+                btn.set_palette(bg=fills.get(code, ModernStyle.ACCENT_PRIMARY), fg=ModernStyle.TEXT_ON_ACCENT)
+                btn.set_text(f"✓ {sym} {code}")
             else:
-                btn.set_palette(bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY)
-        self.lbl_price.config(text=f"💰 Price ({currency_symbol(cur)})")
+                btn.set_palette(bg=self._toggle_off, fg=ModernStyle.TEXT_SECONDARY)
+                btn.set_text(f"{sym} {code}")
+        self.lbl_price.config(text=f"Price ({currency_symbol(cur).strip()})")
+        glyph = icons.glyph("japanese-yen" if cur == "JPY" else "indian-rupee")
+        if glyph:
+            self._price_icon.config(text=glyph)
 
     def _broker_currencies(self) -> dict:
         try:
@@ -523,7 +573,10 @@ class TradeEntryView(BaseView):
 
     def _on_broker_change(self) -> None:
         cur = self._broker_currencies().get(self.te_broker_var.get())
-        self.te_currency_var.set((cur or "INR").upper())
+        cur = (cur or "INR").upper()
+        if cur not in ("INR", "JPY"):
+            cur = "INR"
+        self.te_currency_var.set(cur)
 
     def _on_currency_change(self) -> None:
         cur = (self.te_currency_var.get() or "INR").upper()
@@ -572,6 +625,53 @@ class TradeEntryView(BaseView):
         if brokers and self.te_broker_var.get() not in brokers:
             self.te_broker_var.set(brokers[0])
         self._load_snapshot()
+        self._load_recent()
+
+    def _show_import_tab(self, key: str) -> None:
+        """Show the CSV or the paste tab of the Import card."""
+        for k, frame in self._imp_tabs.items():
+            btn = self._imp_tab_btns[k]
+            if k == key:
+                frame.pack(fill="both", expand=True)
+                btn.set_palette(bg=ModernStyle.WARNING_FILL, fg=ModernStyle.TEXT_ON_ACCENT)
+            else:
+                frame.pack_forget()
+                btn.set_palette(bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY)
+        self._schedule_fit()
+
+    def _load_recent(self) -> None:
+        """The latest trades added, newest first (in the background)."""
+        self._recent_gen += 1
+        gen = self._recent_gen
+        limit = self._RECENT_ROWS
+
+        def _work():
+            from model.database import db_session
+            with db_session() as conn:
+                return conn.execute("SELECT date, symbol, type, qty, price, currency FROM trades "
+                                    "ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+
+        def _done(rows):
+            if gen == self._recent_gen:
+                self._apply_recent(rows)
+
+        run_in_background(_work, _done, widget=self, name="trade-entry-recent")
+
+    def _apply_recent(self, rows) -> None:
+        tv = self.recent_table
+        tv.delete(*tv.get_children())
+        sides = []
+        for i, (d, sym, t_type, qty, price, cur) in enumerate(rows):
+            try:
+                shown = datetime.strptime(str(d)[:10], "%Y-%m-%d").strftime("%d %b %y")
+            except ValueError:
+                shown = str(d)
+            is_buy = str(t_type).upper() == "BUY"
+            iid = tv.insert("", "end", values=(shown, sym, "▲ BUY" if is_buy else "▼ SELL", f"{float(qty or 0):g}",
+                                               format_money(float(price or 0), (cur or "INR").upper())),
+                            tags=("evenrow" if i % 2 == 0 else "oddrow", "buy" if is_buy else "sell"))
+            sides.append((iid, is_buy))
+        color_buy_sell(tv, sides, ("type", "qty", "price"))   # only these say Buy / Sell
 
     def _load_snapshot(self) -> None:
         """Portfolio KPIs in the background; only the newest result is shown."""
@@ -653,12 +753,15 @@ class TradeEntryView(BaseView):
         tint = ModernStyle.SUCCESS_PALE if t_type == "BUY" else ModernStyle.ERROR_PALE
         if tint != self._sum_tint:   # only when BUY/SELL changes (each change redraws the window)
             self._sum_tint = tint
-            self.sum_card.content.configure(bg=tint)
+            self._sum_total_box.set_fill(tint)
+            self._sum_total_box.configure(bg=tint)
+            self._sum_total_title.configure(bg=tint)
+            self.sum_total_label.configure(bg=tint)
 
         if cur == "INR":
-            self.te_fee_label.config(text=f"💸  Estimated Fee: {format_money(fee, cur)}")
+            self.te_fee_label.config(text=f"Estimated fee {format_money(fee, cur)}")
         else:
-            self.te_fee_label.config(text="💸  Estimated Fee: none (Indian charges apply to INR trades only)")
+            self.te_fee_label.config(text=f"No fee estimate for {cur} trades")
         self.sum_type_label.config(text=t_type, fg=color)
         self.sum_qty_label.config(text=f"{qty:g}" if qty > 0 else "—")
         self.sum_price_label.config(text=format_money(price, cur) if price > 0 else "—")
@@ -699,7 +802,7 @@ class TradeEntryView(BaseView):
         try:
             trade_day = datetime.strptime(date, "%Y-%m-%d").date()
         except ValueError:
-            return self._toast(f"'{date}' isn't a date. Use year-month-day, like 2024-01-15.")
+            return self._toast(f"'{date}' isn't a date. Type it like 15 Jan 2024, or pick it with 📅.")
         if trade_day > _date.today():
             return self._toast("The date is in the future.")
         if not symbol:
@@ -739,12 +842,8 @@ class TradeEntryView(BaseView):
 
         def _saved(_):
             self._set_saving(False)
-            self._toast(f"Saved {t_type} {symbol}", "success")
-            self.recent_trades_label.config(
-                text=f"✓ {datetime.now().strftime('%H:%M:%S')} - Saved {t_type} {qty:g} {symbol} @ {format_money(price, cur)}")
-            if not self.recent_trades_label.winfo_ismapped():
-                self.recent_trades_label.pack(anchor="w", pady=(10, 0))
-                self._schedule_fit()
+            self._toast(f"Saved {t_type} {qty:g} {symbol} @ {format_money(price, cur)}", "success")
+            self._load_recent()
             self._clear_form()
             app_state = self.app_state
 
@@ -873,26 +972,26 @@ class TradeEntryView(BaseView):
         broker_currencies = self._broker_currencies()
 
         top = tk.Toplevel(self)
+        top.withdraw()   # built hidden, then shown centred with a short fade
         self._import_preview_win = top
         top.title("Bulk Import Preview")
         ModernStyle.style_modal(top)
-        top.geometry("1060x660")
         top.minsize(820, 520)
         try:
             top.transient(self.winfo_toplevel())
-            top.grab_set()
         except tk.TclError:
             pass
-        center_window(top, parent=self.winfo_toplevel())
+        place_centered(top, min(1060, top.winfo_screenwidth() - 60), min(660, top.winfo_screenheight() - 100),
+                       self.winfo_toplevel())
 
         BG = ModernStyle.BG_PRIMARY
-        tk.Frame(top, bg=ModernStyle.SUCCESS_FILL, height=4).pack(fill="x")
-        hdr = tk.Frame(top, bg=BG)
-        hdr.pack(fill="x", padx=16, pady=(12, 6))
-        tk.Label(hdr, text="Bulk Import • Preview", fg=ModernStyle.TEXT_PRIMARY, bg=BG,
-                 font=ModernStyle.FONT_TITLE).pack(anchor="w")
-        tk.Label(hdr, text=f"{origin} • {len(df):,} rows. Nothing is saved until you press Import.",
-                 fg=ModernStyle.TEXT_SECONDARY, bg=BG, font=ModernStyle.FONT_BODY).pack(anchor="w")
+        # The same banner as the other pop-ups: a frosted icon tile, the title and a subtitle
+        banner = GradientHeader(top, title="Import Preview",
+                                subtitle=f"{origin}  ·  {len(df):,} rows. Nothing is saved until you press Import.",
+                                height=62, icon="file-spreadsheet" if source == "csv" else "clipboard-paste")
+        banner.pack(fill="x")
+        banner.set_icon_fill("#22C55E" if source == "csv" else "#F97316")
+        tk.Frame(top, bg=BG, height=12).pack(fill="x")
 
         body = tk.Frame(top, bg=BG)
         body.pack(fill="both", expand=True, padx=16, pady=(0, 14))
@@ -902,11 +1001,15 @@ class TradeEntryView(BaseView):
         opts.pack(fill="x", pady=(0, 6))
         btn_box = tk.Frame(opts, bg=BG)
         btn_box.pack(side="right")
-        tk.Label(opts, text="🏦  Broker for rows without one:" if has_broker else "🏦  Broker:",
-                 fg=ModernStyle.TEXT_SECONDARY, bg=BG, font=ModernStyle.FONT_HEADING).pack(side="left")
+        broker_glyph = icons.glyph("landmark")
+        tk.Label(opts, text=broker_glyph or "🏦", fg=ModernStyle.TEXT_ACCENT, bg=BG,
+                 font=icons.font(18) if broker_glyph else ModernStyle.FONT_HEADING).pack(side="left", padx=(0, 6))
+        tk.Label(opts, text="Broker for rows without one:" if has_broker else "Broker:",
+                 fg=ModernStyle.TEXT_SECONDARY, bg=BG, font=ModernStyle.FONT_FIELD_LABEL).pack(side="left")
         broker_var = tk.StringVar(value=self.te_broker_var.get() if self.te_broker_var.get() in self._brokers else "")
         box, broker_cb = rounded_combobox(opts, textvariable=broker_var, state="readonly", width=18,
                                           values=self._brokers)
+        add_broker_logos(box, broker_cb)
         box.pack(side="left", padx=(8, 12))
         currency_lbl = tk.Label(opts, text="", fg=ModernStyle.TEXT_SECONDARY, bg=BG, font=ModernStyle.FONT_BODY)
         currency_lbl.pack(side="left")
@@ -940,12 +1043,14 @@ class TradeEntryView(BaseView):
         style.configure("BulkPreview.Treeview.Heading", font=ModernStyle.FONT_TABLE_BOLD)
         tv = ttk.Treeview(table, style="BulkPreview.Treeview", columns=cols, show="headings", height=12)
         for c, w in zip(cols, widths):
-            tv.heading(c, text=c, anchor="w")
-            tv.column(c, width=w, minwidth=40, anchor="w", stretch=(c == "Status"))
-        tv.tag_configure("BUY", foreground=ModernStyle.SUCCESS)
-        tv.tag_configure("SELL", foreground=ModernStyle.ERROR)
+            anchor = "center" if c == "#" else ("e" if c in ("Qty", "Price", "Fee") else "w")   # numbers line up
+            tv.heading(c, text=c, anchor="center")
+            tv.column(c, width=w, minwidth=40, anchor=anchor, stretch=(c == "Status"))
+        logo_column(tv, "#", "Broker")   # a "Src" column with each row's broker logo
+        fit_columns(tv, dict(zip(cols, widths)))   # all columns inside the popup's width
         tv.tag_configure("rejected", background=ModernStyle.ERROR_PALE, foreground=ModernStyle.ERROR)
         tv.tag_configure("dupe", background=ModernStyle.WARNING_PALE, foreground=ModernStyle.WARNING)
+        enhance_table(tv, stripes=None)   # highlight under the mouse, click a heading to sort
         add_treeview_copy_menu(tv)
         vsb = ttk.Scrollbar(table, orient="vertical", command=tv.yview)
         hsb = ttk.Scrollbar(table, orient="horizontal", command=tv.xview)
@@ -968,12 +1073,12 @@ class TradeEntryView(BaseView):
             if not state["busy"]:
                 top.destroy()
         top.protocol("WM_DELETE_WINDOW", _close)
+        top.bind("<Escape>", lambda _e: _close())
 
-        close_btn = ModernButton(btn_box, text="Close", command=_close, bg=ModernStyle.NEUTRAL_FILL,
-                                 fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=BG, width=96, height=36)
+        close_btn = secondary_button(btn_box, "✕ Close", _close, canvas_bg=BG)
         close_btn.pack(side="right")
-        import_btn = ModernButton(btn_box, text="Import", command=lambda: _import(), bg=ModernStyle.SUCCESS_FILL,
-                                  fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=BG, width=190, height=36, disabled=True)
+        import_btn = action_button(btn_box, "Import", lambda: _import(), kind="success", width=190,
+                                   canvas_bg=BG, disabled=True)
         import_btn.pack(side="right", padx=(0, 10))
 
         def _trade_values(t):
@@ -1016,8 +1121,13 @@ class TradeEntryView(BaseView):
             for d in r.duplicates:
                 tv.insert("", "end", iid=f"d{d.row}", tags=("dupe",),
                           values=(d.row, _dupe_status(d)) + _trade_values(d.trade))
-            for row_no, t in list(zip(r.valid_rows, r.valid))[:PREVIEW_READY_ROWS]:
+            ready = list(zip(r.valid_rows, r.valid))[:PREVIEW_READY_ROWS]
+            for row_no, t in ready:
                 tv.insert("", "end", iid=f"v{row_no}", tags=(t[4],), values=(row_no, "✓ Ready") + _trade_values(t))
+            # Only Type, Qty and Price say Buy / Sell (rejected and duplicate rows keep their colours)
+            color_buy_sell(tv, [(f"v{row_no}", {"BUY": True, "SELL": False}.get(str(t[4]).upper()))
+                                for row_no, t in ready])
+            show_logos(tv)
 
             n_saved, n_rep = r.duplicate_count("saved"), r.duplicate_count("file")
             saved_chk.config(text=f"Skip the {n_saved} row{'s that match' if n_saved != 1 else ' that matches'} "
@@ -1137,6 +1247,14 @@ class TradeEntryView(BaseView):
         broker_cb.bind("<<ComboboxSelected>>", _validate)
         _validate()
 
+        def _reveal_preview():
+            top.deiconify()
+            try:
+                top.grab_set()
+            except tk.TclError:
+                pass
+        top.after_idle(_reveal_preview)
+
     def _finish_import(self, inserted: int, skipped: list, rejected: int, source: str = "csv") -> None:
         parts = [f"✅ Imported {inserted} trade{'s' if inserted != 1 else ''}."]
         if skipped:
@@ -1153,11 +1271,12 @@ class TradeEntryView(BaseView):
             self._paste_status.config(text=text, fg=ModernStyle.SUCCESS)
         else:
             self.import_status.config(text=text, fg=ModernStyle.SUCCESS)
-            self.import_path_label.config(text="Select a CSV file to import trades")
+            self.import_path_label.config(text=self._CSV_PROMPT)
         self._set_dupes([(d.trade[2], d.trade[3], d.trade[5], d.reason) for d in skipped])
         if inserted > 0:
             self._invalidate_other_views()
             self._load_snapshot()
+            self._load_recent()
 
     def _set_dupes(self, dupes: list) -> None:
         children = self.dupe_table.get_children()

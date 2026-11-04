@@ -1,7 +1,13 @@
+from __future__ import annotations   # pandas is only needed once data is loaded
+
 import threading
 from dataclasses import dataclass
-import pandas as pd
+from typing import TYPE_CHECKING
+
 from model.database import db_session
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 @dataclass(frozen=True)
@@ -37,8 +43,10 @@ class DataCache:
         self._version = 0
         self._loaded = False
 
-        self._holdings_df = pd.DataFrame()
-        self._trades_df = pd.DataFrame()
+        # Filled by refresh_from_db (None until then). pandas is imported there, not
+        # when the app starts: it takes about half a second to load.
+        self._holdings_df = None
+        self._trades_df = None
 
     @property
     def version(self) -> int:
@@ -52,6 +60,7 @@ class DataCache:
 
     def refresh_from_db(self) -> None:
         """Reload all cached datasets from SQLite."""
+        import pandas as pd
         with db_session() as conn:
             holdings_query = """
                 SELECT
@@ -117,6 +126,7 @@ class DataCache:
 
     def get_holdings_filtered(self, filters: HoldingsFilters) -> tuple[pd.DataFrame, dict]:
         """Return (filtered_df, summary_dict)."""
+        import pandas as pd
         with self._lock:
             df0 = self._holdings_df
 
@@ -175,6 +185,7 @@ class DataCache:
 
     def get_tradehistory_filtered(self, filters: TradeHistoryFilters) -> tuple[pd.DataFrame, dict]:
         """Return (filtered_df, summary_dict)."""
+        import pandas as pd
         with self._lock:
             df0 = self._trades_df
 

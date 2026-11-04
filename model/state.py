@@ -25,19 +25,20 @@ class AppState:
     def get_brokers_cached(self, *, force_refresh: bool = False) -> list[str]:
         """Return broker list, using an in-memory cache when possible."""
         if force_refresh or self.brokers_cache is None:
-            import model.crud as crud
-            self.brokers_cache = crud.get_all_brokers()
-            self.broker_currencies_cache = crud.get_broker_currencies()
-            self.brokers_cache_version += 1
+            self._load_brokers()
         return self.brokers_cache
+
+    def _load_brokers(self) -> None:
+        import model.crud as crud
+        from ui.broker_logos import ordered
+        self.brokers_cache = ordered(crud.get_all_brokers())   # Bahee-Kite, ICICI, … (Settings order)
+        self.broker_currencies_cache = crud.get_broker_currencies()
+        self.brokers_cache_version += 1
 
     def get_broker_currencies_cached(self, *, force_refresh: bool = False) -> dict[str, str]:
         """Return broker to currency dictionary, using cache when possible."""
         if force_refresh or self.broker_currencies_cache is None:
-            import model.crud as crud
-            self.brokers_cache = crud.get_all_brokers()
-            self.broker_currencies_cache = crud.get_broker_currencies()
-            self.brokers_cache_version += 1
+            self._load_brokers()
         return self.broker_currencies_cache
 
     def init_data_cache(self) -> None:

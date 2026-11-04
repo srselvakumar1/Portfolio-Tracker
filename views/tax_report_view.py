@@ -13,12 +13,14 @@ from datetime import datetime
 
 from views.base_view import BaseView
 from ui.ui_theme import ModernStyle
-from ui.ui_utils import add_treeview_copy_menu, treeview_sort_column, run_in_background, format_money, format_date
+from ui.broker_logos import logo_column, show_logos
+from ui.ui_widgets import EmptyState, ModernButton, kpi_card
+from ui.ui_utils import add_treeview_copy_menu, color_gain_loss, treeview_sort_column, run_in_background, format_money, format_date
 from model.applog import log
 from model.database import db_session
 from model.tax import compute_realised_gains, LONG_TERM, SHORT_TERM
 
-CURRENCIES = ("All", "INR", "JPY")
+CURRENCIES = ("INR", "JPY")
 _SYMBOLS = {"INR": "₹", "JPY": "¥", "USD": "$", "GBP": "£", "CNY": "¥"}
 
 
@@ -65,7 +67,8 @@ def fit_columns(tree, prefs: dict, drop_order=(), min_scale: float = 0.86) -> No
     state = {"w": 0}
 
     def _on_configure(e):
-        w = e.width - 4
+        logo = getattr(tree, "_logo_cols", None)   # the "Src" logo column takes room too
+        w = e.width - 4 - (int(tree.column("#0", "width")) if logo else 0)
         if w < 100 or abs(w - state["w"]) < 6:
             return
         state["w"] = w
@@ -73,7 +76,8 @@ def fit_columns(tree, prefs: dict, drop_order=(), min_scale: float = 0.86) -> No
         for c in drop_order:
             if sum(prefs[x] for x in cols) * min_scale <= w:
                 break
-            cols.remove(c)
+            if c in cols:
+                cols.remove(c)
         scale = w / sum(prefs[x] for x in cols)
         tree.configure(displaycolumns=cols)
         for c in cols:
@@ -83,23 +87,31 @@ def fit_columns(tree, prefs: dict, drop_order=(), min_scale: float = 0.86) -> No
 
 
 class CurrencyToggle(tk.Frame):
-    """[All | INR | JPY] pill for the gradient header (keeps its own colours).
+    """[₹ INR | ¥ JPY] pill buttons for headers and filter bars (radius=14 pill shape).
 
     Clicking only sets `variable`; whoever owns the variable reacts to it
     (one trace), so a click loads the data once.
     """
 
-    def __init__(self, parent, variable: tk.StringVar, options=CURRENCIES):
-        super().__init__(parent, bg=ModernStyle.BG_SECONDARY, padx=3, pady=3)
-        self._ignore_sync_bg = True          # the header must not recolour it
+    def __init__(self, parent, variable: tk.StringVar, options=CURRENCIES, bg=None):
+        try:
+            canvas_bg = bg or str(parent.cget("bg"))
+        except Exception:
+            canvas_bg = ModernStyle.BG_PRIMARY
+        super().__init__(parent, bg=canvas_bg)
         self._var = variable
-        self._labels = {}
+        self._buttons = {}
         for opt in options:
-            lbl = tk.Label(self, text=opt, font=ModernStyle.FONT_BODY_BOLD,
-                           padx=12, pady=3, cursor="hand2")
-            lbl.pack(side="left", padx=(0, 2) if opt != options[-1] else 0)
-            lbl.bind("<Button-1>", lambda _e, v=opt: self._pick(v))
-            self._labels[opt] = lbl
+            sym = currency_symbol(opt).strip()
+            label_text = f"{sym} {opt}".strip()
+            btn = ModernButton(
+                self, text=label_text, command=lambda v=opt: self._pick(v),
+                bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+                canvas_bg=canvas_bg, width=86, height=32, radius=14,
+                font=ModernStyle.FONT_BODY_BOLD,   # like every currency toggle
+            )
+            btn.pack(side="left", padx=(0, 6) if opt != options[-1] else 0)
+            self._buttons[opt] = btn
         variable.trace_add("write", lambda *_: self._paint())
         self._paint()
 
@@ -109,11 +121,25 @@ class CurrencyToggle(tk.Frame):
 
     def _paint(self):
         current = self._var.get()
-        for opt, lbl in self._labels.items():
+        fills = {"INR": ModernStyle.SUCCESS_FILL, "JPY": ModernStyle.PURPLE_FILL}
+        for opt, btn in self._buttons.items():
+            sym = currency_symbol(opt).strip()
             if opt == current:
-                lbl.config(bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT)
+                btn.set_palette(bg=fills.get(opt, ModernStyle.ACCENT_PRIMARY), fg=ModernStyle.TEXT_ON_ACCENT)
+                btn.set_text(f"✓ {sym} {opt}".strip())
             else:
-                lbl.config(bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY)
+                btn.set_palette(bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT)
+                btn.set_text(f"{sym} {opt}".strip())
+
+    def sync_gradient_bg(self, color: str):
+        """Let the GradientHeader sync our background to the gradient."""
+        try:
+            self.config(bg=color)
+        except Exception:
+            pass
+        for btn in self._buttons.values():
+            if hasattr(btn, 'set_canvas_bg'):
+                btn.set_canvas_bg(color)
 
 
 def build_table_rows(res, disp: str) -> list:
@@ -145,7 +171,7 @@ class MenuPill(tk.Label):
     """
 
     def __init__(self, parent, *, values, variable=None, text="", command=None):
-        super().__init__(parent, font=ModernStyle.FONT_BODY_BOLD, bg=ModernStyle.BG_SECONDARY,
+        super().__init__(parent, font=ModernStyle.FONT_BODY, bg=ModernStyle.BG_SECONDARY,
                          fg=ModernStyle.TEXT_PRIMARY, padx=14, pady=5, cursor="hand2")
         self._ignore_sync_bg = True          # the header must not recolour it
         self._var, self._command = variable, command
@@ -207,7 +233,7 @@ class TaxReportView(BaseView):
     # ── layout ───────────────────────────────────────────────────────────────
     def build(self):
         self._current_fy = tk.StringVar(value=self._current_fy_val)
-        self._current_currency = tk.StringVar(value="All")
+        self._current_currency = tk.StringVar(value="INR")
 
         self._content = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
         self._content.pack(fill="both", expand=True)
@@ -225,7 +251,7 @@ class TaxReportView(BaseView):
         def _build_right(parent):
             CurrencyToggle(parent, self._current_currency).pack(side="left", padx=(0, 14))
             tk.Label(parent, text="Year:", bg=parent.cget("bg"), fg=ModernStyle.HEADER_FG,
-                     font=ModernStyle.FONT_BODY_BOLD).pack(side="left", padx=(0, 6))
+                     font=ModernStyle.FONT_BODY).pack(side="left", padx=(0, 6))
             MenuPill(parent, values=self._fy_options_list, variable=self._current_fy).pack(side="left")
 
         self.add_gradient_header(
@@ -238,6 +264,7 @@ class TaxReportView(BaseView):
     def _build_summary(self):
         bar = tk.Frame(self._content, bg=ModernStyle.BG_PRIMARY)
         bar.pack(fill="x", padx=20, pady=(10, 0))
+        icons = {"short": "hourglass", "long": "calendar-clock", "other": "coins", "net": "calculator"}
         specs = [
             ("short", "Short-term gains", "held 12 months or less", ModernStyle.WARNING_FILL, ModernStyle.WARNING),
             ("long", "Long-term gains", "held over 12 months", ModernStyle.INFO_FILL, ModernStyle.INFO),
@@ -245,20 +272,14 @@ class TaxReportView(BaseView):
             ("net", "Net realised gains", "before exemptions", ModernStyle.ACCENT_PRIMARY, ModernStyle.TEXT_ACCENT),
         ]
         self._stat = {}
-        for col, (key, title, caption, bar_fill, title_fg) in enumerate(specs):
+        for col, (key, title, caption, bar_fill, _title_fg) in enumerate(specs):
             bar.grid_columnconfigure(col, weight=1, uniform="taxstats")
-            card = tk.Frame(bar, bg=ModernStyle.BG_SECONDARY, highlightthickness=1,
-                            highlightbackground=ModernStyle.BORDER_COLOR)
+            card, body, _title = kpi_card(bar, title, bar_fill, icons[key])
             card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == 3 else 5))
-            tk.Frame(card, bg=bar_fill, width=5).pack(side="left", fill="y")
-            body = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
-            body.pack(side="left", fill="both", expand=True, padx=14, pady=10)
-            tk.Label(body, text=title, bg=ModernStyle.BG_SECONDARY, fg=title_fg,
-                     font=ModernStyle.FONT_KPI_LABEL, anchor="w").pack(fill="x")
-            value = tk.Label(body, text="…", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY,
+            value = tk.Label(body, text="…", bg=card.tint, fg=ModernStyle.TEXT_PRIMARY,
                              font=ModernStyle.FONT_KPI_VALUE, anchor="w")
             value.pack(fill="x", pady=(2, 0))
-            tk.Label(body, text=caption, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY,
+            tk.Label(body, text=caption, bg=card.tint, fg=ModernStyle.TEXT_SECONDARY,
                      font=ModernStyle.FONT_SMALL, anchor="w").pack(fill="x")
             self._stat[key] = value
         self._stat_bar = bar
@@ -312,8 +333,8 @@ class TaxReportView(BaseView):
 
         head = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
         head.pack(fill="x", padx=16, pady=(10, 6))
-        tk.Label(head, text="Realised sales", font=ModernStyle.FONT_HEADING,
-                 bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_ACCENT).pack(side="left")
+        tk.Label(head, text="Realised sales", font=ModernStyle.FONT_CARD_TITLE,
+                 bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(side="left")
         self._caption = tk.Label(head, text="Calculating…", font=ModernStyle.FONT_BODY,
                                  bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY)
         self._caption.pack(side="left", padx=(12, 0))
@@ -328,17 +349,16 @@ class TaxReportView(BaseView):
         self.tv = ttk.Treeview(tv_frame, columns=self.COLUMNS, show="headings", height=15, style="Tax.Treeview")
         widths = {"#": 46, "Broker": 110, "Symbol": 120, "Buy date": 100, "Sell date": 100, "Qty": 60,
                   "Buy price": 105, "Sell price": 105, "Days held": 85, "Term": 105, "Gain / loss": 130}
-        right = {"Qty", "Buy price", "Sell price", "Days held", "Gain / loss"}
+        right = {"Qty", "Buy price", "Sell price", "Days held"}   # Gain / loss has a ▲/▼, so on the left
         for c in self.COLUMNS:
             anchor = "e" if c in right else ("center" if c == "#" else "w")
-            self.tv.heading(c, text=c, anchor=anchor, command=lambda col=c: treeview_sort_column(self.tv, col, False))
+            self.tv.heading(c, text=c, anchor="center", command=lambda col=c: treeview_sort_column(self.tv, col, False))
             self.tv.column(c, anchor=anchor, width=widths[c], minwidth=30, stretch=False)
+        logo_column(self.tv, "#", "Broker")   # each sale starts with its broker's logo
         # Narrow window: hide the price columns first (Copy All Rows still copies them)
-        fit_columns(self.tv, widths, drop_order=("Buy price", "Sell price", "Days held", "#"))
+        fit_columns(self.tv, widths, drop_order=("Buy price", "Sell price", "Days held"))
         add_treeview_copy_menu(self.tv)
 
-        self.tv.tag_configure("gain", foreground=ModernStyle.SUCCESS)
-        self.tv.tag_configure("loss", foreground=ModernStyle.ERROR)
         self.tv.tag_configure("flat", foreground=ModernStyle.TEXT_PRIMARY)
         self.tv.tag_configure("problem", foreground=ModernStyle.WARNING)
         self.tv.tag_configure("even", background=ModernStyle.BG_SECONDARY)
@@ -350,8 +370,7 @@ class TaxReportView(BaseView):
         vsb.pack(side="right", fill="y")
 
         # Shown over the table when the year has no sales
-        self._empty = tk.Label(tv_frame, text="", font=ModernStyle.FONT_EMPTY_STATE, justify="center",
-                               bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY)
+        self._empty = EmptyState(tv_frame, bg=ModernStyle.BG_SECONDARY)
 
     # ── data ─────────────────────────────────────────────────────────────────
     @staticmethod
@@ -418,7 +437,7 @@ class TaxReportView(BaseView):
         for key in self._stat:
             self._set_stat(key, None, "INR")
         self.tv.delete(*self.tv.get_children())
-        self._empty.place_forget()
+        self._empty.hide()
         self._caption.config(text="Not available")
         self._show_notes([("error", f"✖  The report could not be worked out: {err}. "
                                     "Nothing below is up to date. The details are in the app log.")])
@@ -427,9 +446,12 @@ class TaxReportView(BaseView):
         if seq != self._load_seq:
             return  # a newer report replaced this one
         chunk = 1000 if start == 0 else 2500
+        added = []
         for i in range(start, min(start + chunk, len(table_rows))):
             values, tag = table_rows[i]
-            self.tv.insert("", "end", values=(i + 1,) + values, tags=("odd" if i % 2 else "even", tag))
+            added.append(self.tv.insert("", "end", values=(i + 1,) + values, tags=("odd" if i % 2 else "even", tag)))
+        show_logos(self.tv, added)
+        color_gain_loss(self.tv, ("Gain / loss",), added)
         if start + chunk < len(table_rows):
             self.after(1, lambda: self._fill_table(table_rows, seq, start + chunk))
 
@@ -487,10 +509,11 @@ class TaxReportView(BaseView):
         if not table_rows:
             which = "" if currency == "All" else f" ({currency})"
             if fy_str.startswith("FY "):
-                msg = f"No realised sales in {fy_str}{which}.\nShares you sell during this year will be listed here."
+                self._empty.show("🧾", f"No sales in {fy_str}{which}",
+                                 "Shares you sell during this year are listed here, with the tax on each.",
+                                 "↺ Show all years", lambda: self._current_fy.set("All Time"))
             else:
-                msg = f"No realised sales yet{which}.\nShares you sell will be listed here."
-            self._empty.config(text=msg)
-            self._empty.place(relx=0.5, rely=0.45, anchor="center")
+                self._empty.show("🧾", f"No sales yet{which}",
+                                 "Shares you sell are listed here, with the tax on each sale.")
         else:
-            self._empty.place_forget()
+            self._empty.hide()

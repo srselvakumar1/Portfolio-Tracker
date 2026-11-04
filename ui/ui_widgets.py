@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import tkinter as tk
 from typing import Callable, Optional
 from pathlib import Path
@@ -113,14 +114,15 @@ class ModernEntry(tk.Entry):
             self.delete(0, tk.END)
             self.insert(0, val.replace(',', ''))
             
-        self.config(fg=self.normal_color)
+        if str(self.cget("fg")) != self.normal_color:
+            self.config(fg=self.normal_color)
         self._check_clear_btn()
-        
-        # 2. Smooth border fading via ui_utils
+        # 2. The focus ring colour, at once and only where a ring is shown (inside a rounded
+        #    box it is not): it used to fade in 10 steps, and each step redrew the window
         try:
-            from .ui_utils import fade_color_transition
-            fade_color_transition(self, self.highlight_bg_color, self.highlight_color, attr='highlightcolor', duration_ms=100)
-        except Exception:
+            if int(self.cget("highlightthickness")) > 0:
+                self.config(highlightcolor=self.highlight_color)
+        except (tk.TclError, ValueError):
             pass
     
     def _on_focus_out(self, event=None):
@@ -148,37 +150,57 @@ class ModernEntry(tk.Entry):
 class RoundedBox(tk.Frame):
     """A 1-px bordered box with rounded corners for input fields.
 
-    It behaves like the plain bordered Frame it replaces: its bg is the border
-    colour, so ``configure(bg=...)`` and ``cget("bg")`` still set and read the
-    border (focus and error colours keep working). Pack the field inside it.
-    Four tiny canvases drawn over the corners round them off.
+    It behaves like the plain bordered Frame it replaces: ``configure(bg=...)``
+    and ``cget("bg")`` set and read the border colour (focus and error colours
+    keep working). Pack the field inside it. One canvas behind the field draws
+    the rounded border and the inside colour, so padding around the field shows
+    the field colour, not grey bars. (Eight separate border and corner pieces per
+    box made forms with many fields take seconds to open.)
     """
-    R = 6
+    R = ModernStyle.RADIUS_INPUT
 
     def __init__(self, parent, fill: str | None = None, border: str | None = None, **kw):
-        kw.setdefault("padx", 1)
-        kw.setdefault("pady", 1)
-        self._corners = []
-        super().__init__(parent, bg=border or ModernStyle.BORDER_COLOR, **kw)
+        # The border is drawn on this ring around the field (the field covers the rest)
+        kw.setdefault("padx", 2)
+        kw.setdefault("pady", 2)
+        self._rest = border or ModernStyle.INPUT_BORDER   # the colour when not focused
+        self._border = self._rest
         self._fill = fill or ModernStyle.ENTRY_BG
-        r = self.R
-        for pos, place in (("nw", dict(x=0, y=0)), ("ne", dict(relx=1, x=-r, y=0)),
-                           ("sw", dict(x=0, rely=1, y=-r)), ("se", dict(relx=1, rely=1, x=-r, y=-r))):
-            c = tk.Canvas(self, width=r, height=r, highlightthickness=0, bd=0)
-            c.place(**place)
-            self._corners.append((pos, c))
-        self._paint()
-        # Keep the corners above the field (Canvas.lift means "raise an item", so use Misc.lift)
-        self.bind("<Map>", lambda _e: [tk.Misc.lift(c) for _, c in self._corners], add="+")
+        self._shape = None
+        super().__init__(parent, bg=self._fill, **kw)
+        try:
+            outer = parent._fill if isinstance(parent, RoundedBox) else str(parent.cget("bg"))
+        except tk.TclError:
+            outer = ModernStyle.BG_PRIMARY
+        self._canvas = tk.Canvas(self, bg=outer, highlightthickness=0, bd=0)
+        # bordermode "outside": over the padding ring too (inside it, the field hid the border)
+        self._canvas.place(x=0, y=0, relwidth=1, relheight=1, bordermode="outside")
+        tk.Misc.lower(self._canvas)   # behind the field (Canvas.lower means "lower an item")
+        self._canvas.bind("<Configure>", lambda e: self._paint(e.width, e.height))
 
     def configure(self, cnf=None, **kw):
-        res = super().configure(cnf, **kw)
-        if self._corners and ("bg" in kw or "background" in kw or
-                              (isinstance(cnf, dict) and ("bg" in cnf or "background" in cnf))):
+        # bg / background mean the border colour; the inside keeps the field colour
+        if cnf is None and not kw:
+            return super().configure()
+        cnf = dict(cnf) if isinstance(cnf, dict) else cnf
+        new_border = kw.pop("bg", None) or kw.pop("background", None)
+        if isinstance(cnf, dict):
+            new_border = cnf.pop("bg", None) or cnf.pop("background", None) or new_border
+        res = super().configure(cnf, **kw) if (cnf or kw) else None
+        if new_border and getattr(self, "_canvas", None) is not None:
+            # The plain border colour (what callers set when a field loses focus) means "at rest"
+            self._border = self._rest if new_border == ModernStyle.BORDER_COLOR else new_border
             self._paint()
         return res
 
     config = configure
+
+    def cget(self, key):
+        if key in ("bg", "background") and getattr(self, "_canvas", None) is not None:
+            return self._border
+        return super().cget(key)
+
+    __getitem__ = cget
 
     def watch(self, widget: tk.Misc) -> None:
         """Border in the accent colour while `widget` has the keyboard (red errors are kept)."""
@@ -192,30 +214,507 @@ class RoundedBox(tk.Frame):
         widget.bind("<FocusIn>", _in, add="+")
         widget.bind("<FocusOut>", _out, add="+")
 
+    def set_fill(self, color: str) -> None:
+        """Change the inside colour (the border keeps its own)."""
+        self._fill = color
+        tk.Frame.configure(self, bg=color)
+        self._paint()
+
+    def _paint(self, w: int | None = None, h: int | None = None) -> None:
+        c = self._canvas
+        w = w or c.winfo_width()
+        h = h or c.winfo_height()
+        if w < 3 or h < 3:
+            return
+        # 2 px while focused (accent) or wrong (red), 1 px at rest
+        lw = 2 if self._border in (ModernStyle.ACCENT_PRIMARY, ModernStyle.ERROR) else 1
+        # The line runs 1 px inside the edge: macOS draws canvas lines half a pixel to the
+        # right and down, so a line on the very edge lost its right and bottom sides
+        o = 1
+        r, e, b = min(self.R, w // 2, h // 2), w - o, h - o
+        pts = (o + r, o, o + r, o, e - r, o, e - r, o, e, o, e, o + r, e, o + r, e, b - r, e, b - r, e, b,
+               e - r, b, e - r, b, o + r, b, o + r, b, o, b, o, b - r, o, b - r, o, o + r, o, o + r, o, o)
+        if self._shape is None:
+            self._shape = c.create_polygon(*pts, smooth=True, fill=self._fill, outline=self._border, width=lw)
+        else:
+            c.coords(self._shape, *pts)
+            c.itemconfig(self._shape, fill=self._fill, outline=self._border, width=lw)
+
+
+def icon_tile(parent, name: str, emoji: str, color: str, pale: str, size: int = 38) -> tk.Canvas:
+    """A Lucide icon on a soft rounded tile (card headers); the emoji when the icon font is missing."""
+    from ui import icons
+    c = tk.Canvas(parent, width=size, height=size, bg=parent.cget("bg"), highlightthickness=0, bd=0)
+    r, e = round(size * 0.34), size - 1
+    c.create_polygon(r, 0, r, 0, e - r, 0, e - r, 0, e, 0, e, r, e, r, e, e - r, e, e - r, e, e,
+                     e - r, e, e - r, e, r, e, r, e, 0, e, 0, e - r, 0, e - r, 0, r, 0, r, 0, 0,
+                     smooth=True, fill=pale, outline=pale)
+    g = icons.glyph(name)
+    c.create_text(size // 2, size // 2, text=g or emoji, fill=color,
+                  font=icons.font(round(size * 0.55)) if g else ModernStyle.FONT_BODY)
+    return c
+
+
+def gradient_tile(parent, name: str, emoji: str, top: str, bottom: str, size: int = 30) -> tk.Canvas:
+    """A white Lucide icon on a rounded tile shaded from top to bottom (KPI cards), like an
+    app icon. Drawn as shapes, not a picture, so it stays sharp on Retina screens."""
+    import math
+    from ui import icons
+    bg = str(parent.cget("bg"))
+    c = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0, bd=0)
+    for y in range(size):   # one 1 px band per row
+        c.create_rectangle(0, y, size, y + 1, outline="",
+                           fill=ModernButton._blend(bottom, top, y / max(1, size - 1)))
+    r = round(size * 0.3)   # rounded corners: the card's colour outside a quarter circle
+    for ox, oy, sx, sy in ((0, 0, 1, 1), (size, 0, -1, 1), (0, size, 1, -1), (size, size, -1, -1)):
+        pts = [(ox, oy)] + [(ox + sx * (r - r * math.cos(math.radians(d))),
+                             oy + sy * (r - r * math.sin(math.radians(d)))) for d in range(0, 91, 10)]
+        c.create_polygon(*pts, fill=bg, outline="")
+    g = icons.glyph(name)
+    c.create_text(size // 2, size // 2, text=g or emoji, fill="#FFFFFF",
+                  font=icons.font(round(size * 0.52)) if g else ModernStyle.FONT_BODY)
+    return c
+
+
+# ── KPI cards: one look on every page ─────────────────────────────────────────
+def kpi_colours(fill: str) -> tuple[str, str, str]:
+    """(soft background, border, title colour) for a KPI card in the colour fill."""
+    S, mix = ModernStyle, ModernButton._blend
+    if S.IS_DARK:
+        return mix(fill, S.BG_SECONDARY, 0.16), mix(fill, S.BG_SECONDARY, 0.45), mix(fill, "#FFFFFF", 0.65)
+    return mix(fill, S.BG_SECONDARY, 0.07), mix(fill, S.BG_SECONDARY, 0.30), mix(fill, "#000000", 0.80)
+
+
+def kpi_card(parent, title: str, fill: str, icon: str, emoji: str = "", canvas_bg: str | None = None):
+    """A KPI card: rounded, softly tinted and outlined in its colour, the title in that colour
+    and a solid icon tile on the right (no side bar). Returns (card, body, title label): put
+    the value and captions in body, whose background is the card's tint (card.tint)."""
+    S = ModernStyle
+    tint, border, title_fg = kpi_colours(fill)
+    card = ModernCard(parent, bg=tint, highlight_color=border, highlight_thickness=1,
+                      radius=ModernStyle.RADIUS_CARD, canvas_bg=canvas_bg or str(parent.cget("bg")), expand_height=True)
+    card.hover_color = fill   # under the pointer the outline takes the card's full colour
+    head = tk.Frame(card.content, bg=tint)
+    head.pack(fill="x", padx=12, pady=(8, 0))
+    title_lbl = tk.Label(head, text=title, fg=title_fg, bg=tint, font=S.FONT_KPI_TITLE, anchor="w")
+    title_lbl.pack(side="left", fill="x", expand=True)
+    gradient_tile(head, icon, emoji, ModernButton._blend(fill, "#FFFFFF", 0.7), fill, size=28).pack(side="right", padx=(6, 0))
+    body = tk.Frame(card.content, bg=tint)
+    body.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+    card.tint, card.head = tint, head
+    return card, body, title_lbl
+
+
+# ── Buttons: one look on every page and pop-up ───────────────────────────────
+# What a button does sets its colour (theme names, looked up when the button is made)
+_BUTTON_FILLS = {"primary": "ACCENT_PRIMARY", "success": "SUCCESS_FILL", "danger": "ERROR_FILL",
+                 "warning": "WARNING_FILL", "info": "INFO_FILL", "purple": "PURPLE_FILL",
+                 "neutral": "NEUTRAL_FILL"}
+# A symbol at the start of a label → the Lucide icon drawn in its place
+BUTTON_ICONS = {"✓": "check", "✕": "x", "↻": "refresh-cw", "🔄": "refresh-cw", "⟳": "repeat",
+                "⏳": "hourglass", "+": "plus", "➕": "plus", "✎": "pencil", "▶": "play",
+                "↓": "download", "⧉": "copy", "▤": "columns-3", "★": "star", "▲": "trending-up",
+                "▼": "trending-down", "✨": "wand-sparkles", "✅": "circle-check", "⚠": "triangle-alert",
+                "↺": "rotate-ccw"}
+BUTTON_RADIUS = 8
+_MEASURERS: dict = {}
+
+
+def _button_size(size: str) -> tuple:
+    """(height, font, icon px): "md" for forms and pop-up footers, "sm" for toolbars,
+    card headers and page headers."""
+    if size == "sm":
+        return 30, ModernStyle.FONT_SMALL_BOLD, 14
+    return 38, ModernStyle.FONT_BODY_BOLD, 16
+
+
+def _text_width(font, text: str) -> int:
+    import tkinter.font as tkfont
+    key = (font, id(tk._default_root))
+    if key not in _MEASURERS:
+        _MEASURERS[key] = tkfont.Font(font=font).measure
+    return _MEASURERS[key](text)
+
+
+def label_icon(text: str, icon: str = "") -> tuple[str, str]:
+    """(text, Lucide character) for a button label: `icon` by name, else a leading symbol
+    from BUTTON_ICONS (which is then left out of the text). No icon font: ("text", "")."""
+    from ui import icons
+    text = str(text)
+    if not icon and text[:1] in BUTTON_ICONS and text[1:].strip():
+        g = icons.glyph(BUTTON_ICONS[text[:1]])
+        return (text[1:].strip(), g) if g else (text, "")
+    return text, (icons.glyph(icon) if icon else "")
+
+
+def action_button(parent, text: str, command, *, kind: str = "primary", soft: bool = False,
+                  size: str = "md", width: int | None = None, canvas_bg: str | None = None,
+                  icon: str = "", **kw) -> "ModernButton":
+    """The one button look for pages and pop-ups.
+
+    kind: what it does sets the colour: "primary" blue (save, apply, refresh, open),
+    "success" green (add, import, buy), "danger" red (delete, sell), "neutral" grey
+    (cancel, close, clear). soft: a pale tint with coloured text for the other actions
+    beside a main one (each card or pop-up has one solid button). size: "md" (38 px) or
+    "sm" (30 px). A leading ✓ ✕ ↻ + ✎ ⧉ … (or `icon`, a Lucide name) is drawn as a Lucide
+    icon; the width fits the text unless given.
+    """
+    from ui import icons
+    height, font, icon_px = _button_size(size)
+    text, glyph = label_icon(text, icon)
+    if width is None:
+        pad = 14 if size == "sm" else 18
+        width = max(72 if size == "sm" else 92,
+                    _text_width(font, text) + (icon_px + 6 if glyph else 0) + 2 * pad)
+    return ModernButton(parent, text=text, command=command, bg=getattr(ModernStyle, _BUTTON_FILLS[kind]),
+                        fg=ModernStyle.TEXT_ON_ACCENT, variant="soft" if soft else "solid",
+                        canvas_bg=canvas_bg, width=width, height=height, radius=BUTTON_RADIUS, font=font,
+                        glyph=glyph, glyph_font=icons.font(icon_px) if glyph else None, **kw)
+
+
+def secondary_button(parent, text: str, command, *, size: str = "md", width: int | None = None,
+                     canvas_bg: str | None = None, icon: str = "", height: int | None = None,
+                     **_unused) -> "ModernButton":
+    """The one look for Cancel, Close, No and Clear everywhere: a soft grey button (the main
+    action beside it is a solid colour). `icon` names a Lucide icon (e.g. "eraser" for Clear).
+    `height` (and radius / font) from older calls: 32 px or less means the small size."""
+    if height is not None and height <= 32:
+        size = "sm"
+    return action_button(parent, text, command, kind="neutral", soft=True, size=size, width=width,
+                         canvas_bg=canvas_bg, icon=icon)
+
+
+def header_button(parent, text: str, command, *, main: bool = False, width: int | None = None,
+                  icon: str = "", **kw) -> "ModernButton":
+    """A button on a page's coloured header (or a pop-up's banner). The page's main action
+    is solid white with the header colour as its text; the others are frosted glass."""
+    from ui import icons
+    flat = str(parent.cget("bg"))
+    if main:
+        bg, fg = ModernStyle.HEADER_FG, flat
+    else:
+        bg, fg = ModernButton._blend("#FFFFFF", flat, 0.18), ModernStyle.HEADER_FG
+    text, glyph = label_icon(text, icon)
+    font = ModernStyle.FONT_SMALL_BOLD
+    if width is None:
+        width = max(72, _text_width(font, text) + (20 if glyph else 0) + 28)
+    return ModernButton(parent, text=text, command=command, bg=bg, fg=fg, canvas_bg=flat, width=width,
+                        height=32, radius=BUTTON_RADIUS, font=font, glyph=glyph,
+                        glyph_font=icons.font(14) if glyph else None, **kw)
+
+
+# ── Filter panels ─────────────────────────────────────────────────────────────
+def _tile_colours(hue: str) -> tuple[str, str, str]:
+    """(tint, border, ink) of a filter tile or pill in this hue."""
+    S, blend = ModernStyle, ModernButton._blend
+    if S.IS_DARK:
+        return blend(hue, S.BG_SECONDARY, 0.16), blend(hue, S.BG_SECONDARY, 0.42), blend(hue, "#FFFFFF", 0.62)
+    return blend(hue, S.BG_SECONDARY, 0.07), blend(hue, S.BG_SECONDARY, 0.28), hue
+
+
+def filter_tile(parent, title: str, icon: str, hue: str) -> "ModernCard":
+    """One section of a filter panel: a rounded tile softly tinted in `hue`, its icon and
+    title small on the left. Pack the controls into tile.body (its bg is the tint); the
+    panel lays the tiles out (grid, sticky="nsew", so a row of tiles ends level).
+    tile.show_title(False) leaves just the icon (narrow windows); tile.icon takes a tooltip."""
+    from ui import icons
+    tint, border, ink = _tile_colours(hue)
+    tile = ModernCard(parent, bg=tint, highlight_color=border, highlight_thickness=1,
+                      radius=ModernStyle.RADIUS_BUTTON, canvas_bg=str(parent.cget("bg")), expand_height=True)
+    tile.hover_color = ink
+    row = tk.Frame(tile.content, bg=tint)
+    row.pack(fill="both", expand=True, padx=(8, 6), pady=1)
+    glyph = icons.glyph(icon)
+    tile.icon = tk.Label(row, text=glyph or "•", font=icons.font(15) if glyph else ModernStyle.FONT_SMALL_BOLD,
+                         fg=ink, bg=tint)
+    tile.icon.pack(side="left", padx=(0, 6))
+    tile.caption = tk.Label(row, text=title, font=ModernStyle.FONT_SMALL_BOLD, fg=ink, bg=tint)
+    tile.caption.pack(side="left", padx=(0, 8))
+    tile.body = tk.Frame(row, bg=tint)
+    tile.body.pack(side="left", fill="x", expand=True)   # a control packed with expand=True takes the spare width
+    tile.tint = tint
+    tile.title_shown = True
+
+    def show_title(shown: bool) -> None:
+        if shown != tile.title_shown:
+            tile.title_shown = shown
+            if shown:
+                tile.caption.pack(side="left", padx=(0, 8), before=tile.body)
+            else:
+                tile.caption.pack_forget()
+    tile.show_title = show_title
+    return tile
+
+
+class PillGroup(tk.Frame):
+    """Radio-like pills for a filter tile. Each option has its own colour: its text while not
+    chosen, a solid fill with white text when chosen."""
+
+    def __init__(self, parent, options, variable: tk.StringVar, colours: dict, *, command=None,
+                 labels: dict | None = None, height: int = 28):
+        bg = str(parent.cget("bg"))
+        super().__init__(parent, bg=bg)
+        self.variable, self._command, self._bg = variable, command, bg
+        self._colours = {o: colours.get(o, ModernStyle.ACCENT_PRIMARY) for o in options}
+        self._labels = {o: (labels or {}).get(o, o) for o in options}
+        self._font = ModernStyle.FONT_SMALL_BOLD
+        self.buttons = {}
+        for opt in options:
+            btn = ModernButton(self, text=self._labels[opt], command=lambda v=opt: self._select(v), bg=bg,
+                               canvas_bg=bg, width=_text_width(self._font, self._labels[opt]) + 16, height=height,
+                               radius=height // 2, font=self._font)
+            btn.pack(side="left", padx=(0, 2))
+            self.buttons[opt] = btn
+        variable.trace_add("write", self._on_var)
+        self._paint()
+
+    def _select(self, value) -> None:
+        if self.variable.get() != value:
+            self.variable.set(value)
+
+    def _on_var(self, *_) -> None:
+        self._paint()
+        if self._command:
+            self._command()
+
     def _paint(self) -> None:
-        r, border = self.R, str(self.cget("bg"))
-        try:
-            outer = str(self.master.cget("bg"))
-        except tk.TclError:
-            outer = ModernStyle.BG_PRIMARY
-        for pos, c in self._corners:
-            c.delete("all")
-            c.configure(bg=outer)
-            cx = r if pos[1] == "w" else 0      # circle centre at the inner corner
-            cy = r if pos[0] == "n" else 0
-            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=self._fill, outline=border)
+        chosen = self.variable.get()
+        for opt, btn in self.buttons.items():
+            hue = self._colours[opt]
+            if opt == chosen:
+                btn.set_palette(bg=hue, fg=ModernStyle.TEXT_ON_ACCENT, hover_bg=hue, pressed_bg=hue)
+            else:
+                ink = _tile_colours(hue)[2]
+                btn.set_palette(bg=self._bg, fg=ink, hover_bg=ModernButton._blend(hue, self._bg, 0.14),
+                                pressed_bg=ModernButton._blend(hue, self._bg, 0.24))
 
 
-def rounded_combobox(parent, **kw):
+class FilterBar(tk.Frame):
+    """A page's filter panel: rounded tinted tiles (see filter_tile) on one slim line, with a
+    round ↺ Reset at the end while any filter is set. The tiles show their titles when there
+    is room, just their icons when it is tight, and the `wraps` tile drops to a second line
+    on narrow windows (never squeezed). Call relayout() after a tile's contents changed size."""
+
+    def __init__(self, parent, *, is_default, on_reset, reset_tip: str = "Reset the filters"):
+        from ui import icons
+        from .ui_utils import ToolTip
+        bg = ModernStyle.BG_PRIMARY
+        super().__init__(parent, bg=bg)
+        self._is_default = is_default
+        self._tiles: list = []   # (tile, weight, wraps)
+        self._wide = None
+        self._reset_col = 0
+        self.reset_btn = ModernButton(self, text="" if icons.glyph("rotate-ccw") else "↺",
+                                      glyph=icons.glyph("rotate-ccw"), glyph_font=icons.font(15), command=on_reset,
+                                      bg=ModernStyle.ACCENT_PRIMARY_PALE, fg=ModernStyle.TEXT_ACCENT, canvas_bg=bg,
+                                      width=32, height=32, radius=16)
+        ToolTip(self.reset_btn, reset_tip)
+        self.bind("<Configure>", lambda _e: self.relayout())
+
+    def tile(self, title: str, icon: str, hue: str, tip: str, *, weight: int = 1, wraps: bool = False):
+        """A new tile at the end of the line (pack its controls into .body)."""
+        from .ui_utils import ToolTip
+        t = filter_tile(self, title, icon, hue)
+        for w in (t.icon, t.caption):
+            ToolTip(w, tip)
+        self._tiles.append((t, weight, wraps))
+        return t
+
+    def _need(self, titles: bool) -> int:
+        """Width the tiles need on one line (with or without their titles), gaps and ↺."""
+        need = 8 * (len(self._tiles) - 1) + 40
+        for t, _weight, _wraps in self._tiles:
+            need += t.content.winfo_reqwidth() + 2 * t._inset
+            caption = t.caption.winfo_reqwidth() + 8
+            need += (caption if titles else 0) - (caption if t.title_shown else 0)
+        return need
+
+    def relayout(self) -> None:
+        width = self.winfo_width()
+        if width <= 1 or not self._tiles:
+            return
+        self.update_idletasks()   # the tiles' current sizes (e.g. after counts changed)
+        titles = width >= self._need(True)
+        wide = titles or width >= self._need(False)
+        for t, _weight, _wraps in self._tiles:
+            t.show_title(titles or not wide)
+        self.update_idletasks()
+        for t, _weight, _wraps in self._tiles:   # a card only grows by itself: fit it to what it holds now
+            want = t.content.winfo_reqwidth() + 2 * t._inset
+            if int(t.cget("width")) != want:
+                t.configure(width=want)
+        if wide != self._wide:
+            self._place(wide)
+
+    def _place(self, wide: bool) -> None:
+        for t, _weight, _wraps in self._tiles:
+            t.grid_forget()
+        for col in range(len(self._tiles) + 1):
+            self.grid_columnconfigure(col, weight=0)
+        line = self._tiles if wide else [x for x in self._tiles if not x[2]]
+        for col, (t, weight, _wraps) in enumerate(line):
+            t.grid(row=0, column=col, sticky="nsew", padx=(0, 8 if col < len(line) - 1 else 0))
+            self.grid_columnconfigure(col, weight=weight)
+        if not wide:
+            for t, _weight, _wraps in (x for x in self._tiles if x[2]):
+                t.grid(row=1, column=0, columnspan=len(line), sticky="nsew", pady=(6, 0))
+        self._wide, self._reset_col = wide, len(line)
+        self.reset_btn.grid_forget()
+        self.sync_reset()
+
+    def sync_reset(self) -> None:
+        """↺ Reset shows while a filter is set."""
+        if self._wide is None:
+            return
+        if self._is_default():
+            self.reset_btn.grid_forget()
+        elif not self.reset_btn.winfo_manager():
+            self.reset_btn.grid(row=0, column=self._reset_col, sticky="e", padx=(8, 0))
+
+
+class Pill(tk.Canvas):
+    """A rounded tag: a soft fill, an optional Lucide icon and short text.
+
+    configure(text=..., fg=...) and cget() work like a Label's, so a pill can be updated
+    in place. A leading emoji in the text (e.g. "🏦 Zerodha") becomes the matching icon.
+    """
+
+    _EMOJI_ICONS = {"📈": "chart-line", "🏷️": "tag", "🏷": "tag", "🏢": "building-2", "🏦": "landmark",
+                    "💱": "coins", "⚡": "zap", "🕐": "clock", "▲": "trending-up", "▼": "trending-down"}
+
+    def __init__(self, parent, text: str = "", icon: str = "", fill: str | None = None, fg: str | None = None,
+                 font=None, height: int = 26):
+        super().__init__(parent, height=height, width=10, bg=str(parent.cget("bg")), highlightthickness=0, bd=0)
+        self._fill = fill or ModernStyle.BG_TERTIARY
+        self._fg = fg or ModernStyle.TEXT_SECONDARY
+        self._font = font or ModernStyle.FONT_SMALL_BOLD
+        self._icon, self._text, self._image = icon, "", None
+        self._set_text(text)
+        self._draw()
+
+    def _set_text(self, text) -> None:
+        text = str(text or "")
+        first, _, rest = text.partition(" ")
+        self._image = None
+        if first in self._EMOJI_ICONS and rest:
+            self._icon, text = self._EMOJI_ICONS[first], rest.strip()
+            if first == "🏦":   # a broker: its own logo instead of the bank icon
+                from ui.broker_logos import BROKER_ORDER, key, logo
+                if key(text) in BROKER_ORDER:
+                    self._image = logo(text, 16)
+        self._text = text
+
+    def _draw(self) -> None:
+        from ui import icons
+        self.delete("all")
+        h = int(self.cget("height"))
+        x, mid = 10, h // 2
+        glyph = icons.glyph(self._icon) if self._icon else ""
+        if self._image is not None:
+            self.create_image(x - 3, mid, image=self._image, anchor="w")
+            x += 18
+        elif glyph:
+            gid = self.create_text(x, mid, text=glyph, font=icons.font(14), fill=self._fg, anchor="w")
+            x = (self.bbox(gid) or (0, 0, x, 0))[2] + 5
+        tid = self.create_text(x, mid, text=self._text, font=self._font, fill=self._fg, anchor="w")
+        w = max(h, ((self.bbox(tid) or (0, 0, x, 0))[2] if self._text else x) + 10)
+        # Neutral fills are close to the page colour: give those a hairline outline
+        neutral = self._fill in (ModernStyle.BG_PRIMARY, ModernStyle.BG_SECONDARY, ModernStyle.BG_TERTIARY)
+        outline = ModernStyle.BORDER_COLOR if neutral else self._fill
+        r, e, b = h // 2, w - 1, h - 1
+        pill = self.create_polygon(r, 0, r, 0, e - r, 0, e - r, 0, e, 0, e, r, e, r, e, b - r, e, b - r, e, b,
+                                   e - r, b, e - r, b, r, b, r, b, 0, b, 0, b - r, 0, b - r, 0, r, 0, r, 0, 0,
+                                   smooth=True, fill=self._fill, outline=outline)
+        self.tag_lower(pill)
+        tk.Canvas.configure(self, width=w)
+
+    def configure(self, cnf=None, **kw):
+        changed = False
+        if "text" in kw:
+            self._set_text(kw.pop("text"))
+            changed = True
+        for key in ("fg", "foreground"):
+            if key in kw:
+                self._fg = kw.pop(key)
+                changed = True
+        if "fill" in kw:
+            self._fill = kw.pop("fill")
+            changed = True
+        res = super().configure(cnf, **kw) if (cnf or kw) else None
+        if changed:
+            self._draw()
+        return res
+
+    config = configure
+
+    def cget(self, key):
+        if key == "text":
+            return self._text
+        if key in ("fg", "foreground"):
+            return self._fg
+        return super().cget(key)
+
+    __getitem__ = cget
+
+
+def rounded_combobox(parent, *, box_pady: int = 2, cb_pady: int = 1, ipady: int = 3, **kw):
     """A drop-down in the same rounded box as the text inputs. Returns (box, combobox):
     place the box, use the combobox."""
     from tkinter import ttk
-    box = RoundedBox(parent)
+    box = RoundedBox(parent, pady=box_pady)
     kw.setdefault("font", ModernStyle.FONT_INPUT)
     cb = ttk.Combobox(box, style="Boxed.TCombobox", **kw)
-    cb.pack(fill="both", expand=True, padx=4, pady=1, ipady=3)
+    cb.pack(fill="both", expand=True, padx=4, pady=cb_pady, ipady=ipady)
     box.watch(cb)
     return box, cb
+
+
+def add_broker_logos(box: "RoundedBox", cb) -> None:
+    """A broker drop-down with logos: the chosen broker's logo sits left of its name, and
+    the list opens as a menu with every broker's logo (a ttk list cannot show pictures).
+    An editable box keeps typing in its text; its arrow opens the menu."""
+    from ui import icons
+    from ui.broker_logos import logo
+    mark = tk.Label(box, bg=box._fill, bd=0)
+
+    def _sync(*_):
+        img = logo(cb.get(), 18)
+        try:
+            if img is None:
+                mark.pack_forget()
+            else:
+                mark.configure(image=img)
+                if not mark.winfo_manager():
+                    mark.pack(side="left", padx=(8, 0), before=cb)
+        except tk.TclError:
+            pass
+
+    def _choose(value):
+        cb.set(value)
+        cb.event_generate("<<ComboboxSelected>>")
+        _sync()
+
+    def _open(event=None):
+        state = str(cb.cget("state"))
+        if state == "disabled":
+            return "break"
+        if state != "readonly" and event is not None and "textarea" in str(cb.identify(event.x, event.y)):
+            return None   # clicking the text of an editable box: type as usual
+        menu = tk.Menu(cb, tearoff=0)
+        everyone = icons.image("layers", ModernStyle.TEXT_SECONDARY, 18)
+        for value in cb.cget("values"):
+            img = logo(value, 18) or (everyone if str(value) == "All" else None)
+            menu.add_command(label=f"  {value}", image=img or "", compound="left",
+                             command=lambda v=value: _choose(v))
+        menu.tk_popup(box.winfo_rootx(), box.winfo_rooty() + box.winfo_height() + 2)
+        return "break"
+
+    cb.bind("<Button-1>", _open)
+    cb.bind("<<ComboboxSelected>>", _sync, add="+")
+    var = str(cb.cget("textvariable") or "")
+    if var:   # also when the page sets the broker itself
+        cb.tk.call("trace", "add", "variable", var, "write", cb.register(_sync))
+    cb.after_idle(_sync)
 
 
 class EmptyState(tk.Frame):
@@ -249,11 +748,7 @@ class EmptyState(tk.Frame):
             for w in self._btn_holder.winfo_children():
                 w.destroy()
             if button and command:
-                import tkinter.font as tkfont
-                width = tkfont.Font(font=ModernStyle.FONT_SMALL_BOLD).measure(button) + 48
-                ModernButton(self._btn_holder, text=button, command=command, bg=ModernStyle.ACCENT_PRIMARY,
-                             fg=ModernStyle.TEXT_ON_ACCENT, canvas_bg=self._bg, width=max(150, width),
-                             height=36, radius=8, font=ModernStyle.FONT_SMALL_BOLD).pack()
+                action_button(self._btn_holder, button, command, canvas_bg=self._bg).pack()
         self.place(relx=0.5, rely=0.5, anchor="center")
         self.lift()
 
@@ -361,13 +856,16 @@ class ModernButton(tk.Canvas):
         icon: tk.PhotoImage | None = None,
         icon_path: str | None = None,
         icon_subsample: int = 1,
+        glyph: str = "",
+        glyph_font=None,
+        glyph_fg: str | None = None,
         invoke_on_press: bool = False,
         bg: str = ModernStyle.ACCENT_PRIMARY,
         fg: str = ModernStyle.TEXT_ON_ACCENT,
         canvas_bg: Optional[str] = None,
         width: int = 120,
         height: int = 38,
-        radius: int = 10,
+        radius: int = ModernStyle.RADIUS_BUTTON,
         font=None,
         text_anchor: str = "c",
         text_padx: int = 14,
@@ -399,6 +897,16 @@ class ModernButton(tk.Canvas):
         self._icon = icon if icon is not None else self._try_load_icon(icon_path, icon_subsample)
         self._icon_subsample = max(1, int(icon_subsample))
         self._icon_pad = 10
+        if not glyph and icon is None and str(text).startswith("✕ "):   # Close / Cancel: the Lucide x
+            from ui import icons
+            x_glyph = icons.glyph("x")
+            if x_glyph:
+                glyph, glyph_font, text = x_glyph, glyph_font or icons.font(15), str(text)[2:].strip()
+                self._text = text
+        # An icon-font character (e.g. a Lucide icon) drawn left of the text, in its own colour
+        self._glyph = glyph
+        self._glyph_font = glyph_font
+        self._glyph_fg = glyph_fg
 
         self._invoke_on_press = bool(invoke_on_press)
 
@@ -414,10 +922,14 @@ class ModernButton(tk.Canvas):
         if variant == "soft":
             accent = bg
             dark = getattr(ModernStyle, "IS_DARK", False)
-            bg = self._blend(accent, canvas_bg, 0.2 if dark else 0.13)
-            soft_hover = self._blend(accent, canvas_bg, 0.32 if dark else 0.24)
+            if dark:   # a stronger tint, lifted a little, or it vanishes into a dark card
+                bg = self._blend("#FFFFFF", self._blend(accent, canvas_bg, 0.28), 0.08)
+                soft_hover = self._blend("#FFFFFF", self._blend(accent, canvas_bg, 0.4), 0.1)
+            else:
+                bg = self._blend(accent, canvas_bg, 0.13)
+                soft_hover = self._blend(accent, canvas_bg, 0.24)
             # text a shade darker on light pages, a shade lighter on dark ones
-            fg = self._blend("#FFFFFF", accent, 0.55) if dark else self._blend("#000000", accent, 0.22)
+            fg = self._blend("#FFFFFF", accent, 0.62) if dark else self._blend("#000000", accent, 0.22)
 
         self._bg_normal = bg
         self._bg_hover = soft_hover or self._lighten_color(bg, 18)
@@ -491,7 +1003,16 @@ class ModernButton(tk.Canvas):
         self._redraw(self._bg_normal)
 
     def set_text(self, text: str) -> None:
+        if self._glyph:   # an icon button: a leading symbol picks the icon, then both are centred again
+            text, glyph = label_icon(text)
+            self._glyph = glyph or self._glyph
+            self._canvas_ids = {}
         self._text = text
+        self._redraw(self._bg_normal)
+
+    def set_glyph_color(self, color: str | None) -> None:
+        """The icon's own colour; None draws it in the text colour."""
+        self._glyph_fg = color
         self._redraw(self._bg_normal)
 
     def set_font(self, font) -> None:
@@ -502,6 +1023,13 @@ class ModernButton(tk.Canvas):
     def set_canvas_bg(self, color: str) -> None:
         self._canvas_bg = color
         self.config(bg=color)
+        # The soft shadow was mixed from the old background (white): re-mix it, or it
+        # shows as a pale rim when the button sits on a coloured header
+        ids = self._canvas_ids.get("shadow")
+        if ids:
+            shade = self._blend("#000000", color, 0.08)
+            for i in ids if isinstance(ids, (list, tuple)) else (ids,):
+                self.itemconfig(i, fill=shade, outline=shade)
         self._redraw(self._bg_normal)
 
     def set_size(self, *, width: int | None = None, height: int | None = None) -> None:
@@ -603,6 +1131,7 @@ class ModernButton(tk.Canvas):
             # with tertiary text was unreadable)
             fill = ModernStyle.BG_TERTIARY
         text_fill = ModernStyle.TEXT_TERTIARY if self._disabled else self._fg
+        glyph_fill = text_fill if self._disabled else (self._glyph_fg or self._fg)
 
         # ── INITIAL BUILD ─────────────────────────────────────────────────────
         if not self._canvas_ids:
@@ -628,6 +1157,24 @@ class ModernButton(tk.Canvas):
                         self._height // 2,
                         text=self._text, font=self._font, fill=text_fill, anchor="w",
                     )
+            elif self._glyph:
+                cy = self._height // 2
+                if not str(self._text or "").strip():
+                    self._canvas_ids["glyph"] = self.create_text(
+                        self._width // 2, cy, text=self._glyph, font=self._glyph_font, fill=glyph_fill, anchor="c")
+                else:
+                    gid = self._canvas_ids["glyph"] = self.create_text(
+                        0, cy, text=self._glyph, font=self._glyph_font, fill=glyph_fill, anchor="w")
+                    tid = self._canvas_ids["text"] = self.create_text(
+                        0, cy, text=self._text, font=self._font, fill=text_fill, anchor="w")
+                    gb, tb = self.bbox(gid) or (0, 0, 0, 0), self.bbox(tid) or (0, 0, 0, 0)
+                    gw, tw = gb[2] - gb[0], tb[2] - tb[0]
+                    pad = 6 if self._text_anchor not in {"w", "west", "left"} else self._icon_pad
+                    # Left-aligned buttons (the sidebar) start at text_padx; others centre icon + text
+                    x0 = self._text_padx if self._text_anchor in {"w", "west", "left"} \
+                        else max(2, (self._width - gw - pad - tw) // 2)
+                    self.coords(gid, x0, cy)
+                    self.coords(tid, x0 + gw + pad, cy)
             else:
                 tx, ty, ta = (self._text_padx, self._height // 2, "w") if self._text_anchor in {"w", "west", "left"} else (self._width // 2, self._height // 2, "c")
                 self._canvas_ids["text"] = self.create_text(tx, ty, text=self._text, font=self._font, fill=text_fill, anchor=ta)
@@ -644,6 +1191,8 @@ class ModernButton(tk.Canvas):
         
         if "text" in self._canvas_ids:
             self.itemconfig(self._canvas_ids["text"], fill=text_fill, text=self._text)
+        if "glyph" in self._canvas_ids:
+            self.itemconfig(self._canvas_ids["glyph"], fill=glyph_fill)
 
     @staticmethod
     def _try_load_icon(icon_path: str | None, icon_subsample: int) -> tk.PhotoImage | None:
@@ -870,9 +1419,11 @@ class GradientHeader(tk.Canvas):
     """
     _BANDS = 64  # colour bands; smooth enough, and far fewer items than 1 per 4 px
 
-    def __init__(self, parent, title: str, subtitle: str, height: int = 75, right_widget_func=None, **kwargs):
+    def __init__(self, parent, title: str, subtitle: str, height: int = 75, right_widget_func=None,
+                 icon: str = "", **kwargs):
         super().__init__(parent, bg=ModernStyle.BG_PRIMARY, highlightthickness=0, height=height, **kwargs)
         self.height = height
+        self._text_x = None   # set when an icon tile sits left of the title (pop-ups)
 
         self.grad_start = ModernStyle.HEADER_GRAD_START
         self.grad_end = ModernStyle.HEADER_GRAD_END
@@ -901,20 +1452,87 @@ class GradientHeader(tk.Canvas):
             )
 
         self.bind("<Configure>", self._draw_header_gradient)
+        if icon:
+            self._add_icon_tile(icon)
 
         if right_widget_func:
             self.right_frame = tk.Frame(self, bg=self._color_at(1.0))
             right_widget_func(self.right_frame)
-            self.create_window(
-                0, int(height / 2), window=self.right_frame, anchor="e", tags=("header_content", "right_hdr")
-            )
+            # Placed, not a canvas window (Tk lays those out again on every visit to the page)
+            self.right_frame.place(x=0, y=int(height / 2), anchor="e")
 
     def set_title(self, text: str):
+        if self._text_x is not None:   # the icon tile shows the icon: no emoji in the title
+            text = re.sub(r"^[^\w(]+", "", text).strip() or text
         self.itemconfig(self.title_id, text=text)
 
     def set_subtitle(self, text: str):
-        if hasattr(self, 'subtitle_id'):
-            self.itemconfig(self.subtitle_id, text=text)
+        if not hasattr(self, 'subtitle_id'):
+            self.subtitle_id = self.create_text(
+                20, max(48, int(self.height * 0.68)), text="", fill=ModernStyle.HEADER_SUBTLE_FG,
+                font=ModernStyle.FONT_BODY if self.height >= 75 else ModernStyle.FONT_SMALL,
+                anchor="w", tags="header_content")
+        self.itemconfig(self.subtitle_id, text=text)
+        self._layout_text()
+
+    def _add_icon_tile(self, icon: str) -> None:
+        """A frosted tile with a Lucide icon (or the given emoji) left of the title; the
+        title and subtitle are then centred beside it."""
+        from ui import icons
+        h = self.height
+        t, x0 = round(h * 0.6), 18
+        y0, r, e = (h - t) // 2, max(6, t // 4), t - 1
+        self._tile_fill = ModernButton._blend("#FFFFFF", self._color_at(0.02), 0.24)
+        pts = [(x0 + px, y0 + py) for px, py in ((r, 0), (r, 0), (e - r, 0), (e - r, 0), (e, 0), (e, r), (e, r),
+                                                 (e, e - r), (e, e - r), (e, e), (e - r, e), (e - r, e), (r, e),
+                                                 (r, e), (0, e), (0, e - r), (0, e - r), (0, r), (0, r), (0, 0))]
+        self._tile_id = self.create_polygon(*[c for p in pts for c in p], smooth=True, fill=self._tile_fill,
+                                            outline=self._tile_fill, tags="header_content")
+        glyph = icons.glyph(icon)
+        self.create_text(x0 + t // 2, h // 2, text=glyph or icon, fill=ModernStyle.HEADER_FG,
+                         font=icons.font(round(t * 0.55)) if glyph else ModernStyle.FONT_SECTION_LABEL,
+                         tags="header_content")
+        self._text_x = x0 + t + 12
+        self.set_title(self.itemcget(self.title_id, "text"))
+        self._layout_text()
+
+    def set_icon_fill(self, color: str) -> None:
+        """Colour the icon tile (each pop-up has its own colour), with a soft light edge."""
+        if getattr(self, "_tile_id", None):
+            self.itemconfig(self._tile_id, fill=color, outline=ModernButton._blend("#FFFFFF", color, 0.45))
+
+    def _layout_text(self) -> None:
+        if self._text_x is None:
+            return   # page banners keep their own layout
+        sub = getattr(self, "subtitle_id", None)
+        has_sub = bool(sub and self.itemcget(sub, "text"))
+        mid = self.height // 2
+        self.coords(self.title_id, self._text_x, mid - 10 if has_sub else mid)
+        if sub:
+            self.coords(sub, self._text_x, mid + 12)
+
+    def set_note(self, text: str, color: str | None = None) -> None:
+        """A small line of text under the right-hand buttons, drawn on the gradient."""
+        if getattr(self, "note_id", None) is None:
+            self.note_id = self.create_text(0, 0, anchor="ne", font=ModernStyle.FONT_SMALL,
+                                            tags="header_content")
+        self.itemconfig(self.note_id, text=text, fill=color or ModernStyle.HEADER_SUBTLE_FG)
+        self._place_right(self.winfo_width(), self.winfo_height())
+
+    def _place_right(self, w: int, h: int) -> None:
+        """Right-hand buttons at the right edge; with a note, the two are centred together."""
+        if not self.right_frame or w < 10:
+            return
+        note = getattr(self, "note_id", None)
+        if note is None or not self.itemcget(note, "text"):
+            self.right_frame.place_configure(x=w - 20, y=int(h / 2))
+            return
+        frame_h = self.right_frame.winfo_reqheight()
+        import tkinter.font as tkfont
+        note_h = tkfont.Font(font=ModernStyle.FONT_SMALL).metrics("linespace")
+        top = (h - frame_h - 2 - note_h) / 2
+        self.right_frame.place_configure(x=w - 20, y=int(top + frame_h / 2))
+        self.coords(note, w - 20, int(top + frame_h + 2))
 
     def _color_at(self, t: float) -> str:
         """Gradient colour at position t (0 = left edge, 1 = right edge)."""
@@ -941,9 +1559,9 @@ class GradientHeader(tk.Canvas):
             x1 = int((i + 1) * w / steps) + 1
             self.create_rectangle(x0, 0, x1, h, fill=self._color_at(i / (steps - 1)),
                                   outline="", tags="gradient")
-        # Rounded corners: paint the page colour outside a 14 px quarter circle
+        # Rounded corners: paint the page colour outside a quarter circle
         import math
-        r = 14
+        r = ModernStyle.RADIUS_HEADER
         for ox, oy, sx, sy in ((0, 0, 1, 1), (w, 0, -1, 1), (0, h, 1, -1), (w, h, -1, -1)):
             pts = [(ox, oy)] + [(ox + sx * (r - r * math.cos(math.radians(d))),
                                  oy + sy * (r - r * math.sin(math.radians(d)))) for d in range(0, 91, 10)]
@@ -952,7 +1570,7 @@ class GradientHeader(tk.Canvas):
         if self.right_frame:
             # Re-position right frame to right edge, then match its widgets' backgrounds
             # to the gradient once the layout has settled (only the last resize counts).
-            self.coords("right_hdr", w - 20, int(h / 2))
+            self._place_right(w, h)
             if self._sync_after_id:
                 self.after_cancel(self._sync_after_id)
             self._sync_after_id = self.after(60, lambda: self._sync_right_bg(w))
@@ -990,54 +1608,179 @@ class GradientHeader(tk.Canvas):
             _sync(self.right_frame)
 
 
+class _CardBox(RoundedBox):
+    """The pop-ups' content card: a rounded box with larger corners."""
+    R = ModernStyle.RADIUS_CARD
+
+
+class ScrollArea(tk.Frame):
+    """A vertically scrolling area: put the widgets in `.inner`.
+
+    The inner frame is placed in this frame, not embedded in a canvas, so Tk gives it
+    the area's width in its normal layout pass. A canvas window has to be widened from
+    a <Configure> callback, and on a Mac that callback runs while the window is first
+    drawn and lays out every widget inside again (a long form took 2 s to open).
+    """
+    UNIT = 20   # pixels per scroll step (unless given)
+
+    def __init__(self, parent, bg: str, scrollbar=None, unit: int | None = None, fit_content: bool = False,
+                 **kw):
+        kw.setdefault("width", 380)    # the size an empty canvas asked for
+        kw.setdefault("height", 265)
+        super().__init__(parent, bg=bg, **kw)
+        if unit:
+            self.UNIT = unit
+        # fit_content: ask for the content's full height (a pop-up opens at its natural size,
+        # and scrolls only when it is capped)
+        self._fit_content = fit_content
+        self.inner = tk.Frame(self, bg=bg)
+        self.inner.place(x=0, y=0, relwidth=1)
+        self._top = 0
+        self._scrollbar = scrollbar
+        if scrollbar is not None:
+            scrollbar.configure(command=self.yview)
+        self.bind("<Configure>", lambda _e: self._apply(), add="+")
+        self.inner.bind("<Configure>", lambda _e: self._apply(), add="+")
+
+    def _apply(self) -> None:
+        content, view = max(1, self.inner.winfo_reqheight()), max(1, self.winfo_height())
+        self._top = max(0, min(self._top, content - view))
+        self.inner.place_configure(y=-self._top)
+        if self._scrollbar is not None:
+            self._scrollbar.set(self._top / content, min(1.0, (self._top + view) / content))
+
+    def yview(self, *args):
+        """The scrollbar's command: ("moveto", fraction) or ("scroll", n, "units"/"pages").
+        With no arguments, the shown part as (first, last) fractions, like a canvas."""
+        if not args:
+            content, view = max(1, self.inner.winfo_reqheight()), max(1, self.winfo_height())
+            return self._top / content, min(1.0, (self._top + view) / content)
+        if args[0] == "moveto":
+            self._top = int(float(args[1]) * max(1, self.inner.winfo_reqheight()))
+        elif args and args[0] == "scroll":
+            step = self.winfo_height() * 0.9 if str(args[2]).startswith("page") else self.UNIT
+            self._top += int(int(args[1]) * step)
+        self._apply()
+
+    def yview_scroll(self, number: int, what: str) -> None:
+        self.yview("scroll", number, what)
+
+    def scroll_with_wheel(self, window: tk.Misc) -> None:
+        """Scroll with the wheel or trackpad anywhere in `window` (e.g. a pop-up)."""
+        pending = [0.0]
+
+        def _wheel(event):
+            d = event.delta
+            if d:
+                steps = -round(d / 120) * 3 if abs(d) >= 120 else -d
+                self.yview_scroll(int(steps) or (-1 if d > 0 else 1), "units")
+            return "break"
+
+        def _touchpad(event):
+            low = event.delta & 0xFFFF
+            pending[0] -= low - 0x10000 if low >= 0x8000 else low
+            steps = int(pending[0] / self.UNIT)
+            if steps:
+                pending[0] -= steps * self.UNIT
+                self.yview_scroll(steps, "units")
+            return "break"
+
+        window.bind("<MouseWheel>", _wheel, add="+")
+        try:
+            window.bind("<TouchpadScroll>", _touchpad, add="+")   # Tk 9 trackpads
+        except tk.TclError:
+            pass
+
+    def yview_moveto(self, fraction: float) -> None:
+        self.yview("moveto", fraction)
+
+
+def fit_cards(win: tk.Misc, rounds: int = 3) -> int:
+    """Size every ModernCard in a (hidden) window to its content and return the window's
+    height. Tk lays out a card's content only when the card is drawn, so a pop-up built
+    hidden would otherwise measure its cards as empty and open too short."""
+    need = -1
+    for _ in range(rounds):
+        win.update_idletasks()
+        cards, areas, stack = [], [], [win]
+        while stack:
+            w = stack.pop()
+            stack.extend(w.winfo_children())
+            if isinstance(w, ModernCard):
+                cards.append(w)
+            elif isinstance(w, ScrollArea) and w._fit_content:
+                areas.append(w)
+        for card in reversed(cards):   # inner cards first
+            card._sync_size()
+        win.update_idletasks()
+        for area in areas:   # the whole content; a capped pop-up then scrolls it
+            area.configure(height=max(1, area.inner.winfo_reqheight()))
+        win.update_idletasks()
+        if win.winfo_reqheight() == need:
+            break
+        need = win.winfo_reqheight()
+    return win.winfo_reqheight()
+
+
 class PremiumModal(tk.Toplevel):
     """
     A unified base class for all popup modals.
     Provides standard window styling, centering, and a clean light/modern aesthetic.
     """
-    def __init__(self, parent, title: str, geometry: str = "500x520", icon: str = "✨", right_widget_func=None):
+    # Emoji the callers pass → the Lucide icon shown in the header tile
+    _ICONS = {"💡": "lightbulb", "📊": "chart-column", "🏆": "trophy", "✏️": "pencil", "📋": "clipboard-list",
+              "✨": "sparkles", "◆": "gem", "⊕": "circle-plus", "◷": "clock", "Σ": "sigma", "↗": "trending-up",
+              "↘": "trending-down", "✓": "circle-check", "✕": "circle-x", "%": "percent", "↑": "arrow-up-right"}
+
+    def __init__(self, parent, title: str, geometry: str = "500x520", icon: str = "✨", right_widget_func=None,
+                 subtitle: str = "", icon_color: str | None = None):
         super().__init__(parent)
+        # Built hidden, then shown once at its final size and place (no jump)
+        self.withdraw()
         self.title(f"{title}")
         self.configure(bg=ModernStyle.BG_PRIMARY)
         self.resizable(False, False)
+        # Never larger than the screen (some pop-ups ask for 1200 px)
+        self._size = None
+        m = re.match(r"(\d+)x(\d+)(.*)", str(geometry))
+        if m:
+            w = min(int(m.group(1)), self.winfo_screenwidth() - 60)
+            h = min(int(m.group(2)), self.winfo_screenheight() - 100)
+            self._size = (w, h)
+            geometry = f"{w}x{h}{m.group(3)}"
         self.geometry(geometry)
-        
+        self._fit_width, self._fit_exact, self._revealed = None, False, False
+        self.bind("<Escape>", lambda _e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
         # Apply global option_add defaults for this window's widgets
         try:
             ModernStyle.style_modal(self)
         except Exception:
             pass
-        
+
         try:
             self.transient(parent.winfo_toplevel())
-            self.grab_set()
-        except Exception:
-            pass
-            
-        try:
-            from .ui_utils import center_window
-            center_window(self, parent=parent.winfo_toplevel())
         except Exception:
             pass
             
         # ── Unified Gradient Header ──
-        self.header = GradientHeader(self, title=f"{icon}  {title}" if icon else title, subtitle="", height=55, right_widget_func=right_widget_func)
+        self.header = GradientHeader(self, title=title, subtitle=subtitle, height=62,
+                                     right_widget_func=right_widget_func, icon=self._ICONS.get(icon, icon or "sparkles"))
         self.header.pack(fill="x")
+        if icon_color:   # a colourful tile for this pop-up's icon
+            self.header.set_icon_fill(icon_color)
         
         # Area for child classes to put chips/badges. We'll use a frame right under the header
         self.chips_row = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
         self.chips_row.pack(fill="x", padx=20, pady=(10, 0))
         self.inner_hdr = self.chips_row  # Alias for backward compatibility if anyone attached to inner_hdr
 
-        # ── Scrolling content card (Main Body) ──
-        self.body_card = tk.Frame(self, bg=ModernStyle.BG_SECONDARY, highlightbackground=ModernStyle.BORDER_COLOR, highlightthickness=1)
+        # ── Content card (Main Body): rounded, with a soft border ──
+        self.body_card = _CardBox(self, fill=ModernStyle.BG_SECONDARY, border=ModernStyle.BORDER_COLOR)
         self.body_card.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        # Accent separator under header
-        tk.Frame(self.body_card, bg=ModernStyle.ACCENT_PRIMARY, height=2).pack(fill="x")
-        
         self.content_frame = tk.Frame(self.body_card, bg=ModernStyle.BG_SECONDARY)
-        self.content_frame.pack(fill="both", expand=True, padx=24, pady=(20, 8))
         self.content_frame.grid_columnconfigure(0, weight=1)
 
         # ── Footer / Actions Area ──
@@ -1052,61 +1795,86 @@ class PremiumModal(tk.Toplevel):
         self._footer_divider.pack(fill="x", padx=20, pady=(0, 12))
 
         self.actions_frame = tk.Frame(self.body_card, bg=ModernStyle.BG_SECONDARY)
-        self.actions_frame.pack(fill="x", padx=24, pady=(0, 20))
+        # Packed from the bottom up and before the content: when the pop-up is capped at 75%
+        # of the app's height, the content gives way, never the buttons
+        self.actions_frame.pack(side="bottom", fill="x", padx=24, pady=(0, 20))
+        self._footer_divider.pack_configure(side="bottom", after=self.actions_frame)   # just above the buttons
+        self.status_lbl.pack_configure(side="bottom", after=self._footer_divider)
+        self.content_frame.pack(fill="both", expand=True, padx=24, pady=(18, 8))
         # Once the caller has filled the window, grow it if its content (and the
         # buttons at the bottom) would not fit; fonts and text size change heights.
-        self.after_idle(self._grow_to_fit)
+        # A timer, not after_idle: a caller's update_idletasks() would run an idle
+        # callback halfway through building, and the window would open too short.
+        self.after(1, self._reveal)
 
-    def _grow_to_fit(self) -> None:
+    def _reveal(self) -> None:
+        """Size the window to its content while it is still hidden, centre it on the app
+        and show it: one draw, no fade, so it opens at once."""
+        if self._revealed:
+            return
         try:
             if not self.winfo_exists():
                 return
-            self.update_idletasks()
-            need = min(self.winfo_reqheight(), self.winfo_screenheight() - 120)
-            if need > self.winfo_height():
-                self.geometry(f"{self.winfo_width()}x{need}")
-                from .ui_utils import center_window
-                center_window(self, parent=self.master.winfo_toplevel())
+            self._revealed = True
+            from .ui_utils import place_centered
+            w, h = self._size or (self.winfo_reqwidth(), self.winfo_reqheight())
+            if self._fit_width:
+                w = self._fit_width
+            need = fit_cards(self)
+            place_centered(self, w, need if self._fit_exact else max(h, need))
+            self.deiconify()
+            self._grab()
         except tk.TclError:
             pass
 
-    def make_compact(self) -> None:
+    def _grab(self, tries: int = 10) -> None:
+        """Keep the clicks in the pop-up (once it is on screen)."""
+        try:
+            if self.winfo_exists():
+                self.grab_set()
+        except tk.TclError:
+            if tries:
+                self.after(30, lambda: self._grab(tries - 1))
+
+    def close(self) -> None:
+        """Close at once (Esc, the Close button, the window's close button)."""
+        from .ui_utils import close_popup
+        close_popup(self)
+
+    def make_compact(self, close_bg: str | None = None, close_fg: str | None = None, variant: str = "solid") -> ModernButton:
         """Slim layout for read-only pop-ups: no footer bar, tighter padding, and a small
-        Close button at the right end of the chips row (Esc closes too)."""
+        Close button at the right end of the chips row (Esc closes too). Close has the
+        one look every Close / Cancel shares; the colour arguments are no longer used."""
         self._footer_divider.pack_forget()
         self.actions_frame.pack_forget()
         self.content_frame.pack_configure(padx=16, pady=(12, 4))
-        ModernButton(self.chips_row, text="✕ Close", command=self.destroy, bg=ModernStyle.NEUTRAL_FILL,
-                     variant="soft", canvas_bg=ModernStyle.BG_PRIMARY, width=96, height=30, radius=8,
-                     font=ModernStyle.FONT_SMALL_BOLD).pack(side="right")
-        self.bind("<Escape>", lambda _e: self.destroy())
+        self.close_btn = secondary_button(self.chips_row, "✕ Close", self.close, size="sm",
+                                          canvas_bg=ModernStyle.BG_PRIMARY)
+        self.close_btn.pack(side="right")
+        return self.close_btn
 
     def fit_to_content(self, width: int | None = None) -> None:
         """Make the window just tall enough for what it holds (never taller than the screen)."""
-        self.update_idletasks()
-        w = width or self.winfo_width()
-        h = min(self.winfo_reqheight(), self.winfo_screenheight() - 120)
-        self.geometry(f"{w}x{h}")
-        try:
-            from .ui_utils import center_window
-            center_window(self, parent=self.master.winfo_toplevel())
-        except Exception:
-            pass
+        if not self._revealed:   # not on screen yet: it opens at this size
+            self._fit_width, self._fit_exact = width, True
+            return
+        from .ui_utils import place_centered
+        place_centered(self, width or self.winfo_width(), fit_cards(self))
+
+    def set_accent(self, color: str) -> None:
+        """Colour the header's icon tile (e.g. the colour of the card the pop-up came from)."""
+        self.header.set_icon_fill(color)
 
     def set_status(self, text: str, is_error: bool = False):
         color = ModernStyle.ERROR if is_error else ModernStyle.TEXT_TERTIARY
         self.status_lbl.configure(text=text, fg=color)
         
-    def add_chip(self, emoji: str, text: str, bg_color: str = ModernStyle.ACCENT_PRIMARY_PALE, fg_color: str = ModernStyle.ACCENT_PRIMARY, font: tuple = None):
-        if font is None:
-            font = ModernStyle.FONT_SMALL_BOLD
-        chip = tk.Frame(self.chips_row, bg=bg_color, highlightthickness=1, highlightbackground=fg_color)
+    def add_chip(self, emoji: str, text: str, bg_color: str = ModernStyle.ACCENT_PRIMARY_PALE,
+                 fg_color: str = ModernStyle.ACCENT_PRIMARY, font: tuple = None) -> "Pill":
+        """A rounded tag in the row under the header; the emoji becomes a Lucide icon."""
+        chip = Pill(self.chips_row, text=f"{emoji} {text}", fill=bg_color, fg=fg_color, font=font)
         chip.pack(side="left", padx=(0, 6))
-        tk.Label(
-            chip, text=f"{emoji} {text}", bg=bg_color, fg=fg_color,
-            font=font,
-            padx=8, pady=2
-        ).pack()
+        return chip
 
 
 class LoadingOverlay(tk.Frame):
@@ -1147,10 +1915,11 @@ class LoadingOverlay(tk.Frame):
 
 class ModernCard(tk.Canvas):
     """A card layout with actual rounded corners."""
-    def __init__(self, parent, width=0, height=0, radius=12, bg=ModernStyle.BG_SECONDARY,
+    def __init__(self, parent, width=0, height=0, radius=ModernStyle.RADIUS_CARD, bg=ModernStyle.BG_SECONDARY,
                  highlight_color=ModernStyle.BORDER_COLOR, highlight_thickness=1,
-                 canvas_bg=ModernStyle.BG_PRIMARY, expand_height=False, shadow=False, **kwargs):
+                 canvas_bg=ModernStyle.BG_PRIMARY, expand_height=False, shadow=False, shrink=False, **kwargs):
         super().__init__(parent, width=width, height=height, bg=canvas_bg, highlightthickness=0, bd=0, **kwargs)
+        self._shrink = shrink   # True = also get shorter when the content does (e.g. a message is cleared)
         self.radius = radius
         self.bg_color = bg
         self.highlight_color = highlight_color
@@ -1165,9 +1934,15 @@ class ModernCard(tk.Canvas):
         # Inset the content a little more than the border so its square corners
         # sit inside the rounded shape (otherwise the corners and border look square).
         self._inset = max(self.highlight_thickness, int(radius * 0.3) + self.highlight_thickness)
-        self.content_id = self.create_window(self._inset, self._inset, window=self.content, anchor="nw")
         self._bg_items = []
-        self._shadow = 3 if shadow else 0   # px of soft shadow under the card
+        self._shadow = ModernStyle.CARD_SHADOW if shadow else 0   # px of soft shadow under the card
+        # The content is placed on the card, not embedded as a canvas window: Tk lays an
+        # embedded window out again each time its page is shown (about 8 ms a card on
+        # every page switch); placed, it follows the card's width (and height) for free.
+        place = {"x": self._inset, "y": self._inset, "relwidth": 1, "width": -2 * self._inset}
+        if expand_height:
+            place.update(relheight=1, height=-(2 * self._inset + self._shadow))
+        self.content.place(**place)
         self._shadow_items = []
         self._arc_items = []      # rounded corners: fill + outline
         self._fill_items = []     # straight fill rectangles
@@ -1175,6 +1950,7 @@ class ModernCard(tk.Canvas):
         self._drawn_size = None
         self._hover_active = False
         self._original_highlight = highlight_color
+        self.hover_color = ModernStyle.ACCENT_PRIMARY   # the border under the pointer
         # Sync canvas size whenever inner content changes or card first appears
         self.content.bind("<Configure>", self._sync_size)
         self.bind("<Map>", self._sync_size)
@@ -1188,7 +1964,7 @@ class ModernCard(tk.Canvas):
         if self._hover_active or self._shadow:   # shadowed cards stay calm on hover
             return
         self._hover_active = True
-        self._set_border(ModernStyle.ACCENT_PRIMARY)
+        self._set_border(self.hover_color)
 
     def _on_card_leave(self, event=None):
         # Only reset if the mouse actually left the card entirely
@@ -1205,10 +1981,8 @@ class ModernCard(tk.Canvas):
     def _set_border(self, color: str) -> None:
         """Recolour the border in place (re-creating the shapes made hover slow)."""
         self.highlight_color = color
-        for i in self._arc_items:
-            self.itemconfig(i, outline=color)
-        for i in self._edge_items:
-            self.itemconfig(i, fill=color)
+        for i in self._edge_items:   # straight lines and corner curves
+            self.itemconfig(i, **({"outline": color} if self.type(i) == "arc" else {"fill": color}))
         if self.radius <= 0:
             for i in self._bg_items:
                 self.itemconfig(i, outline=color)
@@ -1227,7 +2001,7 @@ class ModernCard(tk.Canvas):
         except tk.TclError:
             pass
         for i in self._arc_items:
-            self.itemconfig(i, fill=color)
+            self.itemconfig(i, fill=color, outline=color)
         for i in self._fill_items:
             self.itemconfig(i, fill=color)
             if self.highlight_thickness > 0:
@@ -1235,6 +2009,15 @@ class ModernCard(tk.Canvas):
         if self.radius <= 0:
             for i in self._bg_items:
                 self.itemconfig(i, fill=color)
+
+    def set_border(self, color: str, hover: str = "") -> None:
+        """A new resting border colour (and hover one), in place: KPI cards follow their
+        gain/loss colour."""
+        self._original_highlight = color
+        if hover:
+            self.hover_color = hover
+        if not self._hover_active and color != self.highlight_color:
+            self._set_border(color)
 
     def _sync_size(self, event=None):
         """Grow canvas to fit content perfectly. Executed synchronously to avoid macOS event loop sleeping bugs."""
@@ -1246,7 +2029,8 @@ class ModernCard(tk.Canvas):
         # Only grow — never shrink. Geometry manager handles stretching.
         if self._explicit_width == 0 and self.winfo_width() < req_w:
             kw["width"] = req_w
-        if self._explicit_height == 0 and self.winfo_height() < req_h:
+        if self._explicit_height == 0 and (self.winfo_height() < req_h
+                                           or (self._shrink and int(self.cget("height")) != req_h)):
             kw["height"] = req_h
             
         if kw:
@@ -1278,22 +2062,35 @@ class ModernCard(tk.Canvas):
             self.tag_lower(i)
         for i in self._shadow_items:
             self.tag_lower(i)
-        t = self.highlight_thickness
-        t = self._inset
-        item_kw = {"width": max(1, w - 2 * t)}
-        if self._expand_height:
-            item_kw["height"] = max(1, h - 2 * t - sh)
-        self.itemconfig(self.content_id, **item_kw)
         
+    def tint_top(self, color: str, band) -> None:
+        """Colour the card's rounded top down to the bottom of band (a full-width frame at the
+        top of .content in the same colour), so the band reaches the card's edges."""
+        self._top_tint = (color, band)
+        band.bind("<Configure>", lambda _e: self._draw_top_tint(), add="+")
+
+    def _draw_top_tint(self) -> None:
+        color, band = self._top_tint
+        self.delete("top_tint")
+        w, t, r = self.winfo_width(), self.highlight_thickness, self.radius
+        bottom = self._inset + band.winfo_y() + band.winfo_height()
+        if w < 10 or band.winfo_height() < 2:
+            return
+        kw = dict(fill=color, outline=color, tags="top_tint")
+        self.create_arc(t, t, t + 2 * r, t + 2 * r, start=90, extent=90, **kw)
+        self.create_arc(w - t - 1 - 2 * r, t, w - t - 1, t + 2 * r, start=0, extent=90, **kw)
+        self.create_rectangle(t + r, t, w - t - 1 - r, t + r, **kw)
+        self.create_rectangle(t, t + r, w - t - 1, bottom, **kw)
+
     def _rounded_rect(self, x1, y1, x2, y2, r, fill, outline, width):
         ids = []
         if r > 0:
-            arcs = [
-                self.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, fill=fill, outline=outline, width=width),
-                self.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, fill=fill, outline=outline, width=width),
-                self.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90, fill=fill, outline=outline, width=width),
-                self.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, fill=fill, outline=outline, width=width),
-            ]
+            corners = ((x1, y1, x1 + 2 * r, y1 + 2 * r, 90), (x2 - 2 * r, y1, x2, y1 + 2 * r, 0),
+                       (x1, y2 - 2 * r, x1 + 2 * r, y2, 180), (x2 - 2 * r, y2 - 2 * r, x2, y2, 270))
+            # Filled corners outlined in their own colour: a pie slice's outline also draws its
+            # two radii, which showed inside the corners once the border had a colour
+            arcs = [self.create_arc(a, b, c, d, start=s, extent=90, fill=fill, outline=fill, width=width)
+                    for a, b, c, d, s in corners]
             self._arc_items.extend(arcs)
             ids.extend(arcs)
 
@@ -1309,6 +2106,9 @@ class ModernCard(tk.Canvas):
                     self.create_line(x1, y1 + r, x1, y2 - r, fill=outline, width=width),
                     self.create_line(x2, y1 + r, x2, y2 - r, fill=outline, width=width),
                 ]
+                # ...and the rounded corners of the border: just the curves
+                edges += [self.create_arc(a, b, c, d, start=s, extent=90, style="arc", outline=outline, width=width)
+                          for a, b, c, d, s in corners]
                 self._edge_items.extend(edges)
             else:
                 rects = [
@@ -1330,25 +2130,20 @@ class PopupDatePicker(tk.Toplevel):
         super().__init__(master, **kwargs)
         self.withdraw()
         self.transient(master)
+        self.title("Select Date")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
         
-        # Try to make it look like a popup without OS chrome
+        # Ensure the close round button is enabled on macOS
         import sys
-        try:
-            if sys.platform == "win32":
-                self.overrideredirect(True)
-            elif sys.platform == "darwin":
-                # Tk 9 ignores "-type dropdown" on macOS (it opened as a normal titled
-                # window); a "plain" window has no title bar but still gets clicks and keys.
-                try:
-                    self.tk.call("::tk::unsupported::MacWindowStyle", "style", self._w, "plain", "none")
-                except tk.TclError:
-                    self.wm_attributes("-type", "dropdown")
-            else:
-                self.wm_attributes("-type", "popup_menu")
-        except Exception:
-            pass
+        if sys.platform == "darwin":
+            try:
+                self.wm_attributes("-buttons", ("close",))
+            except Exception:
+                pass
 
-        self.config(bg=ModernStyle.BG_PRIMARY, highlightthickness=1, highlightbackground=ModernStyle.ACCENT_PRIMARY, padx=0, pady=0)
+        self.config(bg=ModernStyle.BG_SECONDARY, highlightthickness=1, highlightbackground=ModernStyle.BORDER_COLOR,
+                    padx=6, pady=4)
         
         self.target_var = target_var
         self.on_select = on_select
@@ -1431,7 +2226,8 @@ class PopupDatePicker(tk.Toplevel):
             w, h = self.winfo_width(), self.winfo_height()
         except tk.TclError:
             return  # Widget already destroyed
-        if not (x <= event.x_root <= x + w and y <= event.y_root <= y + h):
+        # Include title bar area above client area so interacting with the title bar or close button is not treated as outside
+        if not (x <= event.x_root <= x + w and (y - 35) <= event.y_root <= y + h):
             self.destroy()
 
     def _on_focus_out(self, event):
@@ -1485,57 +2281,50 @@ class PopupDatePicker(tk.Toplevel):
             
         self.geometry(f"+{x}+{y}")
         
+    _DAY = 34   # day cell size (px)
+
     def _build_ui(self):
-        # Header & Navigation
-        header_frame = tk.Frame(self, bg=ModernStyle.ACCENT_PRIMARY)
-        header_frame.pack(fill=tk.X, pady=(0, 4), ipadx=4, ipady=4)
-        
-        # Helper for custom label-buttons (macOS safe)
-        def make_nav_btn(parent, text, cmd, side):
-            lbl = tk.Label(
-                parent, text=text, font=ModernStyle.FONT_BODY_BOLD,
-                bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
-                cursor="hand2", padx=4, pady=2
-            )
+        """White header with the month and Lucide chevrons, then the weekday names."""
+        from ui import icons
+        bg = ModernStyle.BG_SECONDARY
+        header_frame = tk.Frame(self, bg=bg)
+        header_frame.pack(fill=tk.X, pady=(4, 6))
+
+        def make_nav_btn(parent, icon, fallback, cmd, side):
+            glyph = icons.glyph(icon)
+            lbl = tk.Label(parent, text=glyph or fallback, font=icons.font(18) if glyph else ModernStyle.FONT_BODY_BOLD,
+                           bg=bg, fg=ModernStyle.TEXT_SECONDARY, cursor="hand2", padx=4, pady=2)
+
             def _on_click(e, _cmd=cmd):
                 _cmd()
                 return "break"  # Prevent event propagation
             lbl.bind("<Button-1>", _on_click)
-            lbl.bind("<Enter>", lambda e: lbl.config(bg=ModernStyle.ACCENT_PRIMARY_PALE, fg=ModernStyle.ACCENT_PRIMARY))
-            lbl.bind("<Leave>", lambda e: lbl.config(bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT))
+            lbl.bind("<Enter>", lambda e: lbl.config(fg=ModernStyle.ACCENT_PRIMARY))
+            lbl.bind("<Leave>", lambda e: lbl.config(fg=ModernStyle.TEXT_SECONDARY))
             lbl.pack(side=side, padx=1)
             return lbl
-        
-        make_nav_btn(header_frame, "«", self._prev_year, tk.LEFT)
-        make_nav_btn(header_frame, "‹", self._prev_month, tk.LEFT)
-        
-        self.lbl_month = tk.Label(header_frame, bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT, font=ModernStyle.FONT_SMALL_BOLD)
+
+        make_nav_btn(header_frame, "chevrons-left", "«", self._prev_year, tk.LEFT)
+        make_nav_btn(header_frame, "chevron-left", "‹", self._prev_month, tk.LEFT)
+        self.lbl_month = tk.Label(header_frame, bg=bg, fg=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_HEADING)
         self.lbl_month.pack(side=tk.LEFT, expand=True)
-        
-        make_nav_btn(header_frame, "›", self._next_month, tk.RIGHT)
-        make_nav_btn(header_frame, "»", self._next_year, tk.RIGHT)
-        
+        make_nav_btn(header_frame, "chevrons-right", "»", self._next_year, tk.RIGHT)
+        make_nav_btn(header_frame, "chevron-right", "›", self._next_month, tk.RIGHT)
+
         # Weekday Labels
-        days_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        days_frame.pack(fill=tk.X, padx=6)
-        
+        days_frame = tk.Frame(self, bg=bg)
+        days_frame.pack(fill=tk.X)
         for i, d in enumerate(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]):
             is_weekend = i >= 5
-            lbl = tk.Label(
-                days_frame, text=d, bg=ModernStyle.BG_PRIMARY, 
-                fg=ModernStyle.ACCENT_TERTIARY if is_weekend else ModernStyle.TEXT_SECONDARY, 
-                font=ModernStyle.FONT_TINY_BOLD if is_weekend else ModernStyle.FONT_TINY,
-                width=3
-            )
-            lbl.grid(row=0, column=i, pady=(2, 2))
-            days_frame.columnconfigure(i, weight=1)
-            
+            tk.Label(days_frame, text=d, bg=bg, fg=ModernStyle.WARNING if is_weekend else ModernStyle.TEXT_SECONDARY,
+                     font=ModernStyle.FONT_TINY_BOLD, width=3).grid(row=0, column=i, pady=(0, 2))
+            days_frame.columnconfigure(i, weight=1, minsize=self._DAY)
+
         # Dynamic Calendar Grid
-        self.grid_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        self.grid_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
-        
+        self.grid_frame = tk.Frame(self, bg=bg)
+        self.grid_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
         self._build_grid()
-        
+
     def _prev_year(self):
         self._navigating = True
         self.view_year -= 1
@@ -1578,79 +2367,62 @@ class PopupDatePicker(tk.Toplevel):
             pass
         
     def _build_grid(self):
+        """Round day cells: the chosen day filled blue, today ringed, a soft circle on hover."""
         for widget in self.grid_frame.winfo_children():
             widget.destroy()
-            
+
         dt = self._datetime(self.view_year, self.view_month, 1)
         self.lbl_month.config(text=dt.strftime("%B %Y"))
-        
+
+        bg, size = ModernStyle.BG_SECONDARY, self._DAY
+        now = self._datetime.now()
         weeks = self._cal.monthcalendar(self.view_year, self.view_month)
         for r, week in enumerate(weeks):
-            self.grid_frame.rowconfigure(r, weight=1)
             for c, day in enumerate(week):
                 self.grid_frame.columnconfigure(c, weight=1)
-                if day > 0:
-                    is_selected = (
-                        day == self.current_date.day and 
-                        self.view_month == self.current_date.month and 
-                        self.view_year == self.current_date.year
-                    )
-                    
-                    is_today = (
-                        day == self._datetime.now().day and 
-                        self.view_month == self._datetime.now().month and 
-                        self.view_year == self._datetime.now().year
-                    )
-                    
-                    is_weekend = c >= 5
-                    
-                    if is_selected:
-                        bg = ModernStyle.ACCENT_PRIMARY
-                        fg = ModernStyle.TEXT_ON_ACCENT
-                        hover_bg = ModernStyle.ACCENT_PRIMARY
-                    elif is_today:
-                        bg = ModernStyle.ACCENT_PRIMARY_PALE
-                        fg = ModernStyle.TEXT_ACCENT
-                        hover_bg = ModernStyle.ACCENT_PRIMARY
-                    else:
-                        bg = ModernStyle.BG_PRIMARY
-                        fg = ModernStyle.WARNING if is_weekend else ModernStyle.TEXT_PRIMARY
-                        hover_bg = ModernStyle.BG_SECONDARY
-                        
-                    btn = tk.Label(
-                        self.grid_frame, text=str(day), 
-                        font=ModernStyle.FONT_SMALL_BOLD if is_today or is_selected else ModernStyle.FONT_TINY,
-                        bg=bg, fg=fg, cursor="hand2"
-                    )
-                    btn.bind("<Button-1>", lambda e, d=day: self._select_day(d))
-                    # Square button via uniform padding, slightly smaller
-                    btn.grid(row=r, column=c, padx=0, pady=0, sticky="nsew", ipadx=0, ipady=1)
-                    
-                    # Hover effects for unselected days
-                    if not is_selected and not is_today:
-                        _bg, _hbg = bg, hover_bg
-                        btn.bind("<Enter>", lambda e, b=btn, hb=_hbg: b.config(bg=hb))
-                        btn.bind("<Leave>", lambda e, b=btn, ob=_bg: b.config(bg=ob))
-                    elif is_today and not is_selected:
-                        # accent hover for today
-                        _bg, _hbg = bg, hover_bg
-                        btn.bind("<Enter>", lambda e, b=btn, hb=_hbg: b.config(bg=hb, fg=ModernStyle.TEXT_ON_ACCENT))
-                        btn.bind("<Leave>", lambda e, b=btn, ob=_bg, of=fg: b.config(bg=ob, fg=of))
+                if day <= 0:
+                    tk.Frame(self.grid_frame, bg=bg, width=size, height=size).grid(row=r, column=c)
+                    continue
+                is_selected = (day, self.view_month, self.view_year) == (
+                    self.current_date.day, self.current_date.month, self.current_date.year)
+                is_today = (day, self.view_month, self.view_year) == (now.day, now.month, now.year)
+                cell = tk.Canvas(self.grid_frame, width=size, height=size, bg=bg, highlightthickness=0, bd=0,
+                                 cursor="hand2")
+                cell.grid(row=r, column=c)
+                circle = cell.create_oval(3, 3, size - 3, size - 3, fill="", outline="", width=2)
+                if is_selected:
+                    cell.itemconfig(circle, fill=ModernStyle.ACCENT_PRIMARY, outline=ModernStyle.ACCENT_PRIMARY)
+                    fg = ModernStyle.TEXT_ON_ACCENT
+                elif is_today:
+                    cell.itemconfig(circle, outline=ModernStyle.ACCENT_PRIMARY)
+                    fg = ModernStyle.TEXT_ACCENT
                 else:
-                    # Empty space for days outside the month
-                    spacer = tk.Frame(self.grid_frame, bg=ModernStyle.BG_PRIMARY)
-                    spacer.grid(row=r, column=c, padx=2, pady=2, sticky="nsew")
-                    
+                    fg = ModernStyle.WARNING if c >= 5 else ModernStyle.TEXT_PRIMARY
+                cell.create_text(size // 2, size // 2, text=str(day), fill=fg,
+                                 font=ModernStyle.FONT_SMALL_BOLD if is_today or is_selected else ModernStyle.FONT_SMALL)
+                cell.bind("<Button-1>", lambda e, d=day: self._select_day(d))
+                if not is_selected:
+                    cell.bind("<Enter>", lambda e, w=cell, o=circle: w.itemconfig(o, fill=ModernStyle.BG_TERTIARY))
+                    cell.bind("<Leave>", lambda e, w=cell, o=circle: w.itemconfig(o, fill=""))
+
     def _build_footer(self) -> None:
         """Today and Close links, so the popup can always be closed without picking."""
-        foot = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        foot.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(2, 6))
+        from ui import icons
+        bg = ModernStyle.BG_SECONDARY
+        foot = tk.Frame(self, bg=bg)
+        foot.pack(side=tk.BOTTOM, fill=tk.X, pady=(2, 4))
+        x_glyph = icons.glyph("x")
         for text, cmd, side, fg in (("Today", self._select_today, tk.LEFT, ModernStyle.TEXT_ACCENT),
-                                    ("✕ Close", self.destroy, tk.RIGHT, ModernStyle.TEXT_SECONDARY)):
-            lbl = tk.Label(foot, text=text, bg=ModernStyle.BG_PRIMARY, fg=fg, font=ModernStyle.FONT_SMALL_BOLD,
-                           cursor="hand2", padx=6, pady=2)
-            lbl.pack(side=side)
-            lbl.bind("<Button-1>", lambda _e, c=cmd: c())
+                                    ("Close" if x_glyph else "✕ Close", self.destroy, tk.RIGHT,
+                                     ModernStyle.TEXT_SECONDARY)):
+            row = tk.Frame(foot, bg=bg, cursor="hand2")
+            row.pack(side=side, padx=4)
+            if text == "Close" and x_glyph:
+                tk.Label(row, text=x_glyph, font=icons.font(14), bg=bg, fg=fg, cursor="hand2").pack(side=tk.LEFT)
+            tk.Label(row, text=text, bg=bg, fg=fg, font=ModernStyle.FONT_SMALL_BOLD, cursor="hand2",
+                     padx=4, pady=2).pack(side=tk.LEFT)
+            for w in (row, *row.winfo_children()):
+                w.bind("<Button-1>", lambda _e, c=cmd: c())
 
     def _select_today(self) -> None:
         today = self._datetime.now()

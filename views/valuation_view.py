@@ -19,7 +19,7 @@ from tkinter import ttk
 from model.applog import log
 from views.base_view import BaseView, _enable_canvas_mousewheel
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import RoundedBox, ModernButton, LoadingOverlay, ModernCard, ModernEntry
+from ui.ui_widgets import RoundedBox, LoadingOverlay, action_button, ModernCard, ModernEntry, ScrollArea
 from ui.ui_utils import run_in_background
 import pandas as pd
 
@@ -388,29 +388,13 @@ class ValuationView(BaseView):
         self.main_scroll_frame = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
         self.main_scroll_frame.pack(fill="both", expand=True)
 
-        canvas = tk.Canvas(
-            self.main_scroll_frame,
-            bg=ModernStyle.BG_PRIMARY,
-            highlightthickness=0
-        )
-        scrollbar = ttk.Scrollbar(self.main_scroll_frame, orient="vertical", command=canvas.yview)
-        self.scrollable_inner = tk.Frame(canvas, bg=ModernStyle.BG_PRIMARY)
-
-        self.scrollable_inner.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas_window = canvas.create_window((0, 0), window=self.scrollable_inner, anchor="nw")
-        
-        def _on_canvas_configure(event):
-            canvas.itemconfig(canvas_window, width=event.width)
-            
-        canvas.bind("<Configure>", _on_canvas_configure)
-
+        # A ScrollArea, not a canvas window: Tk lays a canvas window out again on every
+        # visit to the page (about 0.08 s here)
+        scrollbar = ttk.Scrollbar(self.main_scroll_frame, orient="vertical")
+        canvas = ScrollArea(self.main_scroll_frame, ModernStyle.BG_PRIMARY, scrollbar=scrollbar, unit=30)
+        self.scrollable_inner = canvas.inner
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        canvas.configure(yscrollcommand=scrollbar.set)
         _enable_canvas_mousewheel(canvas)
         
         # ── Loading Overlay ───────────────────────────────────────────────────
@@ -423,7 +407,7 @@ class ValuationView(BaseView):
             bg=ModernStyle.BG_SECONDARY,
             highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
             highlight_thickness=1,
-            radius=10,
+            radius=ModernStyle.RADIUS_CARD,
             canvas_bg=ModernStyle.BG_PRIMARY
         )
         input_card.pack(fill="x", padx=20, pady=(10, 6))
@@ -433,7 +417,7 @@ class ValuationView(BaseView):
         tk.Label(
             input_inner, text="Stock Symbol:",
             fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY,
-            font=ModernStyle.FONT_HEADING,
+            font=ModernStyle.FONT_FIELD_LABEL,
         ).pack(side="left", padx=(0, 10))
 
         self._v_symbol = tk.StringVar()
@@ -455,14 +439,8 @@ class ValuationView(BaseView):
         self._fetch_gen = 0
         self._e_symbol.bind("<Return>", lambda _e: self._fetch_data())
 
-        self._btn_fetch = ModernButton(
-            input_inner, text="▶ Analyze",
-            command=self._fetch_data,
-            bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY,
-            width=140, height=40, radius=8,
-            font=ModernStyle.FONT_SUBHEADING,
-        )
+        self._btn_fetch = action_button(input_inner, "▶ Analyze", self._fetch_data, width=140,
+                                        canvas_bg=ModernStyle.BG_SECONDARY)
         self._btn_fetch.pack(side="left")
 
         self._lbl_status = tk.Label(
@@ -488,13 +466,13 @@ class ValuationView(BaseView):
             bg=ModernStyle.BG_SECONDARY,
             highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
             highlight_thickness=1,
-            radius=10,
+            radius=ModernStyle.RADIUS_CARD,
             canvas_bg=ModernStyle.BG_PRIMARY
         )
         self.summary_card.pack(fill="x", padx=20, pady=10)
         self.summary_card.pack_forget() # Hide initially
 
-        tk.Frame(self.summary_card.content, bg=ModernStyle.ACCENT_SECONDARY, height=3).pack(fill="x")
+        tk.Frame(self.summary_card.content, bg=ModernStyle.ACCENT_SECONDARY, height=ModernStyle.ACCENT_BAR).pack(fill="x")
         
         summary_inner = tk.Frame(self.summary_card.content, bg=ModernStyle.BG_SECONDARY)
         summary_inner.pack(fill="both", expand=True, padx=20, pady=16)
@@ -513,11 +491,11 @@ class ValuationView(BaseView):
         prices_frame = tk.Frame(left_summary, bg=ModernStyle.BG_SECONDARY)
         prices_frame.pack(anchor="w")
         
-        tk.Label(prices_frame, text="Current Price:", font=ModernStyle.FONT_SUBHEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY).grid(row=0, column=0, sticky="w", pady=2)
+        tk.Label(prices_frame, text="Current Price:", font=ModernStyle.FONT_FIELD_LABEL, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY).grid(row=0, column=0, sticky="w", pady=2)
         self.lbl_current_price = tk.Label(prices_frame, text="---", font=ModernStyle.FONT_HEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY)
         self.lbl_current_price.grid(row=0, column=1, sticky="w", padx=10, pady=2)
 
-        tk.Label(prices_frame, text="Intrinsic Value:", font=ModernStyle.FONT_SUBHEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY).grid(row=1, column=0, sticky="w", pady=2)
+        tk.Label(prices_frame, text="Intrinsic Value:", font=ModernStyle.FONT_FIELD_LABEL, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY).grid(row=1, column=0, sticky="w", pady=2)
         self.lbl_intrinsic_value = tk.Label(prices_frame, text="---", font=ModernStyle.FONT_HEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY)
         self.lbl_intrinsic_value.grid(row=1, column=1, sticky="w", padx=10, pady=2)
         
@@ -536,7 +514,7 @@ class ValuationView(BaseView):
         right_summary = tk.Frame(summary_inner, bg=ModernStyle.BG_SECONDARY)
         right_summary.pack(side="left", fill="both", expand=True)
         
-        tk.Label(right_summary, text="Decision Rationale", font=ModernStyle.FONT_SUBHEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
+        tk.Label(right_summary, text="Decision Rationale", font=ModernStyle.FONT_CARD_TITLE, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
         
         self.txt_rationale = tk.Text(
             right_summary, height=12, bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY,
@@ -628,7 +606,7 @@ class ValuationView(BaseView):
             card = ModernCard(
                 self.metrics_frame, bg=ModernStyle.BG_SECONDARY,
                 highlight_color=ModernStyle.BG_SECONDARY, shadow=True, highlight_thickness=1,
-                radius=10, canvas_bg=ModernStyle.BG_PRIMARY
+                radius=ModernStyle.RADIUS_CARD, canvas_bg=ModernStyle.BG_PRIMARY
             )
             card.grid(row=row_idx, column=col_idx, sticky="nsew", padx=8, pady=8)
             self.metrics_frame.grid_columnconfigure(col_idx, weight=1)
@@ -636,7 +614,7 @@ class ValuationView(BaseView):
             # Category Header
             tk.Label(
                 card.content, text=cat_name.upper(),
-                font=ModernStyle.FONT_SMALL_BOLD,
+                font=ModernStyle.FONT_SMALL,
                 fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY
             ).pack(anchor="w", padx=12, pady=(12, 6))
             
@@ -701,7 +679,7 @@ class ValuationView(BaseView):
         gen = self._fetch_gen
 
         # The button stays readable while busy; clicks are ignored via _fetching
-        self._btn_fetch.set_text("🔄 Analyzing…")
+        self._btn_fetch.set_text("⏳ Analyzing…")
         self._flash_status(f"Fetching data for {symbol}…")
         self.loading_overlay.show()
         self.loading_overlay.set_text(f"Fetching data for {symbol}…")

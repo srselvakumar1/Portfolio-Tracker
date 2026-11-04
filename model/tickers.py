@@ -63,6 +63,37 @@ def _save_cache():
         log.exception("Could not save the ticker cache")
 
 
+TICKERS = (('^NSEI', 'NIFTY 50'), ('^N225', 'Nikkei 225'), ('^IXIC', 'NASDAQ'), ('INR=X', 'USD/INR'),
+           ('JPY=X', 'USD/JPY'), ('JPYINR=X', 'JPY/INR'))
+
+
+def download_tickers() -> dict:
+    """{name: {"price", "change", "pct"}} for the sidebar tickers (runs in the price helper)."""
+    import yfinance as yf
+    symbols = [s for s, _n in TICKERS]
+    # threads=False avoids ThreadPoolExecutor deadlocks inside daemon threads
+    data = yf.download(symbols, period="7d", progress=False, threads=False)
+    results = {}
+    for sym, name in TICKERS:
+        try:
+            series = data['Close'][sym].dropna()
+            if len(series) >= 2:
+                cp = float(series.iloc[-1])
+                pc = float(series.iloc[-2])
+                if cp > 0:
+                    chg = cp - pc
+                    pct = (chg / pc * 100) if pc > 0 else 0.0
+                    if sym == 'JPYINR=X':
+                        cp *= 100
+                        chg *= 100
+                    results[name] = {"price": cp, "change": chg, "pct": pct}
+            else:
+                log.info("Ticker %s skipped: only %d price points", sym, len(series))
+        except Exception:
+            log.exception("Could not read ticker %s", sym)
+    return results
+
+
 def refresh_mini_tickers(callback=None):
     """Fetch the sidebar tickers in the background; call `callback()` (from that thread) when done.
 
@@ -78,51 +109,29 @@ def refresh_mini_tickers(callback=None):
 
     def _fetch():
         global _fetching, _fetched_at
-        symbols = ['^NSEI', '^N225', '^IXIC', 'INR=X', 'JPY=X', 'JPYINR=X']
-        names = ['NIFTY 50', 'Nikkei 225', 'NASDAQ', 'USD/INR', 'USD/JPY', 'JPY/INR']
         results = {}
-
-        try:
-            import yfinance as yf
-            # threads=False avoids ThreadPoolExecutor deadlocks inside daemon threads
-            data = yf.download(symbols, period="7d", progress=False, threads=False)
-
-            for sym, name in zip(symbols, names):
-                try:
-                    series = data['Close'][sym].dropna()
-                    if len(series) >= 2:
-                        cp = float(series.iloc[-1])
-                        pc = float(series.iloc[-2])
-
-                        if cp > 0:
-                            chg = cp - pc
-                            pct = (chg / pc * 100) if pc > 0 else 0.0
-
-                            if sym == 'JPYINR=X':
-                                cp *= 100
-                                chg *= 100
-
-                            results[name] = {"price": cp, "change": chg, "pct": pct}
-                    else:
-                        log.info("Ticker %s skipped: only %d price points", sym, len(series))
-                except Exception:
-                    log.exception("Could not read ticker %s", sym)
+        try:   # in the price helper process, so the window doesn't wait behind yfinance
+            from model import price_worker
+            results = price_worker.run(download_tickers, timeout=90)
         except Exception:
-            log.exception("Ticker download failed")
-        finally:
-            with _ticker_lock:
-                if results:
-                    _ticker_cache.update(results)
-                    _fetched_at = time.time()
-                    _save_cache()
-                _fetching = False
-                callbacks = list(_pending_callbacks)
-                _pending_callbacks.clear()
-            log.info("Tickers refreshed: %d of %d", len(results), len(symbols))
-            for cb in callbacks:
-                try:
-                    cb()
-                except Exception:
-                    log.exception("Ticker callback failed")
+            log.warning("Price helper unavailable: fetching tickers in the app instead", exc_info=True)
+            try:
+                results = download_tickers()
+            except Exception:
+                log.exception("Ticker download failed")
+        with _ticker_lock:
+            if results:
+                _ticker_cache.update(results)
+                _fetched_at = time.time()
+                _save_cache()
+            _fetching = False
+            callbacks = list(_pending_callbacks)
+            _pending_callbacks.clear()
+        log.info("Tickers refreshed: %d of %d", len(results), len(TICKERS))
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception:
+                log.exception("Ticker callback failed")
 
     threading.Thread(target=_fetch, daemon=True, name="tickers").start()

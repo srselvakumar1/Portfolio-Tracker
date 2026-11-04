@@ -18,16 +18,18 @@ from __future__ import annotations
 
 import math
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
+from ui import dialogs
 
 import pandas as pd
 
 from model.applog import log
 from views.base_view import BaseView
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import EmptyState, RoundedBox, ModernButton, ModernEntry, ModernCard, PremiumModal
+from ui.ui_widgets import (EmptyState, RoundedBox, ModernButton, ModernEntry, ModernCard, PremiumModal, ScrollArea,
+                           action_button, header_button, secondary_button)
 from ui.ui_utils import (add_treeview_copy_menu, format_date, treeview_sort_column, run_in_background,
-                         call_on_ui, show_toast, ToolTip, HeadingTips)
+                         call_on_ui, color_gain_loss, color_signals, show_toast, ToolTip, HeadingTips)
 
 
 # ── Signals ───────────────────────────────────────────────────────────────────
@@ -435,14 +437,13 @@ def _fit_to_screen(widget: tk.Misc, want_w: int, want_h: int) -> str:
     return f"{w}x{h}"
 
 
-def _bind_popup_scroll(top: tk.Toplevel, canvas: tk.Canvas) -> None:
-    """Scroll `canvas` with the wheel/trackpad anywhere inside `top`.
+def _bind_popup_scroll(top: tk.Toplevel, canvas: ScrollArea) -> None:
+    """Scroll `canvas` (a ScrollArea, 20 px a step) with the wheel/trackpad anywhere inside `top`.
 
     The bindings live on the pop-up window itself (every child has it in its
     bindtags), so they never affect the rest of the app and vanish with the
     pop-up. Returning "break" stops a main-window bind_all handler running too.
     """
-    canvas.configure(yscrollincrement=20)
     pending = [0.0]
 
     def _wheel(event):
@@ -471,17 +472,12 @@ def _bind_popup_scroll(top: tk.Toplevel, canvas: tk.Canvas) -> None:
         pass
 
 
-def _make_scroll_area(parent: tk.Misc, bg: str) -> tuple[tk.Canvas, tk.Frame]:
-    canvas = tk.Canvas(parent, bg=bg, highlightthickness=0)
-    scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-    inner = tk.Frame(canvas, bg=bg)
-    inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-    window = canvas.create_window((0, 0), window=inner, anchor="nw")
-    canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
-    canvas.configure(yscrollcommand=scrollbar.set)
-    canvas.pack(side="left", fill="both", expand=True)
+def _make_scroll_area(parent: tk.Misc, bg: str) -> tuple[ScrollArea, tk.Frame]:
+    scrollbar = ttk.Scrollbar(parent, orient="vertical")
+    area = ScrollArea(parent, bg, scrollbar=scrollbar)
+    area.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
-    return canvas, inner
+    return area, area.inner
 
 
 def _alive(widget) -> bool:
@@ -525,63 +521,119 @@ class WatchlistView(BaseView):
         self._fetch_btn = None
         self._signal_filter = "all"
         self._filter_pills: dict[str, tk.Label] = {}
+        self.wl_currency_var = tk.StringVar(value="INR")
 
         def _build_right(parent):
-            self._btn_refresh_all = ModernButton(
-                parent, text="↻ Refresh All",
-                command=self._bulk_refresh_metrics,
-                bg=ModernStyle.WARNING_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-                canvas_bg=ModernStyle.PURPLE_FILL, width=170, height=36, radius=8,
-                font=ModernStyle.FONT_BODY_BOLD
-            )
+            # Currency pills (matching My Holdings: radius=14, green/purple/slate)
+            self._wl_curr_btns = {}
+            for code in ("INR", "JPY"):
+                sym = {"INR": "₹", "JPY": "¥"}.get(code, "₹")
+                btn = ModernButton(
+                    parent, text=f"{sym} {code}",
+                    command=lambda c=code: self.wl_currency_var.set(c),
+                    bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
+                    width=86, height=32, radius=14, font=ModernStyle.FONT_BODY_BOLD,
+                )
+                btn.pack(side="left", padx=(0, 6))
+                self._wl_curr_btns[code] = btn
+            self.wl_currency_var.trace_add("write", self._on_wl_currency_change)
+            self._update_wl_currency_pills()
+
+            self._btn_refresh_all = header_button(parent, "↻ Refresh All", self._bulk_refresh_metrics,
+                                                  main=True, width=160)
             self._btn_refresh_all.pack(side="left", pady=(0, 4))
             ToolTip(self._btn_refresh_all, "Fetch the latest metrics from Yahoo Finance for every symbol")
 
-        self.add_gradient_header(
+        header = self.add_gradient_header(
             self,
             "👁  Watchlist",
             "Click a row to edit it · double-click for the full analysis.",
             right_widget_func=_build_right
         )
+        header.pack_configure(pady=(6, 0))   # tight spacing: the table gets the room
 
         # ── Inline form ───────────────────────────────────────────────────────
         form_card = ModernCard(self,
             bg=ModernStyle.BG_SECONDARY,
             highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
             highlight_thickness=1,
-            radius=10,
+            radius=ModernStyle.RADIUS_CARD,
             canvas_bg=ModernStyle.BG_PRIMARY
         )
-        form_card.pack(fill="x", padx=20, pady=(14, 6))
+        form_card.pack(fill="x", padx=20, pady=(4, 2))
 
         form_inner = tk.Frame(form_card.content, bg=ModernStyle.BG_SECONDARY)
-        form_inner.pack(fill="x", padx=16, pady=14)
+        form_inner.pack(fill="x", padx=16, pady=(8, 10))
 
         # Row 1: Symbol (+ Add) | Notes | Tags | My Target
         fields_row = tk.Frame(form_inner, bg=ModernStyle.BG_SECONDARY)
         fields_row.pack(fill="x")
 
-        def _field(parent, label: str, var: tk.StringVar, width: int = 14, expand=False) -> ModernEntry:
+        def _field(parent, label: str, var: tk.StringVar, width: int = 14, expand=False, placeholder: str = "") -> ModernEntry:
             col = tk.Frame(parent, bg=ModernStyle.BG_SECONDARY)
             col.pack(side="left", padx=(0, 16), fill="x" if expand else None, expand=expand)
-            tk.Label(
-                col, text=label, bg=ModernStyle.BG_SECONDARY,
-                fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD
-            ).pack(anchor="w", pady=(0, 2))
-            box = RoundedBox(col)
+
+            lbl_frame = tk.Frame(col, bg=ModernStyle.BG_SECONDARY)
+            lbl_frame.pack(anchor="w", pady=(0, 4))
+            if "*" in label:
+                clean_lbl = label.replace("*", "").strip()
+                tk.Label(
+                    lbl_frame, text=clean_lbl, bg=ModernStyle.BG_SECONDARY,
+                    fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD
+                ).pack(side="left")
+                tk.Label(
+                    lbl_frame, text=" *", bg=ModernStyle.BG_SECONDARY,
+                    fg=ModernStyle.ERROR, font=ModernStyle.FONT_SMALL_BOLD
+                ).pack(side="left")
+            else:
+                tk.Label(
+                    lbl_frame, text=label, bg=ModernStyle.BG_SECONDARY,
+                    fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD
+                ).pack(side="left")
+
+            box = RoundedBox(col, padx=5, pady=5)
+            inner = tk.Frame(box, bg=ModernStyle.ENTRY_BG)
+            inner.pack(fill="both", expand=True)
+
             e = ModernEntry(
-                box, placeholder="",
+                inner, placeholder=placeholder,
                 textvariable=var,
                 bg=ModernStyle.ENTRY_BG,
                 fg=ModernStyle.TEXT_PRIMARY,
-                insertbackground=ModernStyle.TEXT_PRIMARY,
+                insertbackground=ModernStyle.ACCENT_PRIMARY,
                 highlightthickness=0,
                 relief=tk.FLAT,
                 font=ModernStyle.FONT_INPUT,
                 width=width
             )
-            e.pack(fill="x", ipady=5, padx=8)
-            box.watch(e)
+            e.pack(side="left", fill="x", expand=True, padx=(10, 8), pady=3, ipady=4)
+
+            # Enhanced hover & focus border effects
+            is_focused = [False]
+            def _on_focus_in(_evt):
+                is_focused[0] = True
+                if str(box.cget("bg")) != ModernStyle.ERROR:
+                    box.configure(bg=ModernStyle.ACCENT_PRIMARY)
+
+            def _on_focus_out(_evt):
+                is_focused[0] = False
+                if str(box.cget("bg")) != ModernStyle.ERROR:
+                    box.configure(bg=ModernStyle.BORDER_COLOR)
+
+            def _on_hover_in(_evt):
+                if not is_focused[0] and str(box.cget("bg")) != ModernStyle.ERROR:
+                    box.configure(bg=ModernStyle.TEXT_TERTIARY)
+
+            def _on_hover_out(_evt):
+                if not is_focused[0] and str(box.cget("bg")) != ModernStyle.ERROR:
+                    box.configure(bg=ModernStyle.BORDER_COLOR)
+
+            e.bind("<FocusIn>", _on_focus_in, add="+")
+            e.bind("<FocusOut>", _on_focus_out, add="+")
+            for w in (box, inner, e):
+                w.bind("<Enter>", _on_hover_in, add="+")
+                w.bind("<Leave>", _on_hover_out, add="+")
+
             box.pack(anchor="w", fill="x" if expand else None)
             e.bind("<Return>", lambda _e: self._on_save())
             e.bind("<Escape>", self._clear_form, add="+")
@@ -595,64 +647,34 @@ class WatchlistView(BaseView):
         self._metrics_keys = list(self.BASE_METRIC_KEYS)
         self._metrics_vars = {k: tk.StringVar() for k in self._metrics_keys}
 
-        self._e_symbol = _field(fields_row, "Symbol *", self._v_symbol, width=11)
+        self._e_symbol = _field(fields_row, "Symbol *", self._v_symbol, width=12, placeholder="e.g. INFY")
 
         # Add-as-new button next to the symbol
-        add_btn = ModernButton(
-            fields_row, text="+ Add",
-            command=self._on_quick_add,
-            bg=ModernStyle.SUCCESS_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY,
-            width=86, height=36, radius=8,
-            font=ModernStyle.FONT_BODY_BOLD,
-        )
-        add_btn.pack(side="left", padx=(0, 16), pady=(20, 0))
+        add_btn = action_button(fields_row, "+ Add", self._on_quick_add, kind="success",
+                                canvas_bg=ModernStyle.BG_SECONDARY)
+        add_btn.pack(side="left", padx=(0, 16), pady=(22, 0))
         ToolTip(add_btn, "Add this symbol as a new watchlist entry")
 
-        self._e_notes = _field(fields_row, "Notes", self._v_notes, width=12, expand=True)
-        self._e_tags = _field(fields_row, "Tags", self._v_tags, width=11)
-        self._e_target = _field(fields_row, "My Target Price", self._v_target, width=10)
+        self._e_notes = _field(fields_row, "Notes", self._v_notes, width=14, expand=True, placeholder="Investment thesis / key notes...")
+        self._e_tags = _field(fields_row, "Tags", self._v_tags, width=12, placeholder="e.g. Bluechip, Tech")
+        self._e_target = _field(fields_row, "My Target Price", self._v_target, width=11, placeholder="₹ Target")
         self._entries = (self._e_symbol, self._e_notes, self._e_tags, self._e_target)
 
         # Row 2: Buttons
         btn_row = tk.Frame(form_inner, bg=ModernStyle.BG_SECONDARY)
-        btn_row.pack(fill="x", pady=(10, 0))
+        btn_row.pack(fill="x", pady=(8, 0))
 
-        ModernButton(
-            btn_row, text="✓  Save",
-            command=self._on_save,
-            bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY,
-            width=110, height=36, radius=8,
-            font=ModernStyle.FONT_SUBHEADING,
-        ).pack(side="left", padx=(0, 8))
+        action_button(btn_row, "✓ Save", self._on_save,
+                      canvas_bg=ModernStyle.BG_SECONDARY).pack(side="left", padx=(0, 8))
 
-        ModernButton(
-            btn_row, text="✕  Clear", variant="soft",
-            command=self._clear_form,
-            bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY,
-            width=100, height=36, radius=8,
-            font=ModernStyle.FONT_SUBHEADING,
-        ).pack(side="left", padx=(0, 8))
+        secondary_button(btn_row, "Clear", self._clear_form, icon="eraser",
+                         canvas_bg=ModernStyle.BG_SECONDARY).pack(side="left", padx=(0, 8))
 
-        ModernButton(
-            btn_row, text="✎  Edit Metrics", variant="soft",
-            command=self._open_metrics_dialog,
-            bg=ModernStyle.PURPLE_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY,
-            width=150, height=36, radius=8,
-            font=ModernStyle.FONT_BODY_BOLD,
-        ).pack(side="left", padx=(0, 8))
+        action_button(btn_row, "Edit Metrics", self._open_metrics_dialog, soft=True, icon="gauge",
+                      canvas_bg=ModernStyle.BG_SECONDARY).pack(side="left", padx=(0, 8))
 
-        self._del_btn = ModernButton(
-            btn_row, text="✕  Delete", variant="soft",
-            command=self._on_delete,
-            bg=ModernStyle.ERROR_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY,
-            width=110, height=36, radius=8,
-            font=ModernStyle.FONT_SUBHEADING,
-        )
+        self._del_btn = action_button(btn_row, "Delete", self._on_delete, kind="danger", soft=True,
+                                      icon="trash-2", canvas_bg=ModernStyle.BG_SECONDARY)
         self._del_btn.pack(side="left")
         self._set_delete_enabled(False)   # enabled only when a row is selected
 
@@ -666,7 +688,7 @@ class WatchlistView(BaseView):
 
         # ── Signal filter pills ───────────────────────────────────────────────
         filter_bar = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
-        filter_bar.pack(fill="x", padx=22, pady=(6, 0))
+        filter_bar.pack(fill="x", padx=22, pady=(4, 0))
         tk.Label(
             filter_bar, text="Show:", bg=ModernStyle.BG_PRIMARY,
             fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD,
@@ -687,11 +709,11 @@ class WatchlistView(BaseView):
             bg=ModernStyle.BG_SECONDARY,
             highlight_color=ModernStyle.BG_SECONDARY, shadow=True,
             highlight_thickness=1,
-            radius=10,
+            radius=ModernStyle.RADIUS_CARD,
             canvas_bg=ModernStyle.BG_PRIMARY,
             expand_height=True,
         )
-        table_frame.pack(fill="both", expand=True, padx=20, pady=(6, 20))
+        table_frame.pack(fill="both", expand=True, padx=20, pady=(4, 12))
         table_frame.content.grid_rowconfigure(0, weight=1)
         table_frame.content.grid_columnconfigure(0, weight=1)
         self._empty = EmptyState(table_frame.content)
@@ -702,7 +724,12 @@ class WatchlistView(BaseView):
 
         style = ttk.Style()
         style.configure("Watchlist.Treeview", font=ModernStyle.FONT_TABLE, rowheight=ModernStyle.TABLE_ROW_HEIGHT)
-        style.configure("Watchlist.Treeview.Heading", font=ModernStyle.FONT_SUBHEADING)
+        style.configure("Watchlist.Treeview.Heading", font=ModernStyle.FONT_SUBHEADING,
+                        background=ModernStyle.TABLE_HEADER_BG, foreground=ModernStyle.TABLE_HEADER_FG,
+                        relief="flat")
+        style.map("Watchlist.Treeview.Heading",
+                  background=[("active", ModernStyle.TABLE_HEADER_HOVER)],
+                  foreground=[("active", ModernStyle.TABLE_HEADER_FG)])
 
         self._tv = ttk.Treeview(
             table_frame.content, columns=cols, show="headings",
@@ -725,12 +752,15 @@ class WatchlistView(BaseView):
         sortable_cols = ("Symbol", "Signal", "Current Px", "IV (DCF)", "MoS %", "P/E", "Div. Yield", "From 52W H", "Added")
 
         for c, w in zip(cols, col_widths):
-            anchor = "center" if c in ("#", "Added") else "w"
+            # numbers on the right so their digits line up; text and values with a ▲/▼ on the left
+            anchor = ("center" if c in ("#", "Added") else
+                      "e" if c in ("Current Px", "IV (DCF)", "Graham No.", "Analyst Tgt", "My Target",
+                                   "P/E", "PEG", "Div. Yield") else "w")
             if c in sortable_cols:
-                self._tv.heading(c, text=f"{c} ↕", anchor=anchor,
+                self._tv.heading(c, text=f"{c} ↕", anchor="center",
                                  command=lambda col=c: treeview_sort_column(self._tv, col, False))
             else:
-                self._tv.heading(c, text=c, anchor=anchor)
+                self._tv.heading(c, text=c, anchor="center")
             self._tv.column(c, width=w, minwidth=w, anchor=anchor)
 
         # Row colours by signal. Configured BEFORE the plain stripes so they win
@@ -739,8 +769,11 @@ class WatchlistView(BaseView):
         for key in SIGNAL_ORDER:
             if key == "nodata":
                 continue
-            fg, pale, _fill = signal_colours(key)
-            self._tv.tag_configure(f"sig_{key}", background=pale, foreground=fg)
+            _fg, pale, _fill = signal_colours(key)
+            # a third of the signal's soft tint (as in Holdings): just a hint of colour. The text
+            # stays plain; only the Signal and the indicator columns are coloured
+            row_bg = ModernButton._blend(pale, ModernStyle.BG_SECONDARY, 0.35)
+            self._tv.tag_configure(f"sig_{key}", background=row_bg, foreground=ModernStyle.TEXT_PRIMARY)
         self._tv.tag_configure("plain_odd", background=ModernStyle.BG_SECONDARY, foreground=ModernStyle.TEXT_PRIMARY)
         self._tv.tag_configure("plain_even", background=ModernStyle.TABLE_ROW_ALT, foreground=ModernStyle.TEXT_PRIMARY)
 
@@ -792,7 +825,9 @@ class WatchlistView(BaseView):
             if key in self._db_columns and key not in self._metrics_vars:
                 self._metrics_vars[key] = tk.StringVar()
                 self._metrics_keys.append(key)
-        self._populate_table(rows)
+        # Each visit reloads the list; the table is only rebuilt when something changed
+        if rows != getattr(self, "_data", None) or not self._tv.get_children():
+            self._populate_table(rows)
         if self._selected_id is not None and self._tv.exists(str(self._selected_id)):
             self._tv.selection_set(str(self._selected_id))
 
@@ -818,6 +853,26 @@ class WatchlistView(BaseView):
         self._style_pills()
         self._populate_table()
 
+    # ── Currency filter ──────────────────────────────────────────────────────
+
+    def _update_wl_currency_pills(self, *_):
+        S = ModernStyle
+        active = self.wl_currency_var.get()
+        fills = {"INR": S.SUCCESS_FILL, "JPY": S.PURPLE_FILL}
+        for code, btn in self._wl_curr_btns.items():
+            sym = {"INR": "₹", "JPY": "¥"}.get(code, "₹")
+            if code == active:
+                btn.set_palette(bg=fills.get(code, S.ACCENT_PRIMARY), fg=S.TEXT_ON_ACCENT)
+                btn.set_text(f"✓ {sym} {code}")
+            else:
+                btn.set_palette(bg=S.NEUTRAL_FILL, fg=S.TEXT_ON_ACCENT)
+                btn.set_text(f"{sym} {code}")
+
+    def _on_wl_currency_change(self, *_):
+        self._update_wl_currency_pills()
+        if hasattr(self, '_tv'):
+            self._populate_table()
+
     # ── Table rendering ───────────────────────────────────────────────────────
 
     def _populate_table(self, data: list[dict] | None = None) -> None:
@@ -825,16 +880,23 @@ class WatchlistView(BaseView):
             self._data = data
         self._tv.delete(*self._tv.get_children())
 
+        active_cur = self.wl_currency_var.get()
         counts = {k: 0 for k in SIGNAL_ORDER}
+        currency_total = 0
         shown = 0
         for row in self._data:
+            sym = row.get("symbol", "")
+            row_cur = "JPY" if str(sym).upper().endswith(".T") else "INR"
+            if row_cur != active_cur:
+                continue
+            currency_total += 1
+
             key, signal_badge_text, _ = compute_signal(row)
             counts[key] += 1
             if self._signal_filter != "all" and key != self._signal_filter:
                 continue
 
-            sym = row.get("symbol", "")
-            cy = "¥" if str(sym).upper().endswith(".T") else "₹"
+            cy = "¥" if active_cur == "JPY" else "₹"
 
             def money(text):
                 text = str(text or "").strip()
@@ -894,6 +956,8 @@ class WatchlistView(BaseView):
                 tags=(row_tag,),
             )
             shown += 1
+        color_gain_loss(self._tv, ("MoS %", "From 52W H"))
+        color_signals(self._tv, "Signal")
 
         # A friendly empty screen when nothing is listed (once the data has loaded)
         if shown == 0 and (data is not None or self._data_loaded):
@@ -901,6 +965,11 @@ class WatchlistView(BaseView):
                 self._empty.show("👀", "Your watchlist is empty",
                                  "Type a symbol in the form above and press Add to follow a stock.",
                                  "+ Add a stock", lambda: self._e_symbol.focus_set())
+            elif currency_total == 0:
+                other = "JPY" if active_cur == "INR" else "INR"
+                self._empty.show("💱", f"No {active_cur} stocks in watchlist",
+                                 f"Switch to {other} or add a stock.",
+                                 f"↺ Show {other}", lambda o=other: self.wl_currency_var.set(o))
             else:
                 self._empty.show("🔍", "No stocks with this signal",
                                  "Pick another signal above, or show them all.",
@@ -908,17 +977,21 @@ class WatchlistView(BaseView):
         else:
             self._empty.hide()
 
-        total = len(self._data)
+        total = currency_total
         for key, pill in self._filter_pills.items():
             pill.config(text=self._pill_text(key, total if key == "all" else counts[key]))
+        if total:   # in the header: the verdicts at a glance
+            buy = counts["strong_buy"] + counts["accumulate"]
+            self.set_header_summary(f"{total} {active_cur} {'stock' if total == 1 else 'stocks'}  ·  "
+                                    f"{buy} worth buying  ·  {counts['wait']} to watch  ·  {counts['avoid']} to avoid")
+        else:
+            self.set_header_summary("")
 
     # ── Form helpers ──────────────────────────────────────────────────────────
 
     def _set_delete_enabled(self, enabled: bool) -> None:
-        # A grey surface when disabled, so the greyed-out text stays readable
         try:
-            self._del_btn.set_palette(bg=ModernStyle.ERROR_FILL if enabled else ModernStyle.BG_TERTIARY)
-            self._del_btn.set_disabled(not enabled)
+            self._del_btn.set_disabled(not enabled)   # greyed out while off, its soft red while on
         except Exception:
             pass
 
@@ -1069,7 +1142,7 @@ class WatchlistView(BaseView):
         if self._selected_id is None:
             return
         symbol = self._loaded.get("symbol") or self._v_symbol.get().strip().upper() or str(self._selected_id)
-        if not messagebox.askyesno(
+        if not dialogs.askyesno(
             "Delete from Watchlist",
             f"Remove '{symbol}' from your watchlist?",
             parent=self,
@@ -1126,7 +1199,7 @@ class WatchlistView(BaseView):
         )
 
     def _reset_fetch_btn_later(self) -> None:
-        self.after(2500, lambda: self._set_fetch_btn("↻ Auto-Fill (yfinance)"))
+        self.after(2500, lambda: self._set_fetch_btn("✨ Auto-Fill (yfinance)"))
 
     def _on_autofill_done(self, symbol: str, result) -> None:
         self._autofill_running = False
@@ -1230,7 +1303,8 @@ class WatchlistView(BaseView):
 
     def _open_metrics_dialog(self):
         sym = self._v_symbol.get().strip().upper() or "New Symbol"
-        top = PremiumModal(self, title="Advanced Metrics", geometry=_fit_to_screen(self, 820, 850), icon="📋")
+        top = PremiumModal(self, title="Advanced Metrics", geometry=_fit_to_screen(self, 820, 850), icon="gauge",
+                           icon_color="#0EA5E9")
         top.resizable(True, True)
         top.minsize(600, 420)
         top.add_chip("📈", sym, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.TEXT_ON_ACCENT)
@@ -1276,7 +1350,7 @@ class WatchlistView(BaseView):
                 continue
             group_wrapper = tk.Frame(scrollable_frame, bg=ModernStyle.BG_SECONDARY)
             group_wrapper.pack(fill="x", pady=(0, 15))
-            tk.Frame(group_wrapper, bg=accent_color, height=3).pack(fill="x")
+            tk.Frame(group_wrapper, bg=accent_color, height=ModernStyle.ACCENT_BAR).pack(fill="x")
 
             group_frame = tk.Frame(group_wrapper, bg=ModernStyle.BG_TERTIARY, highlightthickness=1,
                                    highlightbackground=ModernStyle.BORDER_COLOR)
@@ -1284,7 +1358,7 @@ class WatchlistView(BaseView):
             tk.Label(
                 group_frame, text=group_name,
                 fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_TERTIARY,
-                font=ModernStyle.FONT_MODAL_TITLE
+                font=ModernStyle.FONT_CARD_TITLE
             ).pack(anchor="w", padx=20, pady=(6, 8))
 
             grid = tk.Frame(group_frame, bg=ModernStyle.BG_TERTIARY)
@@ -1296,26 +1370,44 @@ class WatchlistView(BaseView):
                 tk.Label(
                     f, text=label_text,
                     fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_TERTIARY,
-                    font=ModernStyle.FONT_SUBHEADING, width=18, anchor="w"
+                    font=ModernStyle.FONT_FIELD_LABEL, width=18, anchor="w"
                 ).pack(side="left", padx=(0, 10))
                 box = RoundedBox(f)
                 box.pack(side="left", fill="x", expand=True)
+                inner = tk.Frame(box, bg=ModernStyle.ENTRY_BG)
+                inner.pack(fill="both", expand=True)
                 ent = tk.Entry(
-                    box, textvariable=self._metrics_vars[key],
+                    inner, textvariable=self._metrics_vars[key],
                     bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
                     font=ModernStyle.FONT_INPUT, relief=tk.FLAT, bd=0, width=12,
-                    highlightthickness=0, insertbackground=ModernStyle.TEXT_PRIMARY)
-                ent.pack(fill="x", ipady=5, padx=8)
-                box.watch(ent)
+                    highlightthickness=0, insertbackground=ModernStyle.ACCENT_PRIMARY)
+                ent.pack(side="left", fill="x", expand=True, padx=(8, 8), pady=3, ipady=4)
+
+                m_focused = [False]
+                def _m_in(_e, b=box):
+                    m_focused[0] = True
+                    b.configure(bg=ModernStyle.ACCENT_PRIMARY)
+                def _m_out(_e, b=box):
+                    m_focused[0] = False
+                    b.configure(bg=ModernStyle.BORDER_COLOR)
+                def _m_hi(_e, b=box):
+                    if not m_focused[0]:
+                        b.configure(bg=ModernStyle.TEXT_TERTIARY)
+                def _m_ho(_e, b=box):
+                    if not m_focused[0]:
+                        b.configure(bg=ModernStyle.BORDER_COLOR)
+
+                ent.bind("<FocusIn>", _m_in, add="+")
+                ent.bind("<FocusOut>", _m_out, add="+")
+                for w in (box, inner, ent):
+                    w.bind("<Enter>", _m_hi, add="+")
+                    w.bind("<Leave>", _m_ho, add="+")
 
         top.set_status("Values are kept in the form; press Save & Close (or Save on the Watchlist page) to store them.")
 
-        self._fetch_btn = ModernButton(
-            top.actions_frame, text="↻ Auto-Fill (yfinance)", command=self._auto_fetch_metrics,
-            bg=ModernStyle.INFO_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY, width=220, height=40, radius=8,
-            font=ModernStyle.FONT_TABLE_BOLD
-        )
+        self._fetch_btn = action_button(top.actions_frame, "✨ Auto-Fill (yfinance)", self._auto_fetch_metrics,
+                                        soft=True, width=210,
+                                        canvas_bg=ModernStyle.BG_SECONDARY)
         self._fetch_btn.pack(side="left", padx=(0, 10))
         if self._autofill_running:
             self._fetch_btn.set_text("🔄 Fetching…")
@@ -1324,20 +1416,14 @@ class WatchlistView(BaseView):
             if self._on_save():
                 top.destroy()
 
-        ModernButton(
-            top.actions_frame, text="✕ Close", command=top.destroy,
-            bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY, width=100, height=40, radius=8,
-            font=ModernStyle.FONT_TABLE_BOLD
-        ).pack(side="right")
-        ModernButton(
-            top.actions_frame, text="✓ Save & Close", command=_save_and_close,
-            bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY, width=160, height=40, radius=8,
-            font=ModernStyle.FONT_TABLE_BOLD
-        ).pack(side="right", padx=(0, 10))
+        secondary_button(top.actions_frame, "✕ Close", top.close,
+                         canvas_bg=ModernStyle.BG_SECONDARY).pack(side="right")
+        action_button(top.actions_frame, "✓ Save & Close", _save_and_close,
+                      canvas_bg=ModernStyle.BG_SECONDARY).pack(side="right", padx=(0, 10))
 
-        top.bind("<Escape>", lambda _e: top.destroy())
+        top.bind("<Escape>", lambda _e: top.close())
+        # Enter saves and closes (not inside a multi-line box, where it starts a new line)
+        top.bind("<Return>", lambda e: None if isinstance(e.widget, tk.Text) else _save_and_close())
         top.focus_set()
 
     # ── Double-click diagnostic pop-up ────────────────────────────────────────
@@ -1349,7 +1435,7 @@ class WatchlistView(BaseView):
 
         geometry = _fit_to_screen(self, 1000, 1100)
         popup_w = int(geometry.split("x")[0])
-        top = PremiumModal(self, title=popup_title, geometry=geometry, icon="📊")
+        top = PremiumModal(self, title=popup_title, geometry=geometry, icon="scan-search", icon_color="#EC4899")
         top.resizable(True, True)
         top.minsize(640, 420)
         top.add_chip("📈", sym, bg_color=ModernStyle.ACCENT_PRIMARY, fg_color=ModernStyle.TEXT_ON_ACCENT)
@@ -1357,12 +1443,8 @@ class WatchlistView(BaseView):
         canvas, scrollable_frame = _make_scroll_area(top.content_frame, ModernStyle.BG_SECONDARY)
         _bind_popup_scroll(top, canvas)
 
-        ModernButton(
-            top.actions_frame, text="✕  Close", command=top.destroy,
-            bg=ModernStyle.NEUTRAL_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.BG_SECONDARY, width=100, height=36, radius=8,
-            font=ModernStyle.FONT_SUBHEADING
-        ).pack(side="right")
+        secondary_button(top.actions_frame, "✕ Close", top.close,
+                         canvas_bg=ModernStyle.BG_SECONDARY).pack(side="right")
         top.set_status("Esc closes this window.")
 
         # ── Signal banner ──────────────────────────────────────────────────
@@ -1487,12 +1569,12 @@ class WatchlistView(BaseView):
             card_outer = tk.Frame(scrollable_frame, bg=ModernStyle.BG_SECONDARY, highlightthickness=1,
                                   highlightbackground=ModernStyle.BORDER_COLOR)
             card_outer.pack(fill="x", pady=(0, 20), padx=25)
-            tk.Frame(card_outer, bg=ModernStyle.ACCENT_PRIMARY, height=3).pack(fill="x")
+            tk.Frame(card_outer, bg=ModernStyle.ACCENT_PRIMARY, height=ModernStyle.ACCENT_BAR).pack(fill="x")
 
             card = tk.Frame(card_outer, bg=ModernStyle.BG_SECONDARY)
             card.pack(fill="both", expand=True, padx=20, pady=15)
-            tk.Label(card, text=group_name, fg=ModernStyle.TEXT_ACCENT, bg=ModernStyle.BG_SECONDARY,
-                     font=ModernStyle.FONT_MODAL_TITLE).pack(anchor="w", pady=(0, 15))
+            tk.Label(card, text=group_name, fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY,
+                     font=ModernStyle.FONT_CARD_TITLE).pack(anchor="w", pady=(0, 15))
 
             hdr_row = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
             hdr_row.pack(fill="x", pady=(0, 10))

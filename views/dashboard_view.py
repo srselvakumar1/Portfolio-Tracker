@@ -31,7 +31,8 @@ import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dtime
 from functools import lru_cache
-from tkinter import ttk, messagebox
+from tkinter import ttk
+from ui import dialogs
 
 from model.applog import log
 from ui.ui_theme import ModernStyle
@@ -39,14 +40,22 @@ from ui.ui_utils import (
     HeadingTips,
     ToolTip,
     add_treeview_copy_menu,
+    color_buy_sell,
+    color_gain_loss,
     call_on_ui,
+    enhance_table,
+    popup_limits,
     format_money,
     run_in_background,
     show_toast,
     start_ui_dispatcher,
 )
-from ui.ui_widgets import EmptyState, ModernButton, ModernCard, PremiumModal
+from ui.ui_widgets import (EmptyState, ModernButton, ModernCard, Pill, PremiumModal, ScrollArea, action_button,
+                           gradient_tile, icon_tile, kpi_colours,
+                           header_button, secondary_button)
+from ui.broker_logos import logo, logo_column, show_logos
 from views.base_view import BaseView
+from views.tax_report_view import fit_columns
 
 try:
     from zoneinfo import ZoneInfo
@@ -61,6 +70,7 @@ _CURRENCY_SYMBOLS = {"INR": "₹", "JPY": "¥", "USD": "$", "GBP": "£", "CNY": 
 _LOAD_TIMEOUT_S = 60       # show "taking too long" + Retry after this
 _REFRESH_TIMEOUT_S = 60    # always give the Refresh button back after this
 _TABLE_ROWS = 10           # rows visible in each dashboard table
+_COMPACT_BELOW = 750       # page height (px) under which the spacing tightens
 
 
 def _roi_bar(v: float, biggest: float) -> str:
@@ -70,8 +80,12 @@ def _roi_bar(v: float, biggest: float) -> str:
 
 
 def _pct_cell(v: float) -> str:
-    """+12.3% normally; +10,077% for very large values so they fit the column."""
-    return f"{v:+,.0f}%" if abs(v) >= 1000 else f"{v:+.1f}%"
+    """▲ 12.3% / ▼ 12.3%: the arrow shows the direction at a glance, also without colour
+    (▲ 10,077% for very large values, so they fit the column)."""
+    if abs(v) < 0.05:
+        return "0.0%"
+    arrow = "▲" if v > 0 else "▼"
+    return f"{arrow} {abs(v):,.0f}%" if abs(v) >= 1000 else f"{arrow} {abs(v):.1f}%"
 
 # Exchange sessions in each market's OWN time zone (exchange holidays are not known).
 # (name, IANA zone, fixed UTC offset used if the zone database is missing, sessions, tooltip)
@@ -86,13 +100,32 @@ _MARKETS = (
 
 # Per-broker symbol rows for the KPI breakdown pop-up (parameters: broker, currency)
 _BREAKDOWN_SQL = {
-    "total_value": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) > 0 ORDER BY val DESC",
-    "total_invested": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * h.avg_price) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND (h.qty * h.avg_price) > 0 ORDER BY val DESC",
-    "overall_pnl": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), running_pnl AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND running_pnl != 0 ORDER BY val DESC",
-    "unrealized_pnl": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) != 0 ORDER BY val DESC",
-    "unrealized_loss": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) < 0 ORDER BY val ASC",
-    "realized_pnl": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), realized_pnl AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND realized_pnl != 0 ORDER BY val DESC",
-    "realized_loss": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), realized_pnl AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND realized_pnl < 0 ORDER BY val ASC",
+    "total_value": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND h.qty > 0 AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)) > 0 ORDER BY val DESC",
+    "total_invested": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * h.avg_price) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND h.qty > 0 AND (h.qty * h.avg_price) > 0 ORDER BY val DESC",
+    "day_pnl": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * (COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - COALESCE(NULLIF(m.previous_close, 0.0), m.current_price, h.avg_price))) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND h.qty > 0 AND (h.qty * (COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - COALESCE(NULLIF(m.previous_close, 0.0), m.current_price, h.avg_price))) != 0 ORDER BY val DESC",
+    "overall_pnl": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), running_pnl AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND h.qty > 0 AND running_pnl != 0 ORDER BY val DESC",
+    "unrealized_pnl": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND h.qty > 0 AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) != 0 ORDER BY val DESC",
+    "unrealized_loss": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND h.qty > 0 AND (h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price) - h.qty*h.avg_price) < 0 ORDER BY val ASC",
+    "realized_pnl": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), realized_pnl AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND h.qty = 0 AND realized_pnl != 0 ORDER BY val DESC",
+    "realized_loss": "SELECT h.symbol, COALESCE(m.stock_name, h.symbol), realized_pnl AS val FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE broker = ? AND h.currency = ? AND h.qty = 0 AND realized_pnl < 0 ORDER BY val ASC",
+}
+# Each open holding's size for the breakdown's extra columns (parameter: currency): money
+# invested, value now and value at yesterday's close
+_HOLDING_SIZES_SQL = (
+    "SELECT h.broker, h.symbol, SUM(h.qty * h.avg_price), "
+    "SUM(h.qty * COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)), "
+    "SUM(h.qty * COALESCE(NULLIF(m.previous_close, 0.0), NULLIF(m.current_price, 0.0), h.avg_price)) "
+    "FROM holdings h LEFT JOIN marketdata m USING(symbol) WHERE h.currency = ? AND h.qty > 0 "
+    "GROUP BY h.broker, h.symbol")
+# The breakdown's extra columns for each figure: mkt = Market Value, day = Day %, ret = Return %
+_BREAKDOWN_EXTRAS = {
+    "total_value": ("day", "ret"), "total_invested": ("mkt", "ret"), "day_pnl": ("mkt", "day"),
+    "overall_pnl": ("ret",), "unrealized_pnl": ("ret",), "unrealized_loss": ("ret",),
+}
+_EXTRA_COLUMNS = {   # id: (heading, width, tip)
+    "mkt": ("Market Value", 140, "What the holdings are worth at today's prices"),
+    "day": ("Day %", 100, "Today's change compared with the value at yesterday's close"),
+    "ret": ("Return %", 104, "Gain or loss compared with the money invested in the current holdings"),
 }
 
 # run_in_background() hands results back through call_on_ui(), which needs
@@ -295,6 +328,166 @@ def _refresh_market_data_work(app_state) -> int:
     return len(symbols)
 
 
+class _MoversBoard(tk.Canvas):
+    """A Top Movers leaderboard drawn on one canvas (one widget: quick to open).
+
+    Each row: a rank badge (gold, silver and bronze for the top three), the symbol with
+    its prices and broker underneath, a bar showing how big the move is next to the
+    day's biggest, the change in money and a coloured % pill. Double-click a row for
+    that stock's trades; right-click to copy the list.
+    """
+    ROW_H = 52
+    _MEDALS = (("#EAB308", "#422006"), ("#94A3B8", "#FFFFFF"), ("#C2763A", "#FFFFFF"))   # gold, silver, bronze: fill, number
+
+    def __init__(self, parent, kind: str, on_open, rows: int = 10):
+        S = ModernStyle
+        super().__init__(parent, bg=S.BG_SECONDARY, highlightthickness=0, bd=0,
+                         height=rows * self.ROW_H, width=420)
+        self._kind, self._on_open, self._items, self._currency = kind, on_open, [], "INR"
+        up = kind == "gain"
+        self._fg = S.SUCCESS if up else S.ERROR
+        self._fill = S.SUCCESS_FILL if up else S.ERROR_FILL
+        self._pale = S.SUCCESS_PALE if up else S.ERROR_PALE
+        # the bar's empty track: the pale colour, or a stronger tint on a dark card
+        self._track = ModernButton._blend(self._fill, S.BG_SECONDARY, 0.3) if S.IS_DARK else self._pale
+        self._arrow = "▲" if up else "▼"
+        self._hover = None
+        self._fonts = {}
+        self.bind("<Configure>", lambda _e: self._draw())
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", lambda _e: self._set_hover(None))
+        self.bind("<Double-1>", self._on_double)
+        self.bind("<Button-2>", self._on_menu)
+        self.bind("<Button-3>", self._on_menu)
+        self.bind("<Control-Button-1>", self._on_menu)
+
+    def set_rows(self, items: list, currency: str) -> None:
+        self._items, self._currency, self._hover = list(items or []), currency, None
+        self._draw()
+
+    # ── drawing ──────────────────────────────────────────────────────────────
+    def _font(self, spec):
+        if spec not in self._fonts:
+            self._fonts[spec] = tkfont.Font(font=spec)
+        return self._fonts[spec]
+
+    def _fit(self, text: str, spec, width: int) -> str:
+        f = self._font(spec)
+        if f.measure(text) <= width:
+            return text
+        while text and f.measure(text + "…") > width:
+            text = text[:-1]
+        return text + "…"
+
+    def _pill(self, x0, y0, x1, y1, fill, tags):
+        r = (y1 - y0) / 2
+        pts = (x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+               x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0)
+        return self.create_polygon(*pts, smooth=True, fill=fill, outline="", tags=tags)
+
+    def _draw(self) -> None:
+        S = ModernStyle
+        self.delete("all")
+        w = max(300, self.winfo_width())
+        if not self._items:
+            return
+        biggest = max((abs(_num(g.get("pct_change"))) for g in self._items), default=0) or 1.0
+        name_font, sub_font, small_bold = S.FONT_BODY_BOLD, S.FONT_SMALL, S.FONT_SMALL_BOLD
+        x_text, pill_w = 52, 92
+        px1 = w - 10
+        px0 = px1 - pill_w
+        text_w = min(230, px0 - x_text - 70)          # the bar gets what is left (if anything)
+        for i, g in enumerate(self._items):
+            y0, h = i * self.ROW_H, self.ROW_H
+            cy, tag = y0 + h / 2, ("row", f"row{i}")
+            # row background (hover tint) and a hairline between rows
+            self.create_rectangle(0, y0, w, y0 + h, fill=S.BG_SECONDARY, outline="", tags=tag + ("bg",))
+            if i:
+                self.create_line(x_text, y0, w - 8, y0, fill=S.DIVIDER_COLOR, tags=tag)
+            # rank badge
+            fill, number = self._MEDALS[i] if i < 3 else (self._pale, self._fg)
+            self.create_oval(10, cy - 14, 38, cy + 14, fill=fill, outline="", tags=tag)
+            self.create_text(24, cy, text=str(i + 1), font=small_bold, fill=number, tags=tag)
+            # line 1: symbol, then the broker in grey
+            cur = g.get("currency", self._currency)
+            brokers = [b for b in str(g.get("broker", "")).split(", ") if b]
+            broker = brokers[0] + (f" +{len(brokers) - 1}" if len(brokers) > 1 else "") if brokers else ""
+            symbol = self._fit(str(g.get("symbol", "")), name_font, text_w)
+            self.create_text(x_text, cy - 10, text=symbol, anchor="w", font=name_font, fill=S.TEXT_PRIMARY, tags=tag)
+            if broker:
+                bx = x_text + self._font(name_font).measure(symbol) + 8
+                img = logo(brokers[0], 16)
+                if img is not None and text_w - (bx - x_text) > 50:   # the broker's logo, then its name
+                    self.create_image(bx, cy - 10, image=img, anchor="w", tags=tag)
+                    bx += 20
+                if text_w - (bx - x_text) > 30:
+                    self.create_text(bx, cy - 10, text=self._fit(broker, sub_font, text_w - (bx - x_text)),
+                                     anchor="w", font=sub_font, fill=S.TEXT_TERTIARY, tags=tag)
+            # line 2: yesterday's close → now, and the change in colour
+            prices = f"{format_money(g.get('prev_close'), cur)} → {format_money(g.get('current_price'), cur)}"
+            self.create_text(x_text, cy + 11, text=prices, anchor="w", font=sub_font, fill=S.TEXT_SECONDARY, tags=tag)
+            change = f"{'+' if self._kind == 'gain' else '−'}{format_money(abs(_num(g.get('price_change'))), cur)}"
+            cx = x_text + self._font(sub_font).measure(prices) + 8
+            if cx + self._font(small_bold).measure(change) <= x_text + text_w:
+                self.create_text(cx, cy + 11, text=change, anchor="w", font=small_bold, fill=self._fg, tags=tag)
+            # % pill at the right
+            pct = abs(_num(g.get("pct_change")))
+            self._pill(px0, cy - 13, px1, cy + 13, self._fill, tag)
+            self.create_text((px0 + px1) / 2, cy, text=f"{self._arrow} {pct:.2f}%", font=small_bold,
+                             fill=S.TEXT_ON_ACCENT, tags=tag)
+            # how big the move is, next to the biggest of the day
+            bx0, bx1 = x_text + text_w + 14, px0 - 14
+            if bx1 - bx0 >= 36:
+                self.create_line(bx0, cy, bx1, cy, width=6, capstyle="round", fill=self._track, tags=tag)
+                self.create_line(bx0, cy, bx0 + max(3, (bx1 - bx0) * pct / biggest), cy, width=6,
+                                 capstyle="round", fill=self._fill, tags=tag)
+
+    # ── interaction ──────────────────────────────────────────────────────────
+    def _row_at(self, y) -> int | None:
+        i = int(self.canvasy(y) // self.ROW_H)
+        return i if 0 <= i < len(self._items) else None
+
+    def _set_hover(self, i) -> None:
+        if i == self._hover:
+            return
+        for j, colour in ((self._hover, ModernStyle.BG_SECONDARY), (i, ModernStyle.BG_HOVER)):
+            if j is not None:
+                for item in self.find_withtag(f"row{j}"):
+                    if "bg" in self.gettags(item):
+                        self.itemconfigure(item, fill=colour)
+        self._hover = i
+        self.configure(cursor="hand2" if i is not None else "")
+
+    def _on_motion(self, e) -> None:
+        self._set_hover(self._row_at(e.y))
+
+    def _on_double(self, e) -> None:
+        i = self._row_at(e.y)
+        if i is not None and self._on_open:
+            self._on_open(str(self._items[i].get("symbol", "")).strip())
+
+    def _on_menu(self, e) -> None:
+        if not self._items:
+            return
+        from ui.icons import decorate_menu
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Copy all", command=self._copy_all)
+        decorate_menu(menu)
+        menu.tk_popup(e.x_root, e.y_root)
+
+    def _copy_all(self) -> None:
+        lines = ["#\tSymbol\tBroker\tPrev Close\tPrice\tChange\t% Change"]
+        for i, g in enumerate(self._items):
+            cur = g.get("currency", self._currency)
+            lines.append("\t".join(str(v) for v in (
+                i + 1, g.get("symbol", ""), g.get("broker", ""), format_money(g.get("prev_close"), cur),
+                format_money(g.get("current_price"), cur), format_money(_num(g.get("price_change")), cur),
+                f"{_num(g.get('pct_change')):.2f}%")))
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        show_toast(self.winfo_toplevel(), f"Copied {len(self._items)} rows", type="success")
+
+
 class DashboardView(BaseView):
     """Portfolio dashboard with summary metrics and overview."""
 
@@ -316,17 +509,33 @@ class DashboardView(BaseView):
         ("XIRR",            "overall_xirr",    "amber",  "%", False, True),
         ("CAGR",            "overall_cagr",    "teal",   "↑", False, True),
     )
+    # Each KPI card's own soft tint (light mode base colour; see _kpi_palette)
+    _KPI_HUES = {"total_value": "#2563EB", "total_invested": "#0D9488", "day_pnl": "#D97706",
+                 "overall_pnl": "#7C3AED", "unrealized_pnl": "#0284C7", "unrealized_loss": "#E11D48",
+                 "realized_pnl": "#059669", "realized_loss": "#EA580C", "overall_xirr": "#4F46E5",
+                 "overall_cagr": "#C026D3"}
+    # The icon on each KPI card's tile (the symbols above when the icon font is missing)
+    _KPI_ICONS = {"total_value": "gem", "total_invested": "piggy-bank", "day_pnl": "zap",
+                  "overall_pnl": "chart-pie", "unrealized_pnl": "trending-up", "unrealized_loss": "trending-down",
+                  "realized_pnl": "hand-coins", "realized_loss": "banknote-arrow-down", "overall_xirr": "target",
+                  "overall_cagr": "rocket"}
+    # ...on a tile shaded between two neighbouring colours (top, bottom), like an app icon
+    _KPI_GRADIENTS = {"total_value": ("#3B82F6", "#6366F1"), "total_invested": ("#14B8A6", "#06B6D4"),
+                      "day_pnl": ("#F59E0B", "#F97316"), "overall_pnl": ("#8B5CF6", "#D946EF"),
+                      "unrealized_pnl": ("#0EA5E9", "#3B82F6"), "unrealized_loss": ("#F43F5E", "#EC4899"),
+                      "realized_pnl": ("#10B981", "#14B8A6"), "realized_loss": ("#F97316", "#EF4444"),
+                      "overall_xirr": ("#6366F1", "#8B5CF6"), "overall_cagr": ("#D946EF", "#A855F7")}
 
     # Table columns: (id, heading, width, anchor)
     _PERF_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                   ("avg", "Avg Price", 86, "e"), ("ltp", "Last Price", 86, "e"),
-                  ("pnl", "P&L", 96, "e"), ("roi", "ROI %", 118, "e"))
+                  ("pnl", "P&L", 96, "w"), ("roi", "ROI %", 72, "w"), ("bar", "", 46, "w"))
     _INSIGHT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                      ("signal", "Signal", 110, "w"), ("current", "Current", 90, "e"),
-                     ("iv", "Fair Value", 90, "e"), ("diff", "Upside %", 80, "e"))
+                     ("iv", "Fair Value", 90, "e"), ("diff", "Upside %", 80, "w"))
     _ALERT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                    ("target", "Target", 90, "e"), ("current", "Current", 90, "e"),
-                   ("pe", "P/E", 56, "e"), ("eps", "EPS", 60, "e"), ("diff", "Upside %", 80, "e"))
+                   ("pe", "P/E", 56, "e"), ("eps", "EPS", 60, "e"), ("diff", "Upside %", 80, "w"))
     # What each column means, shown when the pointer rests on a heading
     _COL_TIPS = {
         "avg": "Average price you paid per share",
@@ -407,7 +616,6 @@ class DashboardView(BaseView):
         flat = self._header_flat_bg = _rgb_hex(self._grad_end)
         # "Frosted glass" controls: white let through the banner colour
         glass = self._header_glass = _rgb_hex(_mix(self._grad_end, (255, 255, 255), 0.18))
-        glass_edge = _rgb_hex(_mix(self._grad_end, (255, 255, 255), 0.4))
 
         title_ls = self._font(S.FONT_SYMBOL_LARGE).metrics("linespace")
         body_ls = self._font(S.FONT_BODY).metrics("linespace")
@@ -438,15 +646,16 @@ class DashboardView(BaseView):
         bottom_row = tk.Frame(right, bg=flat)
         bottom_row.pack(side="top", anchor="e", pady=(6, 0))
 
-        # One glass chip per market: green ● while open, hollow ○ while closed
+        # One status per market, straight on the banner like the clock: green ● while open,
+        # hollow ○ while closed
         self._market_chips = {}
         for name, *_rest, tip in _MARKETS:
-            chip = tk.Frame(top_row, bg=glass)
-            chip.pack(side="left", padx=(0, 6))
-            dot = tk.Label(chip, text="○", bg=glass, fg=S.HEADER_FG, font=S.FONT_SMALL_BOLD)
-            dot.pack(side="left", padx=(8, 2))
-            lbl = tk.Label(chip, text=f"{name} Closed", bg=glass, fg=S.HEADER_FG, font=S.FONT_SMALL_BOLD)
-            lbl.pack(side="left", padx=(0, 9), pady=2)
+            chip = tk.Frame(top_row, bg=flat)
+            chip.pack(side="left", padx=(0, 14))
+            dot = tk.Label(chip, text="○", bg=flat, fg=S.HEADER_FG, font=S.FONT_SMALL_BOLD)
+            dot.pack(side="left", padx=(0, 4))
+            lbl = tk.Label(chip, text=f"{name} Closed", bg=flat, fg=S.HEADER_FG, font=S.FONT_SMALL_BOLD)
+            lbl.pack(side="left", pady=2)
             for w in (chip, dot, lbl):
                 ToolTip(w, tip)
             self._market_chips[name] = (dot, lbl)
@@ -454,57 +663,55 @@ class DashboardView(BaseView):
                                    font=S.FONT_SUBHEADING, width=5, anchor="e")
         self._clock_lbl.pack(side="left", padx=(4, 0))
 
-        self.top_movers_btn = ModernButton(
-            bottom_row, text="★ Movers", command=self._show_gainers_losers_modal,
-            bg=glass, fg=S.HEADER_FG, canvas_bg=flat,
-            width=106, height=32, radius=8, font=S.FONT_SMALL_BOLD)
+        self.top_movers_btn = header_button(bottom_row, "Movers", self._show_gainers_losers_modal,
+                                            icon="trophy", width=106)
         self.top_movers_btn.pack(side="left", padx=(0, 8))
 
-        # INR / JPY toggle: the active side is a white pill with banner-coloured text
-        self._currency_frame = tk.Frame(bottom_row, bg=glass, highlightthickness=1,
-                                        highlightbackground=glass_edge, highlightcolor=glass_edge)
+        # INR / JPY toggle: pill buttons matching My Holdings (radius=14)
+        self._currency_frame = tk.Frame(bottom_row, bg=flat)
         self._currency_frame.pack(side="left", padx=(0, 8))
         self.curr_buttons = {}
         for c_name in ("INR", "JPY"):
-            btn = tk.Label(self._currency_frame, text=f"{_sym(c_name)} {c_name}", bg=glass,
-                           fg=S.HEADER_SUBTLE_FG, font=S.FONT_SMALL_BOLD, padx=10, pady=5, cursor="hand2")
-            btn.pack(side="left")
-            btn.bind("<Button-1>", lambda _e, n=c_name: self._select_currency(n))
-            btn.bind("<Enter>", lambda _e, n=c_name: self._hover_curr(n, True))
-            btn.bind("<Leave>", lambda _e, n=c_name: self._hover_curr(n, False))
+            btn = ModernButton(
+                self._currency_frame, text=f"{_sym(c_name)} {c_name}",
+                command=lambda n=c_name: self._select_currency(n),
+                bg=glass, fg=S.HEADER_FG, canvas_bg=flat,
+                width=86, height=32, radius=14, font=ModernStyle.FONT_BODY_BOLD,
+            )
+            btn.pack(side="left", padx=(0, 6) if c_name == "INR" else 0)
             self.curr_buttons[c_name] = btn
         self.currency_var.trace_add("write", self._update_curr_toggles)
         self._update_curr_toggles()
 
-        self.refresh_btn = ModernButton(
-            bottom_row, text="↻ Refresh", command=self._on_refresh_market_data,
-            bg=S.HEADER_FG, fg=flat, canvas_bg=flat,   # the main action: solid white
-            width=128, height=32, radius=8, font=S.FONT_SMALL_BOLD)
+        self.refresh_btn = header_button(bottom_row, "↻ Refresh", self._on_refresh_market_data, main=True,
+                                         width=128)
         self.refresh_btn.pack(side="left")
 
-        self._header_right_win = c.create_window(0, 0, window=right, anchor="e", tags="header_content")
+        # Placed, not a canvas window: Tk lays an embedded window out again on every
+        # visit to the page, which made each switch to the Dashboard ~0.1 s slower
+        right.place(x=0, y=0, anchor="e")
         c.bind("<Configure>", self._layout_header)
         right.bind("<Configure>", self._layout_header)
         self._update_market_status()
 
     def _select_currency(self, name: str) -> None:
         if self.currency_var.get() != name:
+            self._fit_for_height = None
+            self._fit_count = 0
             self.currency_var.set(name)
-
-    def _hover_curr(self, name: str, inside: bool) -> None:
-        """Brighten the glass under the pointer so the switch looks clickable."""
-        if name != self.currency_var.get():
-            glass = _rgb_hex(_mix(self._grad_end, (255, 255, 255), 0.3)) if inside else self._header_glass
-            self.curr_buttons[name].configure(bg=glass)
 
     def _update_curr_toggles(self, *_):
         S = ModernStyle
         active = self.currency_var.get()
+        fills = {"INR": S.SUCCESS_FILL, "JPY": S.PURPLE_FILL}
         for name, btn in self.curr_buttons.items():
+            sym = _sym(name)
             if name == active:
-                btn.configure(bg=S.HEADER_FG, fg=self._header_flat_bg)
+                btn.set_palette(bg=fills.get(name, S.ACCENT_PRIMARY), fg=S.TEXT_ON_ACCENT)
+                btn.set_text(f"✓ {sym} {name}")
             else:
-                btn.configure(bg=self._header_glass, fg=S.HEADER_FG)
+                btn.set_palette(bg=S.NEUTRAL_FILL, fg=S.TEXT_ON_ACCENT)
+                btn.set_text(f"{sym} {name}")
 
     def _layout_header(self, _event=None, force: bool = False) -> None:
         """Place the header texts and controls so nothing overlaps at any width."""
@@ -541,7 +748,7 @@ class DashboardView(BaseView):
         top = max(2, (h - gh - sh - 2) // 2)
         c.coords(self._greeting_id, 20, top)
         c.coords(self._header_subtitle, 20, top + gh + 2)
-        c.coords(self._header_right_win, right_x, h // 2)
+        self._header_right.place_configure(x=right_x, y=h // 2)
 
         grad_key = (w, h, cluster_left)
         if grad_key != self._grad_key:
@@ -577,8 +784,8 @@ class DashboardView(BaseView):
                 c.create_polygon(*top, *bot, fill=_rgb_hex(_mix(rgb, white, a)), outline="", tags="gradient")
         if flat_from < w:
             c.create_rectangle(flat_from, 0, w, h, fill=self._header_flat_bg, outline="", tags="gradient")
-        # Rounded corners: paint the page colour outside a 14 px quarter circle
-        r = 14
+        # Rounded corners: paint the page colour outside a quarter circle
+        r = ModernStyle.RADIUS_HEADER
         bg = ModernStyle.BG_PRIMARY
         for (ox, oy, sx, sy) in ((0, 0, 1, 1), (w, 0, -1, 1), (0, h, 1, -1), (w, h, -1, -1)):
             pts = [(ox, oy)]
@@ -631,28 +838,17 @@ class DashboardView(BaseView):
         S = ModernStyle
         self._vscroll = ttk.Scrollbar(self, orient="vertical")
         self._vscroll_shown = False
-        self._main_canvas = tk.Canvas(self, bg=S.BG_PRIMARY, highlightthickness=0, yscrollincrement=4)
+        # A ScrollArea, not a canvas window: the content follows its width by itself, and
+        # Tk lays a canvas window out again on every visit (about 0.07 s per switch)
+        self._main_canvas = ScrollArea(self, S.BG_PRIMARY, scrollbar=self._vscroll, unit=4)
         self._main_canvas.pack(side="left", fill="both", expand=True)
-        self._vscroll.configure(command=self._main_canvas.yview)
-        self._main_canvas.configure(yscrollcommand=self._vscroll.set)
-
-        self._content = tk.Frame(self._main_canvas, bg=S.BG_PRIMARY)
-        self._content_id = self._main_canvas.create_window((0, 0), window=self._content, anchor="nw")
-        self._content.bind("<Configure>", lambda _e: self._update_scrollregion())
-        self._main_canvas.bind("<Configure>", lambda _e: self._sync_content_width())
+        self._content = self._main_canvas.inner
+        self._content.bind("<Configure>", lambda _e: self._update_scrollregion(), add="+")
+        self._main_canvas.bind("<Configure>", lambda _e: self._sync_content_width(), add="+")
 
     def _sync_content_width(self):
-        """Give the scrollable content frame the canvas's current width."""
-        try:
-            w = self._main_canvas.winfo_width()
-            if w <= 10:
-                return
-            current = self._main_canvas.itemcget(self._content_id, "width")
-            if int(float(current or 0)) != w:
-                self._main_canvas.itemconfigure(self._content_id, width=w)
-            self._update_scrollregion()
-        except tk.TclError:
-            pass
+        """Check the scroll range again (the content takes the area's width by itself)."""
+        self._update_scrollregion()
 
     def _update_scrollregion(self) -> None:
         """Keep the scroll range in step with the content; show the scrollbar only when needed."""
@@ -660,7 +856,6 @@ class DashboardView(BaseView):
         try:
             content_h = self._content.winfo_reqheight()
             view_h = c.winfo_height()
-            view_w = c.winfo_width()
         except tk.TclError:
             return
         if view_h <= 10:
@@ -669,9 +864,6 @@ class DashboardView(BaseView):
         if getattr(self, "_fit_after_id", None):
             self.after_cancel(self._fit_after_id)
         self._fit_after_id = self.after(150, self._run_fit)
-        region = f"0 0 {max(1, view_w)} {max(content_h, view_h)}"
-        if str(c.cget("scrollregion")) != region:
-            c.configure(scrollregion=region)
         need = content_h > view_h + 1
         if need != self._vscroll_shown:
             self._vscroll_shown = need
@@ -686,7 +878,16 @@ class DashboardView(BaseView):
         try:
             content_h = self._content.winfo_reqheight()
             view_h = self._main_canvas.winfo_height()
-        except tk.TclError:
+            rows = self.top_body._tree.cget("height")
+            rh = ttk.Style(self).lookup("Dashboard.Treeview", "rowheight")
+        except (tk.TclError, AttributeError):
+            return
+        # Fit only a settled page: the cards follow the tables a moment later, and a
+        # half-updated height made the rows grow and shrink until the page scrolled.
+        state = (content_h, view_h, str(rows), str(rh))
+        if state != getattr(self, "_fit_last_state", None):
+            self._fit_last_state = state
+            self._fit_after_id = self.after(150, self._run_fit)
             return
         if view_h > 10 and self._fit_tables(content_h, view_h):
             self.after(150, self._update_scrollregion)
@@ -703,6 +904,8 @@ class DashboardView(BaseView):
         Tables with more rows than fit get their own small scrollbar.
         Returns True when anything changed.
         """
+        if self._set_compact(view_h < _COMPACT_BELOW):
+            return True   # measure again once the new spacing is laid out
         bodies = self._section_bodies()
         style = ttk.Style(self)
         scale = ModernStyle.TEXT_SCALE
@@ -712,10 +915,23 @@ class DashboardView(BaseView):
             rh = int(float(style.lookup("Dashboard.Treeview", "rowheight") or ModernStyle.DASHBOARD_ROW_HEIGHT))
         except (tk.TclError, ValueError, TypeError, AttributeError):
             return False
-        fixed = content_h - 2 * rows * rh           # everything except the table rows
-        budget = view_h - 2 - fixed                 # height the rows of both table rows may use
-        new_rows = max(5, min(_TABLE_ROWS, budget // (2 * lo)))
-        new_rh = max(lo, min(hi, budget // (2 * new_rows)))
+
+        # Height of everything except the table rows, measured from the page itself
+        # (header, KPI rows, card headers, column headings, margins). Estimating it
+        # was ~85 px short, so the rows came out too tall and the page scrolled.
+        fixed = content_h - 2 * rows * rh
+        if fixed < round(200 * scale):
+            return False   # the page is not laid out yet; the next measurement will do
+        budget = max(0, view_h - 2 - fixed)
+
+        # On standard/large windows (>= 750px), always show full _TABLE_ROWS (10)
+        # to avoid cutting off rows with unnecessary scrollbars and leaving blank space below.
+        if view_h >= _COMPACT_BELOW or budget >= 2 * lo * _TABLE_ROWS:
+            new_rows = _TABLE_ROWS
+        else:
+            new_rows = max(5, min(_TABLE_ROWS, budget // (2 * lo)))
+
+        new_rh = max(lo, min(hi, budget // (2 * new_rows))) if new_rows > 0 else ModernStyle.DASHBOARD_ROW_HEIGHT
         if (new_rows, new_rh) == (rows, rh):
             return False
         # The cards follow the tables a moment later, so an early measurement can
@@ -731,6 +947,25 @@ class DashboardView(BaseView):
             for body in bodies:
                 body._tree.configure(height=new_rows)
                 self._update_table_bar(body)
+        return True
+
+    def _set_compact(self, on: bool) -> bool:
+        """Tighter spacing on short windows (1080p screens), so the KPI cards and
+        the tables fit without the page scrolling. Returns True when it changed."""
+        if self._compact == on:
+            return False
+        self._compact = on
+        # Normal spacing is only a little looser: the room goes to taller table rows
+        self._kpi_row1.pack_configure(pady=(6, 3) if on else (10, 4))
+        self._kpi_row2.pack_configure(pady=(3, 2) if on else (4, 2))
+        self._sections_grid.pack_configure(pady=(6, 2) if on else (12, 2))
+        for st in self._kpi.values():
+            st["body"].pack_configure(pady=3 if on else 6)
+        for card in (self.top_card, self.worst_card, self.insights_card, self.alerts_card):
+            card.grid_configure(pady=2)
+            card._hdr.pack_configure(pady=2)
+            card._body.pack_configure(pady=(1, 2))
+        self._fit_kpi_heights()
         return True
 
     def _follow_content_height(self, card, event=None) -> None:
@@ -820,10 +1055,8 @@ class DashboardView(BaseView):
         self._error_lbl = tk.Label(self._error_banner, text="", bg=S.ERROR_PALE, fg=S.ERROR,
                                    font=S.FONT_BODY_BOLD, anchor="w", justify="left", wraplength=640)
         self._error_lbl.pack(side="left", fill="x", expand=True, padx=12, pady=8)
-        self._retry_btn = ModernButton(
-            self._error_banner, text="↻ Retry", command=self._retry_load,
-            bg=S.ERROR_FILL, fg=S.TEXT_ON_ACCENT, canvas_bg=S.ERROR_PALE,
-            width=104, height=32, radius=8, font=S.FONT_BODY_BOLD)
+        self._retry_btn = action_button(self._error_banner, "↻ Retry", self._retry_load, kind="danger",
+                                        size="sm", canvas_bg=S.ERROR_PALE)
         self._retry_btn.pack(side="right", padx=10, pady=6)
 
     def _show_load_error(self, message: str) -> None:
@@ -860,11 +1093,12 @@ class DashboardView(BaseView):
     def _build_kpi_rows(self) -> None:
         S = ModernStyle
         self._kpi_row1 = row1 = tk.Frame(self._content, bg=S.BG_PRIMARY)
-        row1.pack(fill="x", padx=20, pady=(16, 6))
+        row1.pack(fill="x", padx=20, pady=(10, 4))
         self._kpi_row2 = row2 = tk.Frame(self._content, bg=S.BG_PRIMARY)
-        row2.pack(fill="x", padx=20, pady=(6, 4))
+        row2.pack(fill="x", padx=20, pady=(4, 2))
         self._kpi_row_keys = (tuple(s[1] for s in self._KPI_ROW1), tuple(s[1] for s in self._KPI_ROW2))
         self._kpi_height_pending = False
+        self._compact = False
         # KPI value fonts, largest first: all cards step down together when a figure won't fit
         self._kpi_value_fonts = (S.FONT_KPI_VALUE, S.FONT_SYMBOL_LARGE, S.FONT_DRILLDOWN_SYM)
         self._kpi_font_idx = 0
@@ -903,7 +1137,7 @@ class DashboardView(BaseView):
             for key in self._kpi:
                 self._fit_kpi_value(key, schedule=False)
 
-        font = self._font(S.FONT_TINY_BOLD)
+        font = self._font(S.FONT_TINY)
         line = font.metrics("linespace")
         for keys in self._kpi_row_keys:
             extra = 0
@@ -912,7 +1146,7 @@ class DashboardView(BaseView):
                 if st["chip_shown"] and st["wrap"]:
                     lines = _wrapped_lines(font, st["chip"].cget("text"), st["wrap"])
                     extra = max(extra, (lines - 1) * line)
-            height = S.KPI_CARD_HEIGHT + 3 + extra   # +3 for the shadow
+            height = S.KPI_CARD_HEIGHT + extra - (6 if self._compact else 0)
             for k in keys:
                 card = self._kpi[k]["card"]
                 try:
@@ -923,38 +1157,37 @@ class DashboardView(BaseView):
 
     def _make_kpi_card(self, parent, title: str, key: str, family: str, icon: str,
                        is_currency: bool, signed: bool) -> ModernCard:
-        """One KPI card: tinted body, coloured accent bar, icon + title, value, chip."""
+        """One KPI card: rounded, in its own soft tint with a slightly stronger outline, a grey
+        title with an icon tile in the same colour; only gain / loss figures are green / red."""
         S = ModernStyle
-        fam = self._families[family]
-        tint, pale = fam["tint"], fam["pale"]
+        fam = self._families[family]   # its colour still heads the breakdown pop-up
+        tint, border, _, ink = self._kpi_palette(key)
         card = ModernCard(
-            parent, bg=tint, highlight_color=tint, highlight_thickness=1,
-            radius=10, canvas_bg=S.BG_PRIMARY, height=S.KPI_CARD_HEIGHT + 3, expand_height=True, shadow=True)
-        # The content frame covers the card; the soft shadow below replaces a border.
+            parent, bg=tint, highlight_color=border, highlight_thickness=1,
+            radius=ModernStyle.RADIUS_CARD, canvas_bg=S.BG_PRIMARY, height=S.KPI_CARD_HEIGHT, expand_height=True)
+        card.hover_color = ink
         card.content.configure(height=S.KPI_CARD_HEIGHT - 2, highlightthickness=0)
 
         wrapper = tk.Frame(card.content, bg=tint)
         wrapper.pack(fill="both", expand=True)
-        tk.Frame(wrapper, bg=fam["fill"], width=4).pack(side="left", fill="y")
         body = tk.Frame(wrapper, bg=tint)
-        body.pack(side="left", fill="both", expand=True, padx=10, pady=6)
+        body.pack(side="left", fill="both", expand=True, padx=12, pady=6)
 
         title_row = tk.Frame(body, bg=tint)
         title_row.pack(fill="x")
-        icon_lbl = tk.Label(title_row, text=icon, fg=fam["text"], bg=tint, font=S.FONT_ICON)
-        icon_lbl.pack(side="left", padx=(0, 6))
-        title_lbl = tk.Label(title_row, text=title, fg=S.TEXT_SECONDARY, bg=tint,
-                             font=S.FONT_KPI_LABEL, anchor="w")
+        title_lbl = tk.Label(title_row, text=title, fg=S.TEXT_SECONDARY, bg=tint, font=S.FONT_DASHBOARD_KPI_TITLE, anchor="w")
         title_lbl.pack(side="left", fill="x", expand=True)
+        top, bottom = self._KPI_GRADIENTS.get(key, (ink, ink))
+        icon_lbl = gradient_tile(title_row, self._KPI_ICONS.get(key, ""), icon, top, bottom, size=30)
+        icon_lbl.pack(side="right", padx=(6, 0))
 
-        value_lbl = tk.Label(body, text="—", fg=fam["text"], bg=tint, font=S.FONT_KPI_VALUE, anchor="w",
+        value_lbl = tk.Label(body, text="—", fg=S.TEXT_PRIMARY, bg=tint, font=S.FONT_KPI_VALUE, anchor="w",
                              bd=0, padx=0, highlightthickness=0)
         value_lbl.pack(fill="x", pady=(2, 2))
 
-        # Small chip on a slightly stronger tint, outlined in the card's colour
-        chip = tk.Label(body, text="", fg=fam["text"], bg=pale, font=S.FONT_TINY_BOLD, bd=0,
-                        padx=6, pady=1, highlightthickness=1, highlightbackground=fam["text"],
-                        highlightcolor=fam["text"], justify="left", anchor="w")
+        # A small line under the value, on the card itself; its text turns green / red on gain / loss cards
+        chip = tk.Label(body, text="", fg=S.TEXT_SECONDARY, bg=tint, font=S.FONT_TINY, bd=0,
+                        padx=0, pady=1, highlightthickness=0, justify="left", anchor="w")
         setattr(value_lbl, "_trend_lbl", chip)  # older code looked the chip up here
 
         self.kpi_labels[key] = value_lbl
@@ -962,9 +1195,10 @@ class DashboardView(BaseView):
         self._kpi[key] = {
             "card": card, "family": family, "signed": signed, "is_currency": is_currency,
             "tint": family, "hover": False, "body": body, "value": value_lbl, "chip": chip,
-            "chip_shown": False, "wrap": None, "fg": fam["text"],
+            "chip_shown": False, "wrap": None, "fg": S.TEXT_PRIMARY,
             "full": "—", "short": "—", "shown": "—",
             "tint_widgets": (wrapper, body, title_row, icon_lbl, title_lbl, value_lbl),
+            "title": title_lbl, "tile": icon_lbl,
         }
 
         body.bind("<Configure>", lambda e, k=key: self._on_kpi_body_configure(k, e.width))
@@ -989,11 +1223,20 @@ class DashboardView(BaseView):
                         self._show_broker_breakdown(t, k, is_currency=cur, color=col))
         return card
 
+    def _kpi_palette(self, key: str) -> tuple[str, str, str, str]:
+        """(background, outline, icon tile, icon colour) for a KPI card, from its own hue."""
+        S, mix = ModernStyle, ModernButton._blend
+        hue = self._KPI_HUES.get(key, S.ACCENT_PRIMARY)
+        if S.IS_DARK:
+            ink = mix(hue, "#FFFFFF", 0.6)
+            return mix(hue, S.BG_SECONDARY, 0.14), mix(hue, S.BG_SECONDARY, 0.38), mix(hue, S.BG_SECONDARY, 0.30), ink
+        return mix(hue, S.BG_SECONDARY, 0.09), mix(hue, S.BG_SECONDARY, 0.26), mix(hue, S.BG_SECONDARY, 0.16), hue
+
     def _on_kpi_body_configure(self, key: str, width: int) -> None:
         st = self._kpi.get(key)
         if not st or width < 20:
             return
-        wrap = max(60, width - 18)  # chip text width: body minus the chip's padding and outline
+        wrap = max(60, width - 4)  # chip text width: the body's, less a little room
         if st["wrap"] != wrap:
             st["wrap"] = wrap
             st["chip"].configure(wraplength=wrap)
@@ -1040,23 +1283,13 @@ class DashboardView(BaseView):
             family = "green" if value >= 0 else "red"
         else:
             family = st["family"]
-        if family == st["tint"]:
+        if family == st.get("chip_family"):
             return
-        st["tint"] = family
-        fam = self._families[family]
-        card = st["card"]
-        set_fill = getattr(card, "set_fill", None)
-        if set_fill is not None:
-            set_fill(fam["tint"])  # rounded shape + content frame, in place
-        else:
-            card.bg_color = fam["tint"]
-            card.content.configure(bg=fam["tint"])
-        for w in st["tint_widgets"]:
-            w.configure(bg=fam["tint"])
-        border = fam["fill"] if st["hover"] else fam["pale"]
-        card.content.configure(highlightbackground=border, highlightcolor=border)
-        st["chip"].configure(bg=fam["pale"], fg=fam["text"],
-                             highlightbackground=fam["text"], highlightcolor=fam["text"])
+        st["tint"] = st["chip_family"] = family
+        # Calm cards stay white: only the chip's text takes the gain / loss colour
+        S = ModernStyle
+        st["chip"].configure(fg={"green": S.SUCCESS, "red": S.ERROR}.get(family, S.TEXT_SECONDARY)
+                             if st["signed"] else S.TEXT_SECONDARY)
 
     def _set_kpi_value(self, key: str, full: str, short: str | None = None, fg: str | None = None) -> None:
         st = self._kpi.get(key)
@@ -1122,8 +1355,8 @@ class DashboardView(BaseView):
 
     def _build_sections(self) -> None:
         S = ModernStyle
-        grid = tk.Frame(self._content, bg=S.BG_PRIMARY)
-        grid.pack(fill="both", expand=True, padx=20, pady=(8, 4))
+        grid = self._sections_grid = tk.Frame(self._content, bg=S.BG_PRIMARY)
+        grid.pack(fill="both", expand=True, padx=20, pady=(12, 2))   # a little air under the KPI cards
         grid.grid_columnconfigure(0, weight=1, uniform="p")
         grid.grid_columnconfigure(1, weight=1, uniform="p")
 
@@ -1142,10 +1375,10 @@ class DashboardView(BaseView):
 
         for card in (self.top_card, self.worst_card, self.insights_card, self.alerts_card):
             card.content.bind("<Configure>", lambda e, c=card: self._follow_content_height(c, e), add="+")
-        self.top_card.grid(row=0, column=0, sticky="nsew", padx=6, pady=4)
-        self.worst_card.grid(row=0, column=1, sticky="nsew", padx=6, pady=4)
-        self.insights_card.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
-        self.alerts_card.grid(row=1, column=1, sticky="nsew", padx=6, pady=4)
+        self.top_card.grid(row=0, column=0, sticky="nsew", padx=6, pady=2)
+        self.worst_card.grid(row=0, column=1, sticky="nsew", padx=6, pady=2)
+        self.insights_card.grid(row=1, column=0, sticky="nsew", padx=6, pady=2)
+        self.alerts_card.grid(row=1, column=1, sticky="nsew", padx=6, pady=2)
 
         # Double-click opens details / drilldown; Watchlist Alerts opens a trade form
         self.top_body._tree.bind("<Double-1>", lambda e: self._on_symbol_double_click(e, self._open_trade_drilldown))
@@ -1155,10 +1388,10 @@ class DashboardView(BaseView):
         for body in (self.top_body, self.worst_body, self.insights_body, self.alerts_body):
             HeadingTips(body._tree, self._COL_TIPS)
 
-    def _copy_icon(self, parent, fam: dict, command) -> tk.Canvas:
+    def _copy_icon(self, parent, fam: dict, command, bg: str = "", ink: str = "") -> tk.Canvas:
         """A small "copy" button drawn as two overlapping pages (crisp at any text size)."""
         u = max(1.0, self._font(ModernStyle.FONT_SMALL_BOLD).metrics("linespace") / 18)
-        bg, ink = fam["pale"], fam["text"]
+        bg, ink = bg or fam["pale"], ink or fam["text"]
         c = tk.Canvas(parent, width=round(30 * u), height=round(24 * u), bg=bg, bd=0, cursor="hand2",
                       highlightthickness=1, highlightbackground=bg, highlightcolor=bg)
 
@@ -1176,45 +1409,59 @@ class DashboardView(BaseView):
         ToolTip(c, "Copy this table")
         return c
 
+    def _section_style(self, family: str) -> str:
+        """A Dashboard table style whose heading row is a soft tint of its section's colour
+        (everything else comes from Dashboard.Treeview)."""
+        fam, name = self._families[family], f"{family}.Dashboard.Treeview"
+        st = ttk.Style(self)
+        st.configure(f"{name}.Heading", background=fam["pale"], foreground=fam["text"])
+        st.map(f"{name}.Heading", background=[("active", ModernButton._blend(fam["fill"], fam["pale"], 0.18))],
+               foreground=[("active", fam["text"])])
+        return name
+
     def _section_card(self, parent, title: str, icon: str, family: str, columns, empty_msg: str,
                       copy_command=None, hint: str = "") -> tuple[ModernCard, tk.Frame]:
-        """A card with a coloured header (title, count, Copy) and a fixed-height table."""
+        """A card with a strong coloured header band (white icon, title and Copy) and a
+        fixed-height table whose heading row is a soft tint of the same colour."""
         S = ModernStyle
         fam = self._families[family]
         card = ModernCard(parent, bg=S.BG_SECONDARY, highlight_color=S.BG_SECONDARY,
-                          highlight_thickness=1, radius=10, canvas_bg=S.BG_PRIMARY, shadow=True)
-        tk.Frame(card.content, bg=fam["fill"], height=3).pack(fill="x")
+                          highlight_thickness=1, radius=ModernStyle.RADIUS_CARD, canvas_bg=S.BG_PRIMARY, shadow=True)
+        strong, ink = fam["fill"], S.TEXT_ON_ACCENT
+        band = tk.Frame(card.content, bg=strong)
+        band.pack(fill="x")
+        card.tint_top(strong, band)   # the band's colour reaches the card's rounded edges
 
-        hdr = tk.Frame(card.content, bg=S.BG_SECONDARY)
-        hdr.pack(fill="x", padx=12, pady=4)
-        tk.Label(hdr, text=icon, fg=fam["text"], bg=S.BG_SECONDARY, font=S.FONT_HEADING).pack(side="left", padx=(0, 6))
-        tk.Label(hdr, text=title, fg=S.TEXT_PRIMARY, bg=S.BG_SECONDARY, font=S.FONT_HEADING).pack(side="left")
-        count_lbl = tk.Label(hdr, text="0", fg=fam["text"], bg=fam["pale"], font=S.FONT_SMALL_BOLD, padx=8)
-        count_lbl.pack(side="left", padx=(8, 0))
+        hdr = tk.Frame(band, bg=strong)
+        hdr.pack(fill="x", padx=12, pady=2)
+        tk.Label(hdr, text=icon, fg=ink, bg=strong, font=S.FONT_HEADING).pack(side="left", padx=(0, 6))
+        title_lbl = tk.Label(hdr, text=title, fg=ink, bg=strong, font=S.FONT_HEADING)
+        title_lbl.pack(side="left")
+        if hint:   # a clean header: the how-to shows when the title is pointed at
+            ToolTip(title_lbl, hint[:1].upper() + hint[1:])
 
         if copy_command:
-            self._copy_icon(hdr, fam, copy_command).pack(side="right")
-        if hint:  # packed last, so it is the first thing to give way when the card is narrow
-            tk.Label(hdr, text=hint, fg=S.TEXT_SECONDARY, bg=S.BG_SECONDARY,
-                     font=S.FONT_SMALL).pack(side="left", padx=(10, 0))
-
-        tk.Frame(card.content, bg=S.DIVIDER_COLOR, height=1).pack(fill="x", padx=12)
+            self._copy_icon(hdr, fam, copy_command, bg=strong, ink=ink).pack(side="right")
 
         body = tk.Frame(card.content, bg=S.BG_SECONDARY)
-        body.pack(fill="both", expand=True, pady=(2, 4))
+        body.pack(fill="both", expand=True, pady=(1, 2))
+        card._hdr, card._body = hdr, body
 
         tree_frame = tk.Frame(body, bg=S.BG_SECONDARY)
         tv = ttk.Treeview(tree_frame, columns=[c[0] for c in columns], show="headings",
-                          height=_TABLE_ROWS, style="Dashboard.Treeview")
+                          height=_TABLE_ROWS, style=self._section_style(family))
         for cid, text, width, anchor in columns:
-            tv.heading(cid, text=text)
+            tv.heading(cid, text=text, anchor="center")
             tv.column(cid, width=width, minwidth=min(width, 34 if cid == "num" else 56),
                       anchor=anchor, stretch=True)
         tv.tag_configure("evenrow", background=S.TABLE_ROW_ALT)
         tv.tag_configure("oddrow", background=S.BG_SECONDARY)
-        tv.tag_configure("gain", foreground=S.SUCCESS)
-        tv.tag_configure("loss", foreground=S.ERROR)
         tv.tag_configure("watch", foreground=S.TEXT_SECONDARY)
+        # Calm: rows stay dark; only the ▲ / ▼ cells are green / red (see _fill_table)
+        tv.tag_configure("symbol_cell", font=S.FONT_TABLE_SYMBOL)   # the stock first, then its numbers
+        tv.tag_configure("up_cell", foreground=S.SUCCESS)
+        tv.tag_configure("down_cell", foreground=S.ERROR)
+        tv.tag_configure("bar_cell", foreground=S.TEXT_TERTIARY)
         tv.tag_configure("hover", background=S.BG_HOVER)   # configured last, so it wins
 
         def _hover(e, t=tv):
@@ -1247,21 +1494,34 @@ class DashboardView(BaseView):
         body._empty_lbl = empty
         body._empty_msg = empty_msg
         body._tree_shown = False
-        body._count_lbl = count_lbl
         return card, body
 
-    def _fill_table(self, body, rows: list, *, loading: bool = False, count: int | None = None) -> None:
+    def _fill_table(self, body, rows: list, *, loading: bool = False) -> None:
         """Replace a table's rows in place. rows = [(values, tags), ...]."""
         tv = body._tree
         children = tv.get_children()
         if children:
             tv.delete(*children)
+        cols = list(tv["columns"])
+        groups = {"symbol_cell": [], "up_cell": [], "down_cell": [], "bar_cell": []}
         for values, tags in rows:
-            tv.insert("", "end", values=values, tags=tags)
-
-        count = "…" if loading else str(len(rows) if count is None else count)
-        if body._count_lbl.cget("text") != count:
-            body._count_lbl.configure(text=count)
+            iid = tv.insert("", "end", values=values, tags=tags)
+            if "symbol" in cols:
+                groups["symbol_cell"].append((iid, "symbol"))
+            for col, value in zip(cols, values):
+                text = str(value)
+                if col == "bar":
+                    groups["bar_cell"].append((iid, col))
+                elif text.startswith("▲"):
+                    groups["up_cell"].append((iid, col))
+                elif text.startswith("▼"):
+                    groups["down_cell"].append((iid, col))
+        for tag, cells in groups.items():   # one call per kind for the whole table
+            if cells:
+                try:
+                    tv.tk.call(tv._w, "tag", "cell", "add", tag, cells)
+                except tk.TclError:
+                    pass   # a Tk without cell tags: plain cells
 
         has_rows = bool(rows)
         if has_rows != body._tree_shown:
@@ -1348,7 +1608,7 @@ class DashboardView(BaseView):
                  _compact_money(_num(item.get("avg_price")), cur),
                  _compact_money(_num(item.get("current_price")), cur),
                  f"{'▲' if pnl >= 0 else '▼'} {_compact_money(abs(pnl), cur)}",
-                 f"{_roi_bar(_num(item.get('pnl_pct')), biggest)}  {_pct_cell(_num(item.get('pnl_pct')))}"),
+                 _pct_cell(_num(item.get("pnl_pct"))), _roi_bar(_num(item.get("pnl_pct")), biggest)),
                 ("evenrow" if i % 2 == 0 else "oddrow", "gain" if pnl >= 0 else "loss"),
             ))
         self._fill_table(frame, rows)
@@ -1399,7 +1659,7 @@ class DashboardView(BaseView):
                 (stripe, "watch") if item.get("watch") else (stripe,),
             ))
         # The badge counts real alerts; grey "watching" rows only fill the table
-        self._fill_table(frame, rows, count=sum(1 for it in data or [] if isinstance(it, dict) and not it.get("watch")))
+        self._fill_table(frame, rows)
 
     def _on_alert_double_click(self, event):
         symbol = self._tree_symbol(event)
@@ -1582,6 +1842,14 @@ class DashboardView(BaseView):
         if self._data_loaded and not force:
             return
         self._data_loaded = True
+        self._fit_for_height = None
+        self._fit_count = 0
+        if hasattr(self, "top_body") and hasattr(self.top_body, "_tree"):
+            for b in self._section_bodies():
+                try:
+                    b._tree.configure(height=_TABLE_ROWS)
+                except Exception:
+                    pass
         currency = (self.currency_var.get() or "INR").upper()
         self._load_gen += 1
         gen = self._load_gen
@@ -1724,7 +1992,7 @@ class DashboardView(BaseView):
             self.alerts_body._empty_lbl.configure(text=f"⚠️  Couldn't load watchlist alerts ({_short_error(exc)})")
 
     def _apply_alerts(self, alerts: list, save_cache: bool = True):
-        self._current_alerts_data = list(alerts or [])
+        self._current_alerts_data = list(alerts or [])[:_TABLE_ROWS]   # older caches could hold more
         self._alerts_currency = self.currency_var.get()
         self._render_alerts_table(self.alerts_body, self._current_alerts_data)
         if save_cache:
@@ -1790,10 +2058,10 @@ class DashboardView(BaseView):
         def arrow(v):
             return "▲" if v >= 0 else "▼"
 
-        def own_colour(key):
-            return self._families[self._kpi[key]["family"]]["text"]
+        def own_colour(_key):
+            return S.TEXT_PRIMARY
 
-        # Neutral cards: their own colour
+        # Neutral cards: dark figures
         for key, v in (("total_value", total_v), ("total_invested", total_inv)):
             self._tint_kpi_card(key, None)
             self._set_kpi_value(key, _compact_money(v, cur), _compact_money(v, cur), own_colour(key))
@@ -1896,7 +2164,7 @@ class DashboardView(BaseView):
                 ''', (symbol,))
                 row = cur.fetchone()
                 if not row:
-                    messagebox.showinfo("Insight Drilldown", f"No asset data found for {symbol}.")
+                    dialogs.showinfo("Insight Drilldown", f"No asset data found for {symbol}.")
                     return
 
                 (iv, signal, prom_hold, fii_hold, dii_hold, cp, pe, eps, high52, low52, name,
@@ -1937,11 +2205,12 @@ class DashboardView(BaseView):
                 today_pnl = qty * (cp - prev_close) if prev_close > 0 else 0.0
         except Exception as e:
             log.exception("Insight drilldown for %s failed", symbol)
-            messagebox.showerror("Error", f"Failed to load insight details: {e}")
+            dialogs.showerror("Error", f"Failed to load insight details: {e}")
             return
 
         S = ModernStyle
-        modal = PremiumModal(self, title=f"Fundamental Insight — {name}", geometry="800x750", icon="💡")
+        modal = PremiumModal(self, title=f"Fundamental Insight — {name}", geometry="800x750", icon="lightbulb",
+                             icon_color="#F59E0B")
         modal.add_chip("🏷️", symbol, bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
         if sector:
             modal.add_chip("🏢", sector, bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
@@ -1949,23 +2218,27 @@ class DashboardView(BaseView):
         diff_pct = ((iv - cp) / cp * 100.0) if cp else 0.0
 
         if signal == "ACCUMULATE":
-            sig_color, sig_bg, sig_fill = S.SUCCESS, S.SUCCESS_PALE, S.SUCCESS_FILL
+            sig_color, sig_bg = S.SUCCESS, S.SUCCESS_PALE
         elif signal == "REDUCE":
-            sig_color, sig_bg, sig_fill = S.ERROR, S.ERROR_PALE, S.ERROR_FILL
+            sig_color, sig_bg = S.ERROR, S.ERROR_PALE
         else:
-            sig_color, sig_bg, sig_fill = S.WARNING, S.WARNING_PALE, S.WARNING_FILL
+            sig_color, sig_bg = S.WARNING, S.WARNING_PALE
 
         modal.add_chip("⚡", f"{signal} (Gap: {diff_pct:+.1f}%)", bg_color=sig_bg, fg_color=sig_color)
 
         # Grid layout for cards (2 columns, 2 rows)
-        grid = tk.Frame(modal.content_frame, bg=S.BG_SECONDARY)
+        # In a scroll area: on a small screen the pop-up is capped and the cards scroll
+        area = ScrollArea(modal.content_frame, S.BG_SECONDARY, fit_content=True)
+        area.pack(fill="both", expand=True)
+        area.scroll_with_wheel(modal)
+        grid = tk.Frame(area.inner, bg=S.BG_SECONDARY)
         grid.pack(fill="both", expand=True)
         grid.grid_columnconfigure(0, weight=1, uniform="ins")
         grid.grid_columnconfigure(1, weight=1, uniform="ins")
 
         def _card(row, col, heading, color):
             card = ModernCard(grid, bg=S.BG_TERTIARY, canvas_bg=S.BG_SECONDARY,
-                              highlight_color=S.BORDER_COLOR, radius=10)
+                              highlight_color=S.BORDER_COLOR, radius=ModernStyle.RADIUS_CARD)
             card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
             inner = tk.Frame(card.content, bg=S.BG_TERTIARY)
             inner.pack(fill="both", expand=True, padx=14, pady=10)
@@ -2030,13 +2303,11 @@ class DashboardView(BaseView):
 
         btn_text = "▲ Quick Buy" if quick_type == "BUY" else "▼ Quick Sell"
 
-        ModernButton(modal.actions_frame, text=btn_text, command=_quick_trade,
-                     bg=sig_fill, fg=S.TEXT_ON_ACCENT, canvas_bg=S.BG_SECONDARY,
-                     width=160, height=40, radius=8, font=S.FONT_SUBHEADING).pack(side="left")
+        action_button(modal.actions_frame, btn_text, _quick_trade, width=160, canvas_bg=S.BG_SECONDARY,
+                      kind="success" if quick_type == "BUY" else "danger").pack(side="left")
 
-        ModernButton(modal.actions_frame, text="✕  Close", command=modal.destroy,
-                     bg=S.NEUTRAL_FILL, fg=S.TEXT_ON_ACCENT, canvas_bg=S.BG_SECONDARY,
-                     width=110, height=40, radius=8, font=S.FONT_BODY_BOLD).pack(side="right")
+        secondary_button(modal.actions_frame, "✕ Close", modal.close,
+                         canvas_bg=S.BG_SECONDARY).pack(side="right")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Trade Drilldown popup
@@ -2060,24 +2331,18 @@ class DashboardView(BaseView):
         except Exception:
             log.warning("Could not read the stock name of %s", symbol, exc_info=True)
 
-        modal = PremiumModal(self, title=f"Trade Drilldown — {display_name}", geometry="1100x650", icon="📊")
+        modal = PremiumModal(self, title=f"Trade Drilldown — {display_name}", geometry="1100x650", icon="history",
+                             icon_color="#14B8A6")
 
         # Chips for context
-        modal.add_chip("🏢", broker if broker else "All Brokers", bg_color=S.BG_TERTIARY, fg_color=S.TEXT_ACCENT)
+        modal.add_chip("🏦", broker if broker else "All Brokers", bg_color=S.BG_TERTIARY, fg_color=S.TEXT_ACCENT)
         modal.add_chip("🏷️", symbol, bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
 
         # Summary chips (filled in after the trades load)
-        modal.buy_chip = tk.Frame(modal.chips_row, bg=S.SUCCESS_PALE, highlightthickness=1, highlightbackground=S.SUCCESS)
-        modal.buy_chip.pack(side="left", padx=(12, 6))
-        modal.buy_lbl = tk.Label(modal.buy_chip, text="▲ Buy Volume: —", bg=S.SUCCESS_PALE, fg=S.SUCCESS,
-                                 font=S.FONT_SMALL_BOLD, padx=8, pady=2)
-        modal.buy_lbl.pack()
-
-        modal.sell_chip = tk.Frame(modal.chips_row, bg=S.ERROR_PALE, highlightthickness=1, highlightbackground=S.ERROR)
-        modal.sell_chip.pack(side="left", padx=(0, 6))
-        modal.sell_lbl = tk.Label(modal.sell_chip, text="▼ Sell Volume: —", bg=S.ERROR_PALE, fg=S.ERROR,
-                                  font=S.FONT_SMALL_BOLD, padx=8, pady=2)
-        modal.sell_lbl.pack()
+        modal.buy_lbl = Pill(modal.chips_row, text="▲ Buy Volume: —", fill=S.SUCCESS_PALE, fg=S.SUCCESS)
+        modal.buy_lbl.pack(side="left", padx=(12, 6))
+        modal.sell_lbl = Pill(modal.chips_row, text="▼ Sell Volume: —", fill=S.ERROR_PALE, fg=S.ERROR)
+        modal.sell_lbl.pack(side="left", padx=(0, 6))
 
         modal.make_compact()   # slim: Close in this row, no footer bar, Esc closes
 
@@ -2094,15 +2359,18 @@ class DashboardView(BaseView):
 
         widths = [40, 100, 100, 80, 80, 100, 80, 100, 100, 110, 110]
         for c, w in zip(cols, widths):
+            # numbers on the right so their digits line up (as in the Holdings drill-down)
+            anchor = "center" if c == "#" else ("w" if c in ("Date", "Trade ID", "Type", "Broker") else "e")
             tv.heading(c, text=c, anchor="center")
-            tv.column(c, width=w, anchor="center")
+            tv.column(c, width=w, anchor=anchor)
+        logo_column(tv, "#", "Broker")   # a "Src" column with each trade's broker logo
+        fit_columns(tv, dict(zip(cols, widths)))   # all columns inside the popup's width
 
         add_treeview_copy_menu(tv)
 
         tv.tag_configure("odd", background=S.BG_SECONDARY)
         tv.tag_configure("even", background=S.TABLE_ROW_ALT)
-        tv.tag_configure("buy", foreground=S.SUCCESS)
-        tv.tag_configure("sell", foreground=S.ERROR)
+        enhance_table(tv, stripes=("even", "odd"))   # highlight under the mouse, click a heading to sort
 
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tv.yview)
         tv.configure(yscroll=vsb.set)
@@ -2126,9 +2394,8 @@ class DashboardView(BaseView):
                 log.exception("Copying drilldown trades failed")
                 show_toast(modal, f"Couldn't copy the trades: {e}", type="error")
 
-        ModernButton(modal.chips_row, text="⧉ Copy Trades", command=_copy, bg=S.ACCENT_PRIMARY, variant="soft",
-                     canvas_bg=S.BG_PRIMARY, width=130, height=30, radius=8,
-                     font=S.FONT_SMALL_BOLD).pack(side="right", padx=(0, 8))
+        action_button(modal.chips_row, "⧉ Copy Trades", _copy, soft=True, size="sm",
+                      canvas_bg=S.BG_PRIMARY).pack(side="right", padx=(0, 8))
 
         app_state = self.app_state
 
@@ -2136,6 +2403,8 @@ class DashboardView(BaseView):
             from model.data_cache import TradeHistoryFilters
             if app_state is not None and hasattr(app_state, "data_cache"):
                 cache = app_state.data_cache
+                if not cache.loaded:   # opened in the first seconds, before the app loads it
+                    app_state.refresh_data_cache()
             else:
                 from model.data_cache import DataCache
                 cache = DataCache()
@@ -2163,6 +2432,7 @@ class DashboardView(BaseView):
 
             total_buy = 0.0
             total_sell = 0.0
+            sides = []
             for idx, r in enumerate(df.itertuples(index=False)):
                 rtype = str(getattr(r, "type", "")).upper()
                 qty = _num(getattr(r, "qty", 0.0))
@@ -2199,7 +2469,11 @@ class DashboardView(BaseView):
                     str(getattr(r, "broker", "")),
                 )
                 stripe = "odd" if idx % 2 else "even"
-                tv.insert("", "end", values=vals, tags=(stripe, "buy" if is_buy else "sell"))
+                iid = tv.insert("", "end", values=vals, tags=(stripe, "buy" if is_buy else "sell"))
+                sides.append((iid, True if is_buy else (False if is_sell else None)))
+            color_buy_sell(tv, sides)   # only Type, Qty and Price say Buy / Sell
+            color_gain_loss(tv, ("Running P&L",))
+            show_logos(tv)
 
             modal.buy_lbl.configure(text=f"▲ Buy Volume: {total_buy:g}")
             modal.sell_lbl.configure(text=f"▼ Sell Volume: {total_sell:g}")
@@ -2219,49 +2493,217 @@ class DashboardView(BaseView):
         S = ModernStyle
         c_val = self.currency_var.get()
 
-        modal = PremiumModal(self, title=title, geometry="640x460", icon="📊")
-        modal.add_chip("🏦", "Per broker", bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
-        modal.add_chip("💱", f"{c_val} holdings", bg_color=S.ACCENT_PRIMARY_PALE, fg_color=S.TEXT_ACCENT)
+        kpi_specs = self._KPI_ROW1 + self._KPI_ROW2
+        fam_key = next((f for t, k, f, ic, c, s in kpi_specs if k == metric_key), "blue")
+        fam = self._families.get(fam_key, self._families.get("blue"))
 
-        modal.make_compact()   # slim: Close in this row, no footer bar, Esc closes
+        modal = PremiumModal(self, title=f"{title} — Broker Breakdown", geometry="720x260", icon="landmark")
+        modal.add_chip("🏦", "Broker Distribution", bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
+        modal.add_chip("💱", f"{c_val} Portfolio", bg_color=S.ACCENT_PRIMARY_PALE, fg_color=S.TEXT_ACCENT)
 
-        # The thin accent line under the header takes the KPI card's colour
-        for w in modal.body_card.winfo_children():
-            if isinstance(w, tk.Frame) and str(w.cget("height")) == "2":
-                w.configure(bg=color)
+        modal.make_compact(close_bg=color)   # slim: Close in color, no footer bar, Esc closes
 
-        table_frame = modal.content_frame
-        table_frame.pack_configure(fill="both", expand=True)
+        modal.set_accent(color)   # the header's icon tile takes the KPI card's colour
 
-        cols = ("#", "Broker", "Value", "% of Total") if is_currency else ("#", "Broker", "Performance Rate")
-        tv = ttk.Treeview(table_frame, columns=cols, show="headings", height=16)
+        body = modal.content_frame
+        body.pack_configure(fill="both", expand=True, padx=18, pady=(12, 6))
+
+        # ── Hero Metric Summary Banner ──
+        # Rounded, tinted and outlined in the KPI's colour, like the KPI cards
+        hero = ModernCard(body, bg=fam["tint"], highlight_color=kpi_colours(color)[1], highlight_thickness=1,
+                          radius=ModernStyle.RADIUS_CARD, canvas_bg=str(body.cget("bg")))
+        hero.hover_color = color
+        hero.pack(fill="x", pady=(0, 10))
+        hero_card = hero.content
+
+        hero_inner = tk.Frame(hero_card, bg=fam["tint"])
+        hero_inner.pack(fill="both", expand=True, padx=14, pady=10)
+
+        hero_left = tk.Frame(hero_inner, bg=fam["tint"])
+        hero_left.pack(side="left", fill="both", expand=True)
+
+        tk.Label(
+            hero_left, text=f"TOTAL {title.upper()}",
+            font=S.FONT_TINY_BOLD, fg=S.TEXT_SECONDARY, bg=fam["tint"], anchor="w"
+        ).pack(anchor="w")
+
+        hero_val_lbl = tk.Label(
+            hero_left, text="Calculating…",
+            font=S.FONT_SYMBOL_LARGE, fg=fam["text"], bg=fam["tint"], anchor="w"
+        )
+        hero_val_lbl.pack(anchor="w", pady=(2, 0))
+
+        hero_right = tk.Frame(hero_inner, bg=fam["tint"])
+        hero_right.pack(side="right", fill="y", anchor="e")
+
+        hero_count_lbl = tk.Label(
+            hero_right, text="Loading brokers…",
+            font=S.FONT_SMALL_BOLD, bg=fam["pale"], fg=fam["text"],
+            padx=10, pady=3, highlightthickness=1, highlightbackground=fam["fill"],
+            anchor="e"
+        )
+        hero_count_lbl.pack(anchor="e")
+
+        hero_sub_lbl = tk.Label(
+            hero_right, text="",
+            font=S.FONT_SMALL, fg=S.TEXT_SECONDARY, bg=fam["tint"], anchor="e"
+        )
+        hero_sub_lbl.pack(anchor="e", pady=(4, 0))
+
+        # ── Table Container ──
+        table_container = tk.Frame(body, bg=S.BG_SECONDARY, highlightthickness=1,
+                                   highlightbackground=S.BORDER_COLOR)
+        table_container.pack(fill="both", expand=True)
+        table_container.grid_columnconfigure(0, weight=1)
+        table_container.grid_rowconfigure(0, weight=1)
+
+        extras = _BREAKDOWN_EXTRAS.get(metric_key, ()) if is_currency else ()
+        cols = ("#", "Broker", "Value") + extras + ("% of Total",) if is_currency else ("#", "Broker", "Performance Rate")
+        tv = ttk.Treeview(table_container, columns=cols, show="headings", height=1, style="Breakdown.Treeview")
+
         style_name = "Breakdown.Treeview"
-        ttk.Style().configure(style_name, rowheight=S.TABLE_ROW_HEIGHT, font=S.FONT_TABLE)
-        tv.configure(style=style_name)
+        ttk.Style().configure(
+            style_name,
+            rowheight=S.TABLE_ROW_HEIGHT,
+            font=S.FONT_TABLE,
+            background=S.BG_SECONDARY,
+            fieldbackground=S.BG_SECONDARY,
+            foreground=S.TEXT_PRIMARY,
+        )
+        ttk.Style().configure(
+            f"{style_name}.Heading",
+            font=S.FONT_TABLE_BOLD,
+            background=S.TABLE_HEADER_BG,
+            foreground=S.TABLE_HEADER_FG,
+            relief="flat",
+        )
+
         for c in cols:
-            tv.heading(c, text=c, anchor="center")
-            width = 50 if c == "#" else (220 if (c == "Broker" or not is_currency) else 160)
-            tv.column(c, width=width, stretch=c != "#", anchor="center")
+            if c == "#":
+                tv.heading(c, text="#", anchor="center")
+                tv.column(c, width=44, minwidth=36, anchor="center", stretch=False)
+            elif c == "Broker":
+                tv.heading(c, text="Broker / Holding", anchor="center")
+                tv.column(c, width=280, minwidth=180, anchor="w", stretch=True)
+            elif c == "Value":   # the figure itself, named after it ("Value" is the Market Value column)
+                tv.heading(c, text=title if len(title) <= 16 else "Amount", anchor="center")
+                tv.column(c, width=150, minwidth=110, anchor="e", stretch=False)
+            elif c in _EXTRA_COLUMNS:
+                heading, width, _tip = _EXTRA_COLUMNS[c]
+                tv.heading(c, text=heading, anchor="center")
+                tv.column(c, width=width, minwidth=width - 20, anchor="e", stretch=False)
+            elif c == "% of Total":
+                tv.heading(c, text="% Share", anchor="center")
+                tv.column(c, width=110, minwidth=85, anchor="e", stretch=False)
+            else:
+                tv.heading(c, text=title if len(title) <= 16 else "Rate", anchor="center")
+                tv.column(c, width=170, minwidth=130, anchor="e", stretch=False)
+        logo_column(tv, "#", "Broker")   # a "Src" column with each broker's logo
+
+        HeadingTips(tv, {
+            "#": "Rank by value",
+            "Broker": "Broker account (click to expand/collapse holdings)",
+            "Value": f"Total {title} held in this broker account",
+            "% of Total": "Share of the total across all brokers (a stock: of its broker's); gains and losses count alike",
+            "Performance Rate": f"Performance ({title}) for this broker",
+            **{c: _EXTRA_COLUMNS[c][2] for c in extras},
+        })
 
         tv.tag_configure("odd", background=S.BG_SECONDARY)
         tv.tag_configure("even", background=S.TABLE_ROW_ALT)
-        tv.tag_configure("sym", foreground=S.TEXT_SECONDARY, font=S.FONT_BODY)
-        tv.tag_configure("profit", foreground=S.SUCCESS)
-        tv.tag_configure("loss", foreground=S.ERROR)
+        tv.tag_configure("broker_row", foreground=S.TEXT_PRIMARY)
+        tv.tag_configure("sym", foreground=S.TEXT_SECONDARY)
         add_treeview_copy_menu(tv)
 
-        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=tv.yview)
+        vsb = ttk.Scrollbar(table_container, orient="vertical", command=tv.yview)
         tv.configure(yscroll=vsb.set)
-        tv.pack(side="left", fill="both", expand=True)
-        modal.set_status("Loading the breakdown…")
+        tv.grid(row=0, column=0, sticky="nsew")
+
+        modal.set_status("Loading broker metrics…")
+
+        broker_data = {"rows": [], "children": {}}
+
+        def _adjust_modal_height(center: bool = False):
+            vis = 0
+            for root_id in tv.get_children(""):
+                vis += 1
+                if bool(tv.item(root_id, "open")):
+                    vis += len(tv.get_children(root_id))
+            new_h = max(1, min(vis, 14))
+            tv.configure(height=new_h)
+            if vis > new_h:
+                vsb.grid(row=0, column=1, sticky="ns")
+            else:
+                vsb.grid_forget()
+            modal.update_idletasks()
+            if center:
+                modal.fit_to_content(width=750 + sum(_EXTRA_COLUMNS[c][1] for c in extras))
+            else:
+                req_h = min(modal.winfo_reqheight(), popup_limits(modal)[1])
+                cur_x = modal.winfo_x()
+                cur_y = modal.winfo_y()
+                modal.geometry(f"{modal.winfo_width()}x{req_h}+{cur_x}+{cur_y}")
+
+        _last_broker_toggle = {"time": 0.0, "item": None}
+
+        def _toggle_broker(item_id: str):
+            children = broker_data["children"]
+            if item_id in children and children[item_id]:
+                is_open = bool(tv.item(item_id, "open"))
+                new_open = not is_open
+                tv.item(item_id, open=new_open)
+                vals = list(tv.item(item_id, "values"))
+                if vals and len(vals) > 1:
+                    arrow = "▾" if new_open else "▸"
+                    n_stocks = len(children[item_id])
+                    vals[1] = f"{arrow}  {item_id}  ({n_stocks} {'stocks' if n_stocks > 1 else 'stock'})"
+                    tv.item(item_id, values=tuple(vals))
+                _adjust_modal_height(center=False)
+            elif "::" in item_id:
+                b_name, sym = item_id.split("::", 1)
+                self._open_trade_drilldown(sym, broker=b_name)
+
+        def _on_row_click(event):
+            item_id = tv.identify_row(event.y)
+            if not item_id:
+                return
+            if item_id in broker_data["children"] and broker_data["children"][item_id]:
+                import time
+                now = time.time()
+                if item_id == _last_broker_toggle["item"] and (now - _last_broker_toggle["time"]) < 0.35:
+                    return "break"
+                _last_broker_toggle["item"] = item_id
+                _last_broker_toggle["time"] = now
+                _toggle_broker(item_id)
+                tv.selection_set(item_id)
+                return "break"
+
+        def _on_row_double_click(event):
+            item_id = tv.identify_row(event.y)
+            if not item_id:
+                return
+            if item_id in broker_data["children"]:
+                return "break"
+            elif "::" in item_id:
+                b_name, sym = item_id.split("::", 1)
+                self._open_trade_drilldown(sym, broker=b_name)
+                return "break"
+
+        tv.bind("<Button-1>", _on_row_click)
+        tv.bind("<Double-1>", _on_row_double_click)
+        tv.bind("<Return>", lambda _e: [_toggle_broker(sel) for sel in tv.selection()])
+        tv.bind("<space>", lambda _e: [_toggle_broker(sel) for sel in tv.selection()])
 
         def _work():
             from model.database import db_session
             with DashboardView._import_lock:
                 from model.engine import get_metrics_by_broker
             broker_metrics = get_metrics_by_broker(currency_filter=c_val)
-            rows = sorted(((str(b), _num((m or {}).get(metric_key))) for b, m in (broker_metrics or {}).items()),
-                          key=lambda x: x[1], reverse=True)
+            is_loss_metric = metric_key in {"unrealized_loss", "realized_loss"}
+            raw_rows = [(str(b).strip(), _num((m or {}).get(metric_key)))
+                        for b, m in (broker_metrics or {}).items() if str(b).strip()]
+            # For loss metrics, order by ascending (most negative / largest loss first). Otherwise descending.
+            rows = sorted(raw_rows, key=lambda x: x[1], reverse=(not is_loss_metric))
             children = {}
             sql = _BREAKDOWN_SQL.get(metric_key)
             if sql:
@@ -2273,39 +2715,156 @@ class DashboardView(BaseView):
                             children[b] = [(s, n, _num(v)) for s, n, v in cur.fetchall()]
                 except Exception:
                     log.exception("Failed to fetch the symbol breakdown for %s", metric_key)
-            return rows, children
+
+            sizes = {}   # broker → [invested, value, value at yesterday's close, {symbol: (the same)}]
+            if extras:
+                try:
+                    with db_session() as conn:
+                        for b, sym, inv, val, prev in conn.execute(_HOLDING_SIZES_SQL, (c_val.upper(),)):
+                            e = sizes.setdefault(str(b).strip(), [0.0, 0.0, 0.0, {}])
+                            inv, val, prev = _num(inv), _num(val), _num(prev)
+                            e[0] += inv
+                            e[1] += val
+                            e[2] += prev
+                            e[3][sym] = (inv, val, prev)
+                except Exception:
+                    log.exception("Failed to fetch the holding sizes for the %s breakdown", metric_key)
+
+            # Filter out brokers with no value and no holdings for the specific metric
+            if metric_key in {"day_pnl", "unrealized_pnl", "unrealized_loss", "realized_pnl", "realized_loss"}:
+                rows = [r for r in rows if abs(r[1]) > 0.01 or len(children.get(r[0], [])) > 0]
+
+            return rows, children, sizes
+
+        def _change(now, base) -> str:
+            """now against base as ▲ / ▼ percent ("—" without a base)."""
+            if not base:
+                return "—"
+            p = (now - base) / abs(base) * 100.0
+            return "0.00%" if abs(p) < 0.005 else f"{'▲' if p > 0 else '▼'} {abs(p):.2f}%"
+
+        def _extra_cells(size, amount) -> tuple:
+            """The extra columns for a row: size = (invested, value, value at yesterday's close)."""
+            inv, val, prev = size
+            out = []
+            for c in extras:
+                if c == "mkt":
+                    out.append(_money(val, c_val) if val else "—")
+                elif c == "day":
+                    out.append(_change(val, prev))
+                else:   # Return %: Overall P&L also counts what was sold; the rest is value against cost
+                    out.append(_change(inv + amount, inv) if metric_key == "overall_pnl" else _change(val, inv))
+            return tuple(out)
 
         def _populate(result):
-            rows, children = result
+            rows, children, sizes = result
+            broker_data["rows"] = rows
+            broker_data["children"] = children
+            num_brokers = len(rows)
             total = sum(v for _b, v in rows)
+
+            # Update Hero Value
             if is_currency:
-                modal.set_status(f"Total across brokers: {_money(total, c_val)}  ·  double-click a broker to see its stocks")
-            else:
-                modal.set_status(f"{title} calculated per broker.")
-            if len(rows) > 8:
-                vsb.pack(side="right", fill="y")
-            for idx, (b, v) in enumerate(rows):
-                tags = ["odd" if idx % 2 == 0 else "even"]
-                if metric_key in {"overall_pnl", "unrealized_pnl", "realized_pnl", "overall_xirr", "overall_cagr", "day_pnl"}:
-                    if v > 0:
-                        tags.append("profit")
-                    elif v < 0:
-                        tags.append("loss")
+                val_str = _money(total, c_val)
+                if metric_key in {"overall_pnl", "unrealized_pnl", "realized_pnl", "day_pnl"}:
+                    if total > 0:
+                        val_str = f"+{val_str}"
+                        hero_val_lbl.configure(fg=S.SUCCESS)
+                    elif total < 0:
+                        hero_val_lbl.configure(fg=S.ERROR)
+                    else:
+                        hero_val_lbl.configure(fg=fam["text"])
                 elif metric_key in {"unrealized_loss", "realized_loss"}:
-                    tags.append("loss")
-                disp = _money(v, c_val) if is_currency else _pct(v)
-                if is_currency:
-                    pct = (v / total * 100.0) if total != 0 else 0.0
-                    tv.insert("", "end", iid=b, values=(idx + 1, b, disp, f"{pct:.1f}%"), tags=tuple(tags))
+                    hero_val_lbl.configure(fg=S.ERROR if total != 0 else fam["text"])
                 else:
-                    tv.insert("", "end", iid=b, values=(idx + 1, b, disp), tags=tuple(tags))
-                for sym, name, val in children.get(b, []):
-                    if abs(val) <= 0.01:
-                        continue
-                    share = f"{abs(val) / abs(v) * 100:.1f}%" if abs(v) > 0 else "0.0%"
-                    label = f"   ↳ {name}" if name and name != sym else f"   ↳ {sym}"
-                    sym_disp = _money(val, c_val) if is_currency else f"{val:.2f}"
-                    tv.insert(b, "end", values=("", label, sym_disp, share), tags=("sym",))
+                    hero_val_lbl.configure(fg=fam["text"])
+                hero_val_lbl.configure(text=val_str)
+            else:
+                avg_rate = (total / num_brokers) if num_brokers else 0.0
+                val_str = _pct(avg_rate)
+                if avg_rate > 0:
+                    hero_val_lbl.configure(fg=S.SUCCESS, text=f"+{val_str}")
+                elif avg_rate < 0:
+                    hero_val_lbl.configure(fg=S.ERROR, text=val_str)
+                else:
+                    hero_val_lbl.configure(fg=fam["text"], text=val_str)
+
+            # Update Hero Badges
+            hero_count_lbl.configure(text=f"🏛️ {num_brokers} {'Broker' if num_brokers == 1 else 'Brokers'}")
+
+            if num_brokers > 1 and is_currency and total != 0:
+                top_b, top_v = rows[0]
+                whole = sum(abs(x) for _b, x in rows)   # as the % Share column
+                top_pct = (abs(top_v) / whole * 100.0) if whole else 0.0
+                hero_sub_lbl.configure(text=f"Largest: {top_b} ({top_pct:.1f}%)")
+            elif num_brokers == 1:
+                hero_sub_lbl.configure(text="100% in this account")
+            else:
+                hero_sub_lbl.configure(text="")
+
+            has_subitems = any(len(children.get(b, [])) > 0 for b, _ in rows)
+            if has_subitems:
+                modal.set_status("💡 Click any broker to expand stocks · Double-click a stock for trade history")
+            else:
+                modal.set_status(f"{title} breakdown across active broker accounts.")
+
+            if num_brokers == 0:
+                tv.configure(height=2)
+                tv.insert("", "end", values=("-", f"No holdings found for {c_val}", "-", "-"))
+            else:
+                for idx, (b, v) in enumerate(rows):
+                    tags = ["even" if idx % 2 == 0 else "odd", "broker_row"]
+                    b_size = sizes.get(b, [0.0, 0.0, 0.0, {}])
+                    if metric_key == "unrealized_loss":   # just the losing stocks listed under the broker
+                        listed = [b_size[3][sym] for sym, _n, _v in children.get(b, []) if sym in b_size[3]]
+                        b_size = [sum(x[0] for x in listed), sum(x[1] for x in listed), sum(x[2] for x in listed), b_size[3]]
+
+                    disp = _money(v, c_val) if is_currency else _pct(v)
+                    if is_currency and metric_key in {"overall_pnl", "unrealized_pnl", "realized_pnl", "day_pnl"} and v > 0:
+                        disp = f"+{disp}"
+
+                    stock_list = children.get(b, [])
+                    if stock_list:
+                        n_stocks = len(stock_list)
+                        b_label = f"▸  {b}  ({n_stocks} {'stocks' if n_stocks > 1 else 'stock'})"
+                    else:
+                        b_label = f"   {b}"
+
+                    first = {"text": "", "image": logo(b, 18) or ""}   # logo in the "Src" column
+                    if is_currency:
+                        # Shares of everything that moved (gains and losses alike), so they add up to 100 %
+                        whole = sum(abs(x) for _b, x in rows)
+                        pct = (abs(v) / whole * 100.0) if whole else 0.0
+                        tv.insert("", "end", iid=b, values=(idx + 1, b_label, disp) + _extra_cells(b_size[:3], v)
+                                  + (f"{pct:.1f}%",), tags=tuple(tags), **first)
+                    else:
+                        tv.insert("", "end", iid=b, values=(idx + 1, b_label, disp), tags=tuple(tags), **first)
+
+                    for sym, name, val in stock_list:
+                        if abs(val) <= 0.01:
+                            continue
+                        moved = sum(abs(x) for _s, _n, x in stock_list)
+                        share = f"{abs(val) / moved * 100:.1f}%" if moved else "0.0%"
+                        sym_label = f"      ↳  {name} ({sym})" if name and name != sym else f"      ↳  {sym}"
+                        sym_disp = _money(val, c_val) if is_currency else f"{val:.2f}"
+                        if is_currency and metric_key in {"overall_pnl", "unrealized_pnl", "realized_pnl", "day_pnl"} and val > 0:
+                            sym_disp = f"+{sym_disp}"
+
+                        sym_tags = ["sym", "even" if idx % 2 == 0 else "odd"]
+                        child_vals = (("", sym_label, sym_disp) + _extra_cells(b_size[3].get(sym, (0.0, 0.0, 0.0)), val)
+                                      + (share,)) if is_currency else ("", sym_label, sym_disp)
+                        tv.insert(b, "end", iid=f"{b}::{sym}", values=child_vals, tags=tuple(sym_tags))
+
+                # Green / red only for gains and losses: the P&L figure (not a value) and the % columns
+                signed = metric_key in {"overall_pnl", "unrealized_pnl", "realized_pnl", "day_pnl",
+                                        "unrealized_loss", "realized_loss", "overall_xirr", "overall_cagr"}
+                every = [i for b in tv.get_children("") for i in (b, *tv.get_children(b))]
+                color_gain_loss(tv, (("Value", "Performance Rate") if signed else ()) + tuple(c for c in extras if c != "mkt"),
+                                every)
+
+            modal.resizable(True, True)
+            modal.minsize(600, 240)
+            _adjust_modal_height(center=True)
 
         run_in_background(
             _work, on_done=_populate,
@@ -2442,58 +3001,42 @@ class DashboardView(BaseView):
         S = ModernStyle
         currency = self.currency_var.get()  # read on the Tk thread, before the worker starts
 
-        modal = PremiumModal(self, title="Daily Top 10 Portfolio Movers", geometry="1200x600", icon="🏆")
+        modal = PremiumModal(self, title="Today's Top 10 Movers", geometry="1100x700", icon="trophy",
+                             icon_color="#EAB308")
         modal.add_chip("💱", f"{currency} holdings", bg_color=S.ACCENT_PRIMARY_PALE, fg_color=S.TEXT_ACCENT)
         modal.add_chip("🕐", "Price vs previous close", bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
 
         body = modal.content_frame
         body.grid_columnconfigure(0, weight=1, uniform="movers")
-        body.grid_columnconfigure(1, weight=1, uniform="movers")
+        body.grid_columnconfigure(2, weight=1, uniform="movers")
         body.grid_rowconfigure(0, weight=1)
+        tk.Frame(body, bg=S.DIVIDER_COLOR, width=1).grid(row=0, column=1, sticky="ns", padx=14)
 
-        cols = (("#", 40, "center"), ("Symbol", 120, "w"), ("Broker", 120, "w"), ("Prev Close", 90, "e"),
-                ("Price", 90, "e"), ("Change", 100, "e"), ("% Change", 84, "e"))
+        def _side(col, kind, title, subtitle, icon, emoji):
+            up = kind == "gain"
+            panel = tk.Frame(body, bg=S.BG_SECONDARY)
+            panel.grid(row=0, column=col, sticky="nsew")
+            head = tk.Frame(panel, bg=S.BG_SECONDARY)
+            head.pack(fill="x", pady=(0, 8))
+            icon_tile(head, icon, emoji, S.SUCCESS if up else S.ERROR,
+                      S.SUCCESS_PALE if up else S.ERROR_PALE, size=34).pack(side="left")
+            words = tk.Frame(head, bg=S.BG_SECONDARY)
+            words.pack(side="left", padx=(10, 0))
+            tk.Label(words, text=title, bg=S.BG_SECONDARY, fg=S.TEXT_PRIMARY,
+                     font=S.FONT_CARD_TITLE).pack(anchor="w")
+            tk.Label(words, text=subtitle, bg=S.BG_SECONDARY, fg=S.TEXT_SECONDARY,
+                     font=S.FONT_SMALL).pack(anchor="w")
+            board = _MoversBoard(panel, kind, self._open_trade_drilldown)
+            board.pack(fill="both", expand=True)
+            board._empty = EmptyState(panel)
+            return board
 
-        def _column(col, title, fill, row_tag, row_fg):
-            frame = tk.Frame(body, bg=S.BG_SECONDARY, highlightthickness=1,
-                             highlightbackground=fill, highlightcolor=fill)
-            frame.grid(row=0, column=col, sticky="nsew", padx=(0, 8) if col == 0 else (8, 0))
-            tk.Label(frame, text=title, bg=fill, fg=S.TEXT_ON_ACCENT, font=S.FONT_HEADING,
-                     pady=8).pack(fill="x")
-            tv = ttk.Treeview(frame, columns=[c[0] for c in cols], show="headings",
-                              height=10, style="Drilldown.Treeview")
-            for name, width, anchor in cols:
-                tv.heading(name, text=name)
-                tv.column(name, width=width, minwidth=60, anchor=anchor, stretch=True)
-            tv.tag_configure("evenrow", background=S.TABLE_ROW_ALT)
-            tv.tag_configure("oddrow", background=S.BG_SECONDARY)
-            tv.tag_configure(row_tag, foreground=row_fg)
-            tv.pack(fill="both", expand=True, padx=8, pady=8)
-            base = tuple((name, width) for name, width, _a in cols)
-            tv.bind("<Configure>", lambda e, t=tv, b=base: self._fit_tree_columns(t, b, e.width))
-            add_treeview_copy_menu(tv)
-            HeadingTips(tv, {
-                "Prev Close": "Yesterday's closing price",
-                "Price": "Latest price",
-                "Change": "Change per share since yesterday's close",
-                "% Change": "Change as a % of yesterday's close",
-            })
+        gainers = _side(0, "gain", "Top Gainers", "Biggest rises since yesterday's close", "trending-up", "📈")
+        losers = _side(2, "loss", "Top Losers", "Biggest falls since yesterday's close", "trending-down", "📉")
 
-            def _open(e, t=tv):   # double-click a row: that stock's trades
-                row = t.identify_row(e.y)
-                vals = t.item(row, "values") if row else ()
-                if len(vals) > 1 and str(vals[1]).strip():
-                    self._open_trade_drilldown(str(vals[1]).strip())
-            tv.bind("<Double-1>", _open)
-            tv._empty = EmptyState(frame)
-            return tv
-
-        gainers_tv = _column(0, "▲  Top 10 Gainers", S.SUCCESS_FILL, "gain", S.SUCCESS)
-        losers_tv = _column(1, "▼  Top 10 Losers", S.ERROR_FILL, "loss", S.ERROR)
-
-        # Slim: the Close button sits at the end of the chips row, and the window fits its tables
+        # Slim: the Close button sits at the end of the chips row, and the window fits its lists
         modal.make_compact()
-        modal.fit_to_content(width=1200)
+        modal.fit_to_content(width=1100)
         modal.set_status("Loading today's movers…")
 
         def _work():
@@ -2502,27 +3045,14 @@ class DashboardView(BaseView):
             return get_daily_gainers_losers(limit=10, currency_filter=currency)
 
         def _populate(result):
-            gainers, losers = result
-            for tv, items, arrow, tag in ((gainers_tv, gainers, "▲", "gain"), (losers_tv, losers, "▼", "loss")):
-                for i, g in enumerate(items or []):
-                    cur = g.get("currency", currency)
-                    # Held at several brokers: show the first and how many more ("Bahee-Kite +1")
-                    brokers = [b for b in str(g.get("broker", "")).split(", ") if b]
-                    broker = brokers[0] + (f" +{len(brokers) - 1}" if len(brokers) > 1 else "") if brokers else ""
-                    tv.insert("", "end", values=(
-                        i + 1,
-                        g.get("symbol", ""),
-                        broker,
-                        format_money(g.get("prev_close"), cur),
-                        format_money(g.get("current_price"), cur),
-                        f"{arrow} {format_money(abs(_num(g.get('price_change'))), cur)}",
-                        f"{arrow} {abs(_num(g.get('pct_change'))):.2f}%",
-                    ), tags=("evenrow" if i % 2 == 0 else "oddrow", tag))
+            up, down = result
+            for board, items, kind in ((gainers, up, "gain"), (losers, down, "loss")):
+                board.set_rows(items, currency)
                 if not items:
-                    tv._empty.show("😴", "No gainers today" if tag == "gain" else "No losers today",
-                                   "Prices may not have moved yet, or the market is closed.")
-            modal.set_status(f"{len(gainers or [])} gainers and {len(losers or [])} losers today "
-                             f"among your {currency} holdings. Double-click a row to see its trades.")
+                    board._empty.show("😴", "No gainers today" if kind == "gain" else "No losers today",
+                                      "Prices may not have moved yet, or the market is closed.")
+            modal.set_status(f"{len(up or [])} gainers and {len(down or [])} losers today among your "
+                             f"{currency} holdings. Double-click a row for its trades; right-click to copy.")
 
         run_in_background(
             _work, on_done=_populate,

@@ -1,12 +1,20 @@
 
 from model.database import db_session
+from model.applog import log
 from datetime import datetime
+from functools import lru_cache
 import time
 import math
 import threading
 import concurrent.futures
 
 _bad_dates_logged: set = set()
+
+
+@lru_cache(maxsize=8192)
+def _parse_ymd(text: str) -> datetime:
+    """strptime is slow and the same few hundred dates are read thousands of times."""
+    return datetime.strptime(text, '%Y-%m-%d')
 
 
 def _trade_date(date_str, *context):
@@ -16,7 +24,7 @@ def _trade_date(date_str, *context):
     rebuild, or turn the overall XIRR into 0.00% without any warning.
     """
     try:
-        return datetime.strptime(str(date_str), '%Y-%m-%d')
+        return _parse_ymd(str(date_str))
     except (TypeError, ValueError):
         key = (str(date_str),) + tuple(str(c) for c in context)
         if key not in _bad_dates_logged:
@@ -249,7 +257,7 @@ def get_fx_estimates() -> set[str]:
 
 def _warm_fx_cache() -> None:
     """Pre-load all exchange rates in a single DB query."""
-    global _fx_cache, _fx_cache_ts
+    global _fx_cache_ts
     try:
         with db_session() as conn:
             cur = conn.cursor()
@@ -273,8 +281,6 @@ def get_exchange_rate(currency: str) -> float:
     Uses an in-memory cache (60s TTL) to avoid per-row DB round-trips
     in hot loops like dashboard metrics and data cache summaries.
     """
-    global _fx_cache, _fx_cache_ts
-
     if currency == "INR":
         return 1.0
 
@@ -537,6 +543,31 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
         asset_row = (orig_sym, 0.0, "N/A", 0.0, 0.0, 0.0, now)
         return mkt_row, asset_row
 
+def fetch_market_rows(pairs: list, now: str) -> list:
+    """(market row, asset row) for each (Yahoo symbol, symbol). Runs in the price helper
+    process (or, if it can't start, in a thread of the app)."""
+    blank = lambda sym: ((sym, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '', '', '', now),
+                         (sym, 0.0, "N/A", 0.0, 0.0, 0.0, now))
+    rows, done = [], set()
+    # 8 workers: enough to overlap network waits without 25 threads competing for the GIL
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_fetch_single_ticker, yf_sym, orig_sym, now): orig_sym
+                   for yf_sym, orig_sym in pairs}
+        try:
+            # No total timeout, so large batches finish; each answer still has _YFINANCE_TIMEOUT
+            for future in concurrent.futures.as_completed(futures):
+                sym = futures[future]
+                try:
+                    rows.append(future.result(timeout=_YFINANCE_TIMEOUT))
+                except Exception:
+                    rows.append(blank(sym))
+                done.add(sym)
+        except Exception:
+            pass   # unexpected loop failure: the missing symbols get blank rows below
+    rows.extend(blank(sym) for sym in futures.values() if sym not in done)
+    return rows
+
+
 def fetch_and_update_market_data(symbols: list):
     """
     Fetches real-time data from yfinance concurrently to prevent UI freezing.
@@ -560,37 +591,15 @@ def fetch_and_update_market_data(symbols: list):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     yf_symbols = [s + ".NS" if not ('.' in s or '=' in s) else s for s in symbols]
 
-    marketdata_records = []
-    assets_records = []
-
-    # 8 workers: enough to overlap network waits without 25 threads competing for the GIL
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_fetch_single_ticker, yf_sym, orig_sym, now): orig_sym 
-                   for yf_sym, orig_sym in zip(yf_symbols, symbols)}
-
-        try:
-            # We remove the total timeout here to allow large batches to finish.
-            # Individual futures still time out via future.result(_YFINANCE_TIMEOUT) below.
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    m_row, a_row = future.result(timeout=_YFINANCE_TIMEOUT)
-                    marketdata_records.append(m_row)
-                    assets_records.append(a_row)
-                    if future in futures: del futures[future]
-                except Exception:
-                    sym = futures.get(future, "Unknown")
-                    marketdata_records.append((sym, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '', '', '', now))
-                    assets_records.append((sym, 0.0, "N/A", 0.0, 0.0, 0.0, now))
-                    if future in futures: del futures[future]
-        except Exception:
-            # Catch unexpected loop failures (like KeyboardInterrupt)
-            pass
-
-        # Cleanup: capture any symbols that were totally missed/interrupted
-        for f, sym in futures.items():
-            if not any(r[0] == sym for r in marketdata_records):
-                marketdata_records.append((sym, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '', '', '', now))
-                assets_records.append((sym, 0.0, "N/A", 0.0, 0.0, 0.0, now))
+    pairs = list(zip(yf_symbols, symbols))
+    try:   # in the helper process, so the window never waits behind yfinance's Python work
+        from model import price_worker
+        rows = price_worker.run(fetch_market_rows, pairs, now, timeout=60 + len(pairs) * _YFINANCE_TIMEOUT / 4)
+    except Exception:
+        log.warning("Price helper unavailable: fetching prices in the app instead", exc_info=True)
+        rows = fetch_market_rows(pairs, now)
+    marketdata_records = [m for m, _a in rows]
+    assets_records = [a for _m, a in rows]
 
     # Write to DB in a fraction of a second
     with db_session() as conn:
@@ -702,6 +711,11 @@ def rebuild_holdings(*, sync_trade_calcs: bool = True):
             cagr_val = 0.0
             running_pnl = 0.0
 
+            # If net position is zero or negative (due to intraday sequence, bonus, or rounding), clamp to closed (0.0)
+            if data['qty'] <= 0.00001:
+                data['qty'] = 0.0
+                data['cost'] = 0.0
+
             if data['qty'] > 0 or data['realized_pnl'] != 0 or data['total_fees'] > 0:
                 avg_price = data['cost'] / data['qty'] if data['qty'] > 0 else 0.0
 
@@ -745,7 +759,7 @@ def rebuild_holdings(*, sync_trade_calcs: bool = True):
                 else:
                     running_pnl = data['realized_pnl']
 
-            records_to_insert.append((broker, symbol, data['qty'], avg_price, data['realized_pnl'], running_pnl, xirr_val, cagr_val, data['earliest_date'], data['total_fees'], data['currency']))
+            records_to_insert.append((broker, symbol, max(0.0, data['qty']), avg_price, data['realized_pnl'], running_pnl, xirr_val, cagr_val, data['earliest_date'], data['total_fees'], data['currency']))
 
 
         # Rebuild the holdings table in one committed transaction. (This used to run
@@ -986,6 +1000,8 @@ def get_dashboard_metrics(force_refresh: bool = False, broker_filter: str = None
         ''')
         
         invested = current_val = overall_pnl = overall_loss = unrealized_loss = day_pnl = 0.0
+        closed_realized_pnl = closed_realized_loss = 0.0
+        total_realized_pnl = total_realized_loss = 0.0
         earliest_date = None
         
         for row in cursor.fetchall():
@@ -1003,11 +1019,26 @@ def get_dashboard_metrics(force_refresh: bool = False, broker_filter: str = None
                 
             rate = 1.0 if currency_filter != "All" else get_exchange_rate(currency)
             
-            row_inv = (qty * avg_price) * rate
-            row_cur = (qty * mkt_price) * rate
-            row_unrealized = row_cur - row_inv
-            row_day_pnl = (qty * (mkt_price - prev_close)) * rate
+            if qty > 0:
+                row_inv = (qty * avg_price) * rate
+                row_cur = (qty * mkt_price) * rate
+                row_unrealized = row_cur - row_inv
+                row_day_pnl = (qty * (mkt_price - prev_close)) * rate
+                if row_unrealized < 0:
+                    unrealized_loss += row_unrealized
+            else:
+                row_inv = 0.0
+                row_cur = 0.0
+                row_unrealized = 0.0
+                row_day_pnl = 0.0
+                closed_realized_pnl += real_pnl * rate
+                if real_pnl < 0:
+                    closed_realized_loss += real_pnl * rate
             
+            total_realized_pnl += real_pnl * rate
+            if real_pnl < 0:
+                total_realized_loss += real_pnl * rate
+
             invested += row_inv
             current_val += row_cur
             overall_pnl += running_pnl * rate
@@ -1015,15 +1046,13 @@ def get_dashboard_metrics(force_refresh: bool = False, broker_filter: str = None
             
             if real_pnl < 0:
                 overall_loss += real_pnl * rate
-            if row_unrealized < 0:
-                unrealized_loss += row_unrealized
                 
             if earliest_date is None or (date_str and date_str < earliest_date):
                 earliest_date = date_str
 
         unrealized_pnl = current_val - invested
-        realized_pnl = overall_pnl - unrealized_pnl
-        realized_loss = overall_loss
+        realized_pnl = total_realized_pnl
+        realized_loss = total_realized_loss
 
         # Calculate true XIRR from all trades (not simple ROI)
         overall_xirr = calculate_overall_xirr(conn, currency_filter=currency_filter)
@@ -1087,7 +1116,10 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
             if broker not in broker_metrics:
                 broker_metrics[broker] = {
                     "invested": 0.0, "current_val": 0.0, "overall_pnl": 0.0,
-                    "overall_loss": 0.0, "unrealized_loss": 0.0, "day_pnl": 0.0, "earliest_date": None
+                    "overall_loss": 0.0, "unrealized_loss": 0.0, "day_pnl": 0.0,
+                    "total_realized_pnl": 0.0, "total_realized_loss": 0.0,
+                    "closed_realized_pnl": 0.0, "closed_realized_loss": 0.0,
+                    "earliest_date": None
                 }
                 
             metrics = broker_metrics[broker]
@@ -1102,11 +1134,26 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
             
             rate = 1.0 # Broker metrics are kept in their native currency
             
-            row_inv = (qty * avg_price) * rate
-            row_cur = (qty * mkt_price) * rate
-            row_unrealized = row_cur - row_inv
-            row_day_pnl = (qty * (mkt_price - prev_close)) * rate
+            if qty > 0:
+                row_inv = (qty * avg_price) * rate
+                row_cur = (qty * mkt_price) * rate
+                row_unrealized = row_cur - row_inv
+                row_day_pnl = (qty * (mkt_price - prev_close)) * rate
+                if row_unrealized < 0:
+                    metrics["unrealized_loss"] += row_unrealized
+            else:
+                row_inv = 0.0
+                row_cur = 0.0
+                row_unrealized = 0.0
+                row_day_pnl = 0.0
+                metrics["closed_realized_pnl"] += real_pnl * rate
+                if real_pnl < 0:
+                    metrics["closed_realized_loss"] += real_pnl * rate
             
+            metrics["total_realized_pnl"] += real_pnl * rate
+            if real_pnl < 0:
+                metrics["total_realized_loss"] += real_pnl * rate
+
             metrics["invested"] += row_inv
             metrics["current_val"] += row_cur
             metrics["overall_pnl"] += running_pnl * rate
@@ -1114,8 +1161,6 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
             
             if real_pnl < 0:
                 metrics["overall_loss"] += real_pnl * rate
-            if row_unrealized < 0:
-                metrics["unrealized_loss"] += row_unrealized
                 
             if metrics["earliest_date"] is None or (date_str and date_str < metrics["earliest_date"]):
                 metrics["earliest_date"] = date_str
@@ -1124,13 +1169,14 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
         final_broker_metrics = {}
         for broker, metrics in broker_metrics.items():
             invested, current_val = metrics["invested"], metrics["current_val"]
-            overall_pnl, overall_loss = metrics["overall_pnl"], metrics["overall_loss"]
+            overall_pnl = metrics["overall_pnl"]
             unrealized_loss = metrics["unrealized_loss"]
             earliest_date = metrics["earliest_date"]
             currency = metrics.get("currency", "INR")
 
             unrealized_pnl = current_val - invested
-            realized_pnl = overall_pnl - unrealized_pnl
+            realized_pnl = metrics["total_realized_pnl"]
+            realized_loss = metrics["total_realized_loss"]
             # Calculate true XIRR per broker based on all trades for that broker
             overall_xirr = calculate_overall_xirr(conn, broker_filter=broker, currency_filter=currency)
 
@@ -1148,7 +1194,9 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
             final_broker_metrics[broker] = {
                 "total_invested": invested, "total_value": current_val,
                 "overall_pnl": overall_pnl, "unrealized_pnl": unrealized_pnl,
-                "realized_pnl": realized_pnl, "realized_loss": overall_loss, "unrealized_loss": unrealized_loss,
+                "realized_pnl": realized_pnl, "realized_loss": realized_loss, "unrealized_loss": unrealized_loss,
+                "closed_realized_pnl": metrics["closed_realized_pnl"],
+                "closed_realized_loss": metrics["closed_realized_loss"],
                 "overall_xirr": overall_xirr, "overall_cagr": overall_cagr,
                 "day_pnl": metrics.get("day_pnl", 0.0),
                 "currency": currency
@@ -1256,7 +1304,8 @@ _ALERT_MIN_UPSIDE = -30.0   # % : skip alerts whose target is more than 30% belo
 def get_watchlist_alerts(currency_filter: str = "All", fill_to: int = 0) -> list:
     """Watchlist stocks marked Accumulate or Strong Buy, with PE and EPS.
 
-    With fill_to, a shorter list is topped up with the other watchlist stocks
+    With fill_to, the list has at most fill_to items (the alerts with the most
+    upside), and a shorter list is topped up with the other watchlist stocks
     (never "Avoid") that have the most upside to their target; those items
     carry "watch": True so the Dashboard can show them as "watching".
     """
@@ -1332,6 +1381,10 @@ def get_watchlist_alerts(currency_filter: str = "All", fill_to: int = 0) -> list
                 "watch": not is_alert,
             })
         
+        if fill_to and len(alerts) > fill_to:
+            # Too many for the table: keep the ones with the most upside to their target
+            alerts.sort(key=lambda x: -x["pct_below"])
+            del alerts[fill_to:]
         alerts.sort(key=lambda x: x["symbol"])
         if len(alerts) < fill_to:
             watching.sort(key=lambda x: -x["pct_below"])

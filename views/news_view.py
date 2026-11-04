@@ -22,7 +22,7 @@ from tkinter import ttk
 from model.applog import log
 from views.base_view import BaseView, _enable_canvas_mousewheel
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import ModernButton
+from ui.ui_widgets import EmptyState, action_button, header_button
 from ui.ui_utils import run_in_background
 
 CACHE_MAX_AGE_S = 3600          # refresh automatically when older than 1 hour
@@ -142,19 +142,11 @@ def _search_news(yf, sym: str, name: str) -> list[dict]:
     return out
 
 
-def fetch_news(holdings: list[str], cache_path: str) -> tuple[list, list, float]:
-    """Fetch, translate, de-duplicate and sort the news. BACKGROUND THREAD ONLY.
-
-    Returns (articles, symbols searched, fetched_at). Saves the cache when
-    articles were found. Raises ConnectionError when every request failed.
-    """
+def download_news(symbols: list[str], names: dict) -> tuple[list, int]:
+    """(articles, failed symbols) from Yahoo Finance, Japanese titles translated. Runs in
+    the price helper process (or, if it can't start, in a thread of the app)."""
     import concurrent.futures
     import yfinance as yf
-
-    symbols = list(holdings[:MAX_HOLDINGS]) or ["RELIANCE.NS", "TCS.NS", "AAPL", "MSFT"]
-    for sym in MARKET_SYMBOLS + list(CURRENCY_SYMBOLS):
-        if sym not in symbols:
-            symbols.append(sym)
 
     try:
         from deep_translator import GoogleTranslator
@@ -169,8 +161,6 @@ def fetch_news(holdings: list[str], cache_path: str) -> tuple[list, list, float]
             except Exception:
                 return text
         return text
-
-    names = _company_names(symbols)
 
     def fetch_symbol(sym):
         try:
@@ -204,6 +194,27 @@ def fetch_news(holdings: list[str], cache_path: str) -> tuple[list, list, float]
             except Exception as exc:
                 failures += 1
                 log.warning("News for %s failed: %s", futures[fut], exc)
+    return articles, failures
+
+
+def fetch_news(holdings: list[str], cache_path: str) -> tuple[list, list, float]:
+    """Fetch, translate, de-duplicate and sort the news. BACKGROUND THREAD ONLY.
+
+    Returns (articles, symbols searched, fetched_at). Saves the cache when
+    articles were found. Raises ConnectionError when every request failed.
+    """
+    symbols = list(holdings[:MAX_HOLDINGS]) or ["RELIANCE.NS", "TCS.NS", "AAPL", "MSFT"]
+    for sym in MARKET_SYMBOLS + list(CURRENCY_SYMBOLS):
+        if sym not in symbols:
+            symbols.append(sym)
+    names = _company_names(symbols)   # read here: the helper never opens the database
+    try:   # the download in the price helper process, so the window doesn't wait behind it
+        from model import price_worker
+        articles, failures = price_worker.run(download_news, symbols, names, timeout=180)
+    except Exception:
+        log.warning("Price helper unavailable: fetching the news in the app instead", exc_info=True)
+        articles, failures = download_news(symbols, names)
+
     if failures == len(symbols):
         raise ConnectionError("Couldn't reach Yahoo Finance. Check the internet connection and press Refresh.")
     if not articles:
@@ -278,7 +289,7 @@ class NewsView(BaseView):
         status_row.pack(fill="x", pady=(0, 8))
         self.updated_lbl = tk.Label(
             status_row, text="", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY,
-            font=ModernStyle.FONT_SMALL_BOLD,
+            font=ModernStyle.FONT_SMALL,
         )
         self.updated_lbl.pack(side="right", padx=(12, 0))
         self.symbols_lbl = tk.Label(
@@ -313,19 +324,10 @@ class NewsView(BaseView):
         _enable_canvas_mousewheel(self.canvas, include_widget=self.scroll_frame)
 
         self._show_placeholder("Fetching latest news…")
+        self._empty = EmptyState(self.list_frame, bg=ModernStyle.BG_PRIMARY)   # no stories: retry button
 
     def _build_header_right(self, parent):
-        self.refresh_btn = ModernButton(
-            parent,
-            text="↻ Refresh News",
-            command=self.fetch_news_async,
-            bg=ModernStyle.INFO_FILL,
-            fg=ModernStyle.TEXT_ON_ACCENT,
-            canvas_bg=ModernStyle.PURPLE_FILL,
-            width=170,
-            height=34,
-            font=ModernStyle.FONT_BODY_BOLD,
-        )
+        self.refresh_btn = header_button(parent, "↻ Refresh News", self.fetch_news_async, main=True, width=150)
         self.refresh_btn.pack(side="right")
 
     # ── Layout: wrap text to the card width (debounced) ──────────────────────
@@ -391,7 +393,7 @@ class NewsView(BaseView):
 
         self._hide_error()
         self.updated_lbl.config(text="⟳ Refreshing…", fg=ModernStyle.TEXT_ACCENT)
-        self.refresh_btn.set_text("⟳ Refreshing…")
+        self.refresh_btn.set_text("⏳ Refreshing…")
         if not self._cards_shown:
             self._show_placeholder("Fetching latest news…")
 
@@ -414,7 +416,7 @@ class NewsView(BaseView):
         elif self._cards_shown:
             self._show_error("Yahoo Finance returned no articles just now; showing the earlier news.")
         else:
-            self._show_placeholder("No news available for your portfolio symbols right now.")
+            self._show_no_news()
         self._show_updated()
 
     def _on_news_failed(self, err):
@@ -423,7 +425,7 @@ class NewsView(BaseView):
         extra = " Showing the earlier news." if self._cards_shown else ""
         self._show_error(f"⚠ Couldn't refresh the news: {err}{extra}")
         if not self._cards_shown:
-            self._show_placeholder("No news to show yet.")
+            self._show_no_news()
 
     # ── Status / error ────────────────────────────────────────────────────────
 
@@ -449,8 +451,18 @@ class NewsView(BaseView):
 
     def _show_placeholder(self, text: str):
         self._clear_cards()
+        if hasattr(self, "_empty"):
+            self._empty.hide()
         tk.Label(self.scroll_frame, text=text, fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY,
                  font=ModernStyle.FONT_SUBHEADING).pack(pady=40)
+
+    def _show_no_news(self) -> None:
+        """A friendly empty screen with a retry button (Yahoo Finance had nothing just now)."""
+        self._clear_cards()
+        self.set_header_summary("")
+        self._empty.show("📰", "No news right now",
+                         "Yahoo Finance has no recent stories about your stocks. Try again in a while.",
+                         "↻ Try again", self.fetch_news_async)
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
@@ -458,11 +470,15 @@ class NewsView(BaseView):
         self._clear_cards()
         self.symbols_lbl.config(text=f"News for: {', '.join(symbols_fetched)}" if symbols_fetched else "")
         if not news_items:
-            self._show_placeholder("No news available for your portfolio symbols right now.")
+            self._show_no_news()
             return
+        self._empty.hide()
         for item in news_items:
             self._create_news_card(self.scroll_frame, item)
         self._cards_shown = True
+        # In the header: how many stories, about how many of your stocks (the time is shown below)
+        about = f"  ·  about {len(symbols_fetched)} of your stocks" if symbols_fetched else ""
+        self.set_header_summary(f"{len(news_items)} {'story' if len(news_items) == 1 else 'stories'}{about}")
         self.canvas.yview_moveto(0)
 
     def _create_news_card(self, parent, item):
@@ -514,12 +530,8 @@ class NewsView(BaseView):
                 except Exception:
                     log.exception("Opening %s failed", url)
 
-            ModernButton(
-                meta_frame, text="Read article ↗", command=open_link,
-                bg=ModernStyle.ACCENT_PRIMARY_PALE, fg=ModernStyle.TEXT_ACCENT,
-                canvas_bg=card_bg, width=140, height=28,
-                font=ModernStyle.FONT_SMALL_BOLD, radius=14,
-            ).pack(side="right")
+            action_button(meta_frame, "Read article", open_link, soft=True, size="sm", icon="external-link",
+                          canvas_bg=card_bg).pack(side="right")
 
         title_lbl = tk.Label(card, text=title, fg=ModernStyle.TEXT_PRIMARY, bg=card_bg,
                              font=ModernStyle.FONT_HEADING, anchor="w", justify="left", wraplength=self._wrap)

@@ -6,19 +6,21 @@ consistent even while the app is reading or writing. They live in a
 ~/Library/Application Support/PTracker/Backups).
 
 File names look like  portfolio-2026-10-20_221530-daily.db  where the last
-part says why the copy was made: daily, manual, or before-<action>.
+part says why the copy was made: daily (the automatic copy, made every few
+days; the name is kept from when it was daily), manual, or before-<action>.
 """
 
 import os
 import re
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import model.database as database
 
-DAILY_KEEP = 30    # one a day on launch, so about a month of history
-SAFETY_KEEP = 30   # copies taken right before a delete, wipe, import or restore
+AUTO_EVERY_DAYS = 5   # an automatic copy on launch once the last is this many days old
+DAILY_KEEP = 5        # automatic copies kept, so about 25 days of history
+SAFETY_KEEP = 5    # copies taken right before a delete, wipe, import or restore
 # Manual backups ("Back up now") are never deleted automatically.
 
 _NAME_RE = re.compile(r"^portfolio-(\d{4}-\d{2}-\d{2})_(\d{6})-([a-z0-9-]+)\.db$")
@@ -94,17 +96,17 @@ def safety_backup(action: str) -> str:
     return create_backup(f"before-{action}")
 
 
-def daily_backup_if_due() -> str | None:
-    """Make today's automatic backup, unless one already exists.
+def auto_backup_if_due() -> str | None:
+    """Make the automatic backup if the last one is AUTO_EVERY_DAYS or more days old.
 
     An empty database (no trades) is skipped, so a wiped database does not
-    push the older, useful backups out of the 30-day window.
+    push the older, useful backups out of the kept ones.
     """
     if not database.DB_PATH or not os.path.exists(database.DB_PATH):
         return None
-    today = datetime.now().strftime("%Y-%m-%d")
+    not_before = datetime.now().date() - timedelta(days=AUTO_EVERY_DAYS)
     for info in list_backups():
-        if info["reason"] == "daily" and info["when"].strftime("%Y-%m-%d") == today:
+        if info["reason"] == "daily" and info["when"].date() > not_before:
             return None
     try:
         conn = sqlite3.connect(database.DB_PATH, timeout=15.0)

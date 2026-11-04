@@ -14,12 +14,12 @@ SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 
 DEFAULTS = {
     "theme": "light",        # "light", "dark" or "system" (match macOS)
-    "text_size": "normal",   # "normal", "large" or "xlarge"
+    "text_size": "normal",   # "small", "normal", "large" or "xlarge"
 }
 
 CHOICES = {
     "theme": ("light", "dark", "system"),
-    "text_size": ("normal", "large", "xlarge"),
+    "text_size": ("small", "normal", "large", "xlarge"),
 }
 
 

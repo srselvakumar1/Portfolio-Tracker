@@ -27,7 +27,7 @@ THEMES:
       Tints      SUCCESS_PALE, ERROR_PALE, WARNING_PALE, INFO_PALE,
                  ACCENT_PRIMARY_PALE, ACCENT_PURPLE_PALE = soft backgrounds for
                  chips and highlighted rows; KPI_TINT_* for KPI cards
-      Tables     TABLE_HEADER_BG/FG/HOVER, TABLE_ROW_ALT, TABLE_SELECTED_BG/FG
+      Tables     TABLE_HEADER_BG/FG/HOVER, TABLE_ROW_ALT/GAIN/LOSS, TABLE_SELECTED_BG/FG
       Header     HEADER_GRAD_START/END (RGB tuples), HEADER_FG, HEADER_SUBTLE_FG
       Sidebar    SIDEBAR_* (the sidebar is dark in both themes)
 """
@@ -84,6 +84,7 @@ _COMMON = {
     # Gradient header text (white on the indigo→pink banner)
     "HEADER_FG":        "#FFFFFF",
     "HEADER_SUBTLE_FG": "#E0E7FF",
+    "HEADER_WARN_FG":   "#FDE68A",   # light amber warnings on the banner
 }
 
 LIGHT = {
@@ -95,6 +96,7 @@ LIGHT = {
     "ENTRY_BG":     "#FFFFFF",
     "BG_HOVER":     "#EEF2F7",
     "BORDER_COLOR": "#E5E7EB",
+    "INPUT_BORDER": "#CBD5E1",   # around text inputs: clearly visible on white cards
     "DIVIDER_COLOR": "#E2E8F0",
 
     "TEXT_PRIMARY":   "#0F172A",
@@ -123,10 +125,12 @@ LIGHT = {
     "KPI_TINT_PURPLE": "#F5F3FF",
     "KPI_TINT_TEAL":   "#ECFEFF",
 
-    "TABLE_HEADER_BG":    "#F1F5F9",   # pale header row, like the Dashboard
-    "TABLE_HEADER_FG":    "#0F172A",
-    "TABLE_HEADER_HOVER": "#E2E8F0",
-    "TABLE_ROW_ALT":      "#F8FAFC",
+    "TABLE_HEADER_BG":    "#D0CDF2",   # every table's heading row: a lavender tint of the page header's indigo
+    "TABLE_HEADER_FG":    "#312E81",
+    "TABLE_HEADER_HOVER": "#BDB9EC",
+    "TABLE_ROW_ALT":      "#F4F6F9",   # zebra stripes: visible on white, lighter than the hover
+    "TABLE_ROW_GAIN":     "#F3FEF7",   # Holdings rows in profit / at a loss: a third-strength pale
+    "TABLE_ROW_LOSS":     "#FFF5F5",
     "TABLE_SELECTED_BG":  "#2563EB",
     "TABLE_SELECTED_FG":  "#FFFFFF",
 
@@ -144,6 +148,7 @@ DARK = {
     "ENTRY_BG":     "#0F1A2C",
     "BG_HOVER":     "#1E2A45",
     "BORDER_COLOR": "#26344F",
+    "INPUT_BORDER": "#3B4D70",
     "DIVIDER_COLOR": "#22304A",
 
     "TEXT_PRIMARY":   "#E5E9F0",
@@ -172,10 +177,12 @@ DARK = {
     "KPI_TINT_PURPLE": "#211A3D",
     "KPI_TINT_TEAL":   "#0C2730",
 
-    "TABLE_HEADER_BG":    "#1B2640",
-    "TABLE_HEADER_FG":    "#E5E9F0",
-    "TABLE_HEADER_HOVER": "#26344F",
-    "TABLE_ROW_ALT":      "#0F1A2C",
+    "TABLE_HEADER_BG":    "#292974",
+    "TABLE_HEADER_FG":    "#C7D2FE",
+    "TABLE_HEADER_HOVER": "#2D2B84",
+    "TABLE_ROW_ALT":      "#18233A",   # zebra stripes: a shade lighter than the card, below the hover
+    "TABLE_ROW_GAIN":     "#122229",
+    "TABLE_ROW_LOSS":     "#211A26",
     "TABLE_SELECTED_BG":  "#2563EB",
     "TABLE_SELECTED_FG":  "#FFFFFF",
 
@@ -188,7 +195,7 @@ DARK = {
     "HEADER_GRAD_END":   (131, 24, 67),   # #831843
 }
 
-TEXT_SCALES = {"normal": 1.0, "large": 1.12, "xlarge": 1.25}
+TEXT_SCALES = {"small": 0.96, "normal": 1.0, "large": 1.12, "xlarge": 1.25}
 
 
 def _macos_is_dark() -> bool:
@@ -209,8 +216,46 @@ _SCALE = TEXT_SCALES.get(_SETTINGS.get("text_size", "normal"), 1.0)
 
 _FAMILY = (
     "Segoe UI" if sys.platform == "win32"
-    else ("Avenir Next" if sys.platform == "darwin" else "Ubuntu")   # softer, rounder than the system font
+    else ("Helvetica" if sys.platform == "darwin" else "Ubuntu")   # clean, with even-width digits
 )
+# The macOS system font (SF Pro) by its own name: asking for "SF Pro Display" gives the
+# same font, but Tk first searched every installed font for it (0.15 s at each start)
+_NAV_FAMILY = ".AppleSystemUIFont" if sys.platform == "darwin" else _FAMILY
+
+
+def _calibri() -> str:
+    """Calibri (the Dashboard's KPI card titles). On a Mac it comes with Microsoft Office,
+    which keeps it to itself, so the app loads it from Word or Excel for its own use only
+    (nothing is installed). Without Office: the app's usual font."""
+    if sys.platform == "win32":
+        return "Calibri"
+    if sys.platform != "darwin":
+        return _FAMILY
+    from pathlib import Path
+    home = Path.home()
+    if any((d / "Calibri.ttf").exists() for d in (home / "Library/Fonts", Path("/Library/Fonts"))):
+        return "Calibri"   # installed for every app
+    try:
+        import ctypes
+        cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        ct = ctypes.CDLL("/System/Library/Frameworks/CoreText.framework/CoreText")
+        cf.CFURLCreateFromFileSystemRepresentation.restype = ctypes.c_void_p
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+        ct.CTFontManagerRegisterFontsForURL.restype = ctypes.c_bool
+        ct.CTFontManagerRegisterFontsForURL.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        for app in ("Word", "Excel", "PowerPoint", "Outlook"):
+            path = Path(f"/Applications/Microsoft {app}.app/Contents/Resources/DFonts/Calibri.ttf")
+            if path.exists():
+                raw = str(path).encode()
+                url = cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), False)
+                if url and ct.CTFontManagerRegisterFontsForURL(url, 1, None):   # 1 = this app only
+                    return "Calibri"
+    except Exception:
+        pass
+    return _FAMILY
+
+
+_KPI_FAMILY = _calibri()
 
 
 def _f(size: int, *style: str) -> tuple:
@@ -227,6 +272,7 @@ class ModernStyle:
 
     THEME = _PALETTE["NAME"]          # "light" or "dark" (what is actually shown)
     THEME_CHOICE = _THEME_CHOICE      # what the user picked: light / dark / system
+    TEXT_SIZE_CHOICE = _SETTINGS.get("text_size", "normal")
     IS_DARK = THEME == "dark"
     TEXT_SCALE = _SCALE
 
@@ -248,6 +294,9 @@ class ModernStyle:
     FONT_TINY        = _f(12)           # (same as SMALL: nothing smaller is readable)
     FONT_TABLE       = _f(13)           # Treeview body rows
     FONT_TABLE_BOLD  = _f(13, "bold")   # Treeview headings
+    # Stock symbols in the Dashboard tables: bold, two points smaller, so they stand out without
+    # looking bigger than their row (Tk has no semi-bold)
+    FONT_TABLE_SYMBOL = (_FAMILY, _f(13)[1] - 2, "bold")
     FONT_DASHBOARD_TABLE      = _f(12)
     FONT_DASHBOARD_TABLE_BOLD = _f(12, "bold")
     FONT_REPORT_TABLE         = _f(13)
@@ -272,14 +321,23 @@ class ModernStyle:
 
     FONT_KPI_VALUE   = _f(20, "bold")
     FONT_KPI_LABEL   = _f(13)
+    FONT_KPI_TITLE   = _f(13)   # KPI card titles, in the card's colour (regular, not bold)
+    FONT_DASHBOARD_KPI_TITLE = (_KPI_FAMILY, _f(13)[1])   # the Dashboard's KPI card titles: Calibri, regular
 
     FONT_INPUT       = _f(13)
 
-    FONT_TICKER_SYMBOL = _f(12, "bold")
+    # Label roles: the same kind of text looks the same on every page
+    FONT_CARD_TITLE  = FONT_HEADING      # card and section titles, in TEXT_PRIMARY
+    FONT_FIELD_LABEL = FONT_SMALL_BOLD   # labels of inputs and filters, in TEXT_SECONDARY
+    FONT_HINT        = FONT_SMALL        # hints and captions, in TEXT_TERTIARY
+
+    FONT_TICKER_SYMBOL = (_FAMILY, max(1, round(11 * _SCALE) - 1), "bold")   # 10 pt at Small text
     FONT_TICKER_VALUE  = _f(12, "normal")
 
-    FONT_NAV         = _f(13, "normal")
-    FONT_NAV_ACTIVE  = _f(13, "bold")
+    # The sidebar menu uses the system font (SF Pro on macOS), bold, like BookingManager
+    FONT_NAV         = (_NAV_FAMILY, max(1, round(13 * _SCALE) - 1), "bold")   # 11 pt at Small text
+    FONT_NAV_ACTIVE  = FONT_NAV
+    NAV_ICON_PX      = round(20 * _SCALE)
     FONT_NAV_SECTION = _f(12)
 
     FONT_BADGE       = _f(12, "bold")
@@ -288,8 +346,13 @@ class ModernStyle:
     # ──────────────────────────────────────────────────────────────
     # COMPONENT LAYOUT TOKENS
     # ──────────────────────────────────────────────────────────────
-    KPI_CARD_HEIGHT          = round(120 * _SCALE)   # Avenir Next lines are a little taller
-    KPI_ACCENT_BAR_HEIGHT    = 3
+    KPI_CARD_HEIGHT          = round(120 * _SCALE)
+    RADIUS_CARD              = 16   # corners: cards, panels and pop-up boxes
+    RADIUS_BUTTON            = 12   #          standard buttons (pills give their own)
+    RADIUS_INPUT             = 10   #          text and drop-down boxes
+    RADIUS_HEADER            = 18   #          the page header banners
+    ACCENT_BAR               = 2   # coloured bar beside KPI cards and line atop table cards
+    CARD_SHADOW              = 2   # soft shadow under cards
     DASH_GRID_CARD_HEIGHT    = round(240 * _SCALE)
     DASH_SECTION_CARD_HEIGHT = round(300 * _SCALE)
     TABLE_ROW_HEIGHT         = round(34 * _SCALE)
@@ -407,7 +470,7 @@ class ModernStyle:
         style.configure("Dashboard.Treeview", font=cls.FONT_TABLE, rowheight=cls.DASHBOARD_ROW_HEIGHT, borderwidth=0)
         # No border of its own: the card edge is the only line under the table
         style.layout("Dashboard.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-        # Softer than the other tables: pale header row with dark text
+        # Calm: one light grey heading row in all four Dashboard tables
         style.configure("Dashboard.Treeview.Heading", font=cls.FONT_TABLE_BOLD,
                         background=cls.BG_TERTIARY, foreground=cls.TEXT_PRIMARY)
         style.map("Dashboard.Treeview.Heading", background=[("active", cls.BG_HOVER)],
@@ -542,6 +605,11 @@ class ModernStyle:
         root.option_add("*Label.Font",       cls.FONT_BODY,       p)
         root.option_add("*Label.Background", cls.BG_PRIMARY,      p)
         root.option_add("*Label.Foreground", cls.TEXT_PRIMARY,    p)
+
+        # A steady text cursor in every input: each blink made Tk redraw the window
+        # (~0.07 s on a Retina Mac), so a field with the cursor in it kept the app
+        # about 17% busy and every click on that page waited behind the blinking
+        root.option_add("*insertOffTime", 0, p)
 
         # Entry
         root.option_add("*Entry.Font",                cls.FONT_BODY,       p)

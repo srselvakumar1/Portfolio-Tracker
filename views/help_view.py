@@ -120,7 +120,7 @@ SECTIONS = [
             "more shares sold than bought. It is **not counted** in the totals. Usually the buy was entered "
             "under another broker, or is missing.",
             "**Bad data** (amber rows): a trade whose date or numbers could not be read, for example a date "
-            "written 15/01/2024. It is left out; correct it in **Trade History** (dates are YYYY-MM-DD).",
+            "written 15/01/2024. It is left out; correct it in **Trade History** (pick the date with 📅, or type it like 15 Jan 2024).",
             "**Red message**: the report could not be worked out at all. The cards then show — rather than "
             "an older year's figures.",
             "**All currencies**: JPY amounts are converted to ₹ at **today's exchange rate**, because past "
@@ -186,8 +186,8 @@ SECTIONS = [
     ("backups", "💾  Backups", "purple", [
         ("p", "Find these in **Settings → Data Backup & Export**."),
         ("bullets", [
-            "**Automatic daily backup**: one copy a day when PTracker starts; the last **30** are kept.",
-            "**Safety backup**: a copy is also saved **before every delete, wipe, import or restore**.",
+            "**Automatic backup**: one copy every **5 days** when PTracker starts; the last **5** are kept.",
+            "**Safety backup**: a copy is also saved **before every delete, wipe, import or restore**; the last **5** are kept.",
             "**Back Up Now**: makes a copy straight away. These are never deleted automatically.",
             "**Restore…**: go back to a backup. Your current data is saved first, so a restore can be "
             "undone too.",
@@ -201,7 +201,7 @@ SECTIONS = [
         ("p", "In **Settings → Appearance** choose:"),
         ("bullets", [
             "**Theme**: Light, Dark, or **Match macOS** (follows your Mac's light or dark setting).",
-            "**Text size**: Normal, Large or Extra large.",
+            "**Text size**: Small, Normal, Large or Extra large.",
             "Changes apply **after you restart** PTracker.",
         ]),
     ]),

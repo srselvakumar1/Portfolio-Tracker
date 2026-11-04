@@ -6,7 +6,8 @@ background; the window only shows the results.
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, filedialog
+from ui import dialogs
 from collections import defaultdict
 from datetime import datetime
 
@@ -14,8 +15,9 @@ from views.base_view import BaseView
 from views.tax_report_view import (CurrencyToggle, currency_symbol, signed_money, gain_colour,
                                    fit_columns, fit_value_font)
 from ui.ui_theme import ModernStyle
-from ui.ui_widgets import ModernButton
-from ui.ui_utils import add_treeview_copy_menu, treeview_sort_column, run_in_background, format_money
+from ui.ui_widgets import EmptyState, ModernButton, header_button, kpi_card
+from ui.broker_logos import logo, logo_column, show_logos
+from ui.ui_utils import add_treeview_copy_menu, color_gain_loss, treeview_sort_column, run_in_background, format_money
 
 
 def _short_amount(val: float, currency: str) -> str:
@@ -32,6 +34,35 @@ def _short_amount(val: float, currency: str) -> str:
     return f"{sym}{val:.0f}"
 
 
+_blend = ModernButton._blend
+
+
+def _gradient_bar(cv: tk.Canvas, x0: float, y0: float, x1: float, y1: float, colour: str, tag: str) -> None:
+    """A bar that fades from a lighter top to `colour` at the base, with rounded top corners.
+
+    Drawn as thin horizontal strips: 1 px where the corners curve, 3 px below."""
+    height = y1 - y0
+    if height < 1:
+        return
+    top = _blend("#FFFFFF", colour, 0.35)
+    r = min(6.0, (x1 - x0) / 2, height)
+    y = y0
+    while y < y1:
+        step = 1 if y - y0 < r else 3
+        dy = r - (y - y0)                                   # how far into the corner curve
+        inset = r - (r * r - dy * dy) ** 0.5 if dy > 0 else 0
+        cv.create_rectangle(x0 + inset, y, x1 - inset, min(y + step, y1), outline="",
+                            fill=_blend(colour, top, (y - y0) / height), tags=tag)
+        y += step
+
+
+def _round_rect(cv: tk.Canvas, x0, y0, x1, y1, r, **kw) -> int:
+    """A rounded rectangle (a smoothed polygon)."""
+    pts = (x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+           x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0)
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
 class BrokerReportView(BaseView):
     """P&L per broker, grouped by currency, with KPI cards, chart and PDF export."""
 
@@ -45,7 +76,7 @@ class BrokerReportView(BaseView):
         super().__init__(parent, app_state=app_state)
 
     def build(self):
-        self._current_currency = tk.StringVar(value="All")
+        self._current_currency = tk.StringVar(value="INR")
 
         self._content = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
         self._content.pack(fill="both", expand=True)
@@ -64,11 +95,7 @@ class BrokerReportView(BaseView):
     def _build_header(self):
         def _build_right(parent):
             CurrencyToggle(parent, self._current_currency).pack(side="left", padx=(0, 14))
-            self._pdf_btn = ModernButton(
-                parent, text="↓ Save PDF", command=self._export_pdf,
-                bg=ModernStyle.WARNING_FILL, fg=ModernStyle.TEXT_ON_ACCENT,
-                canvas_bg=parent.cget("bg"), width=120, height=34, font=ModernStyle.FONT_BODY_BOLD,
-            )
+            self._pdf_btn = header_button(parent, "Save PDF", self._export_pdf, main=True, icon="file-down")
             self._pdf_btn.pack(side="left")
 
         self.add_gradient_header(
@@ -84,18 +111,12 @@ class BrokerReportView(BaseView):
         self._status.config(text=text, fg=colour)
 
     # ── KPI cards ────────────────────────────────────────────────────────────
+    _KPI_ICONS = {"📥": "wallet", "💼": "briefcase", "📊": "chart-column", "🎯": "target", "📐": "gauge"}
+
     def _kpi_card(self, parent, title: str, bar_fill: str, value_fg: str, icon: str):
-        card = tk.Frame(parent, bg=ModernStyle.BG_SECONDARY, highlightthickness=1,
-                        highlightbackground=ModernStyle.BORDER_COLOR, height=ModernStyle.KPI_CARD_HEIGHT)
-        card.pack_propagate(False)
-        tk.Frame(card, bg=bar_fill, width=5).pack(side="left", fill="y")
-        body = tk.Frame(card, bg=ModernStyle.BG_SECONDARY)
-        body.pack(side="left", expand=True, fill="both", padx=14, pady=10)
-        tk.Label(body, text=f"{icon}  {title}", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY,
-                 font=ModernStyle.FONT_KPI_LABEL, anchor="w").pack(fill="x")
-        val_lbl = tk.Label(body, text="…", fg=value_fg, bg=ModernStyle.BG_SECONDARY,
-                           font=ModernStyle.FONT_KPI_VALUE, anchor="w")
-        val_lbl.pack(fill="x", pady=(8, 0))
+        card, body, _title = kpi_card(parent, title, bar_fill, self._KPI_ICONS.get(icon, "circle-dollar-sign"), icon)
+        val_lbl = tk.Label(body, text="…", fg=value_fg, bg=card.tint, font=ModernStyle.FONT_KPI_VALUE, anchor="w")
+        val_lbl.pack(fill="x", pady=(6, 4))
         return card, val_lbl
 
     def _build_kpis(self):
@@ -153,6 +174,7 @@ class BrokerReportView(BaseView):
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._empty = EmptyState(container, bg=ModernStyle.BG_SECONDARY)   # shown when nothing is held or sold
 
         headers = {
             "num": ("#", 44), "broker": ("Broker", 150), "invested": ("Invested", 120), "current_val": ("Current Value", 130),
@@ -161,16 +183,16 @@ class BrokerReportView(BaseView):
             "total_pnl": ("Total P&L", 140), "xirr": ("XIRR", 95),
         }
         for col, (title, width) in headers.items():
-            anchor = "w" if col == "broker" else ("center" if col == "num" else "e")
-            self.tree.heading(col, text=title, anchor=anchor, command=lambda c=col: treeview_sort_column(self.tree, c, False))
+            # amounts with a ▲/▼ indicator on the left, plain amounts on the right
+            anchor = "center" if col == "num" else ("e" if col in ("invested", "current_val") else "w")
+            self.tree.heading(col, text=title, anchor="center", command=lambda c=col: treeview_sort_column(self.tree, c, False))
             self.tree.column(col, width=width, minwidth=30, anchor=anchor, stretch=False)
+        logo_column(self.tree, "num", "broker")   # a "Src" column with each broker's logo
         # Narrow window: hide the two Loss columns first (Copy All Rows still copies them)
         fit_columns(self.tree, {c: w for c, (_t, w) in headers.items()},
                     drop_order=("unrealized_loss", "realized_loss"))
         add_treeview_copy_menu(self.tree)
 
-        self.tree.tag_configure('profit', foreground=ModernStyle.SUCCESS)
-        self.tree.tag_configure('loss', foreground=ModernStyle.ERROR)
         self.tree.tag_configure('even', background=ModernStyle.BG_SECONDARY)
         self.tree.tag_configure('odd', background=ModernStyle.BG_TERTIARY)
         self.tree.tag_configure('group', font=ModernStyle.FONT_REPORT_TABLE_BOLD,
@@ -209,7 +231,7 @@ class BrokerReportView(BaseView):
                     signed_money(v["realized_loss"], c),
                     signed_money(v["overall_pnl"], c),
                     xirr_txt,
-                ), tags=('odd' if idx % 2 else 'even', 'profit' if v["overall_pnl"] >= 0 else 'loss'))
+                ), tags=('odd' if idx % 2 else 'even',))
             self.tree.insert("", tk.END, values=(
                 "",
                 f"TOTAL ({c})",
@@ -222,6 +244,8 @@ class BrokerReportView(BaseView):
                 signed_money(totals["overall_pnl"], c),
                 "",
             ), tags=('summary',))
+        color_gain_loss(self.tree, ("unrealized_pnl", "unrealized_loss", "realized_pnl", "realized_loss", "total_pnl", "xirr"))
+        show_logos(self.tree)
 
     # ── chart ────────────────────────────────────────────────────────────────
     def _build_chart(self):
@@ -232,14 +256,16 @@ class BrokerReportView(BaseView):
 
         head = tk.Frame(frame, bg=ModernStyle.BG_SECONDARY)
         head.pack(fill="x", padx=16, pady=(10, 2))
-        tk.Label(head, text="Investment vs current value by broker", font=ModernStyle.FONT_HEADING,
-                 bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_ACCENT).pack(side="left")
+        tk.Label(head, text="Investment vs current value by broker", font=ModernStyle.FONT_CARD_TITLE,
+                 bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(side="left")
         for colour, text in ((ModernStyle.ACCENT_PRIMARY, "Invested"),
                              (ModernStyle.SUCCESS_FILL, "Value (gain)"),
                              (ModernStyle.ERROR_FILL, "Value (loss)")):
             tk.Label(head, text=text, fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY,
                      font=ModernStyle.FONT_SMALL).pack(side="right", padx=(4, 12))
-            tk.Frame(head, bg=colour, width=12, height=12).pack(side="right")
+            dot = tk.Canvas(head, width=12, height=12, bg=ModernStyle.BG_SECONDARY, highlightthickness=0)
+            dot.create_oval(1, 1, 11, 11, fill=colour, outline="")
+            dot.pack(side="right")
 
         self._chart_canvas = tk.Canvas(frame, bg=ModernStyle.BG_SECONDARY, highlightthickness=0)
         self._chart_canvas.pack(fill=tk.BOTH, expand=True)
@@ -277,7 +303,8 @@ class BrokerReportView(BaseView):
             return
 
         section_w = w / len(shown)
-        pad_l, pad_r, pad_t, pad_b = 70, 20, 26, 30
+        pad_l, pad_r, pad_b = 70, 20, 30
+        pad_t = 44 if len(shown) > 1 else 26   # room for the % labels (and the section titles)
         for idx, c in enumerate(shown):
             brokers = sorted(grouped[c], key=lambda item: item[1].get("total_value", 0.0), reverse=True)
             x_off = idx * section_w
@@ -288,40 +315,51 @@ class BrokerReportView(BaseView):
 
             if len(shown) > 1:
                 cv.create_text(x_off + section_w / 2, 4, text=f"{c} brokers", anchor="n",
-                               fill=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_SMALL_BOLD)
+                               fill=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_SMALL)
+            grid = _blend(ModernStyle.DIVIDER_COLOR, ModernStyle.BG_SECONDARY, 0.6)   # faint, solid
             for i in range(6):
                 y = base - (i / 5) * plot_h
-                cv.create_text(left - 6, y, text=_short_amount((i / 5) * max_val, c), anchor="e",
+                cv.create_text(left - 8, y, text=_short_amount((i / 5) * max_val, c), anchor="e",
                                fill=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL)
                 if i:
-                    cv.create_line(left, y, left + plot_w, y, fill=ModernStyle.DIVIDER_COLOR, dash=(2, 2))
-            cv.create_line(left, pad_t, left, base, fill=ModernStyle.TEXT_TERTIARY)
-            cv.create_line(left, base, left + plot_w, base, fill=ModernStyle.TEXT_TERTIARY)
+                    cv.create_line(left, y, left + plot_w, y, fill=grid)
+            cv.create_line(left, base, left + plot_w, base, fill=ModernStyle.BORDER_COLOR)
 
             group_w = plot_w / len(brokers)
             bar_w = min(40, group_w * 0.35)
-            gap = bar_w * 0.1
+            gap = bar_w * 0.15
             for i, (name, data) in enumerate(brokers):
                 inv = float(data.get("total_invested", 0.0) or 0.0)
                 cur = float(data.get("total_value", 0.0) or 0.0)
                 xc = left + i * group_w + group_w / 2
                 y_inv = base - (inv / max_val) * plot_h
                 y_cur = base - (cur / max_val) * plot_h
-                inv_id = cv.create_rectangle(xc - bar_w - gap / 2, y_inv, xc - gap / 2, base,
-                                             fill=ModernStyle.ACCENT_PRIMARY, outline="")
-                cur_id = cv.create_rectangle(xc + gap / 2, y_cur, xc + bar_w + gap / 2, base, outline="",
-                                             fill=ModernStyle.SUCCESS_FILL if cur >= inv else ModernStyle.ERROR_FILL)
-                self._tip_data[inv_id] = (f"{name}: invested {format_money(inv, c)}", xc - bar_w / 2, y_inv)
-                self._tip_data[cur_id] = (f"{name}: now worth {format_money(cur, c)}  ({signed_money(cur - inv, c)})",
-                                          xc + bar_w / 2, y_cur)
+                fill = ModernStyle.SUCCESS_FILL if cur >= inv else ModernStyle.ERROR_FILL
+                bar_no = len(self._tip_data)
+                _gradient_bar(cv, xc - bar_w - gap / 2, y_inv, xc - gap / 2, base,
+                              ModernStyle.ACCENT_PRIMARY, f"bar{bar_no}")
+                _gradient_bar(cv, xc + gap / 2, y_cur, xc + bar_w + gap / 2, base, fill, f"bar{bar_no + 1}")
+                self._tip_data[f"bar{bar_no}"] = (f"{name}: invested {format_money(inv, c)}", xc - bar_w / 2, y_inv)
+                self._tip_data[f"bar{bar_no + 1}"] = (
+                    f"{name}: now worth {format_money(cur, c)}  ({signed_money(cur - inv, c)})", xc + bar_w / 2, y_cur)
+                if inv > 0:   # gain or loss in % above the pair
+                    pct = (cur - inv) / inv * 100
+                    cv.create_text(xc, min(y_inv, y_cur) - 4, text=f"{'▲' if pct >= 0 else '▼'} {abs(pct):.1f}%",
+                                   anchor="s", fill=gain_colour(pct), font=ModernStyle.FONT_SMALL)
                 label = name if len(name) <= 12 else name[:10] + "…"
-                cv.create_text(xc, base + 6, text=label, anchor="n",
-                               fill=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_SMALL)
+                t = cv.create_text(xc + 10, base + 6, text=label, anchor="n",
+                                   fill=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_SMALL)
+                img = logo(name, 16)   # the broker's logo just left of its name
+                if img is not None:
+                    x0, y0, _x1, y1 = cv.bbox(t)
+                    cv.create_image(x0 - 4, (y0 + y1) / 2, image=img, anchor="e")
+                else:
+                    cv.move(t, -10, 0)
 
     def _on_chart_motion(self, event):
         cv = self._chart_canvas
-        hit = next((i for i in reversed(cv.find_overlapping(event.x, event.y, event.x, event.y))
-                    if i in self._tip_data), None)
+        hit = next((t for i in reversed(cv.find_overlapping(event.x, event.y, event.x, event.y))
+                    for t in cv.gettags(i) if t in self._tip_data), None)
         if hit == self._tip_item:
             return                      # nothing changed: no redraw
         self._hide_tip()
@@ -330,14 +368,14 @@ class BrokerReportView(BaseView):
         self._tip_item = hit
         text, x, top = self._tip_data[hit]
         t = cv.create_text(x, max(top - 8, 18), text=text, anchor="s", tags="tip",
-                           fill=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_SMALL_BOLD)
+                           fill=ModernStyle.TEXT_PRIMARY, font=ModernStyle.FONT_SMALL)
         x0, y0, x1, y1 = cv.bbox(t)
         shift = min(0, cv.winfo_width() - 4 - (x1 + 8)) or max(0, 4 - (x0 - 8))
         if shift:
             cv.move(t, shift, 0)
             x0, x1 = x0 + shift, x1 + shift
-        cv.create_rectangle(x0 - 8, y0 - 4, x1 + 8, y1 + 4, fill=ModernStyle.BG_TERTIARY,
-                            outline=ModernStyle.BORDER_COLOR, tags="tip")
+        _round_rect(cv, x0 - 10, y0 - 5, x1 + 10, y1 + 5, 8, fill=ModernStyle.BG_TERTIARY,
+                    outline=ModernStyle.BORDER_COLOR, tags="tip")
         cv.tag_raise(t)
 
     def _hide_tip(self):
@@ -378,6 +416,13 @@ class BrokerReportView(BaseView):
             metrics, totals, rates = payload
             self._cached_metrics = metrics
             self._populate_table(metrics, currency)
+            if metrics:
+                self._empty.hide()
+            else:
+                which = "" if currency == "All" else f"{currency} "
+                self._empty.show("📊", f"No {which}trades to report yet",
+                                 "Each broker's profit and loss shows up here once you record trades.",
+                                 "+ Add a trade", lambda: self.go_to("trade_entry"))
             self._show_kpis(totals, currency)
             others = sorted(c for c in rates if c != "INR")
             if others:
@@ -405,25 +450,24 @@ class BrokerReportView(BaseView):
     # ── PDF ──────────────────────────────────────────────────────────────────
     def _export_pdf(self):
         if not self._cached_metrics:
-            messagebox.showwarning("No Data", "There is nothing to export yet. Please wait for the report to load.")
+            dialogs.showwarning("No Data", "There is nothing to export yet. Please wait for the report to load.")
             return
         filepath = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
             title="Save P&L Report As",
-            initialfile=f"Broker_Report_{datetime.now().strftime('%Y%m%d')}.pdf",
+            initialfile=f"PnL_Report_{datetime.now().strftime('%Y%m%d')}.pdf",
         )
         if not filepath:
             return
 
-        metrics = {b: dict(d) for b, d in self._cached_metrics.items()}   # a copy for the thread
-        currency = self._current_currency.get()
         self._pdf_btn.set_disabled(True)
         self._set_status("Creating the PDF…")
 
         def work():
+            # The PDF always covers every currency, whatever the filter shows
             from scripts.export_pdf import generate_broker_report_pdf
-            generate_broker_report_pdf(filepath, metrics, currency)
+            generate_broker_report_pdf(filepath)
             return filepath
 
         def done(path):
@@ -433,6 +477,6 @@ class BrokerReportView(BaseView):
         def failed(err):
             self._pdf_btn.set_disabled(False)
             self._set_status(f"✖  Could not create the PDF: {err}", "error")
-            messagebox.showerror("Export Failed", f"Could not create the PDF:\n{err}")
+            dialogs.showerror("Export Failed", f"Could not create the PDF:\n{err}")
 
         run_in_background(work, done, failed, widget=self, name="broker-pdf")

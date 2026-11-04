@@ -14,16 +14,17 @@ Helpers that Trade History's own dialogs use too:
     friendly_error()     turns a database error into a sentence for the status line
 """
 
+import re
 import sqlite3
 import tkinter as tk
 from datetime import date as _date, datetime
-from tkinter import messagebox, ttk
+from ui import dialogs, icons
 
 from model.applog import log
 from model.importer import CURRENCY_SYMBOLS, parse_number, sanity_warnings
 from ui.ui_theme import ModernStyle
-from ui.ui_utils import center_window, run_in_background, show_toast
-from ui.ui_widgets import RoundedBox, ModernButton
+from ui.ui_utils import close_popup, place_centered, run_in_background, show_toast
+from ui.ui_widgets import RoundedBox, ModernButton, action_button, icon_tile, secondary_button
 from views.base_view import _create_date_input
 
 
@@ -55,7 +56,8 @@ def known_brokers(app_state=None, *extra: str) -> list:
     except Exception:
         log.exception("Could not read the broker list")
         names = []
-    names = sorted(set(names))
+    from ui.broker_logos import ordered
+    names = ordered(set(names))   # Bahee-Kite, ICICI, Upstox, … as in Settings
     for b in extra:
         if b and b not in names:
             names.insert(0, b)
@@ -63,13 +65,8 @@ def known_brokers(app_state=None, *extra: str) -> list:
 
 
 def currency_choices(app_state=None, *extra: str) -> list:
-    """INR, JPY, then any other currency your brokers use (and `extra`)."""
-    out = ["INR", "JPY"]
-    for c in list(broker_currency_map(app_state).values()) + list(extra):
-        c = (c or "").strip().upper()
-        if c and c not in out:
-            out.append(c)
-    return out
+    """INR and JPY only."""
+    return ["INR", "JPY"]
 
 
 def friendly_error(e: Exception, *, broker: str = "", trade_id: str = "") -> str:
@@ -97,7 +94,7 @@ def check_trade_fields(*, broker, date, symbol, trade_type, qty, price, fee, cur
     try:
         d = datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
-        raise ValueError("Date must look like 2024-01-15 (year-month-day)")
+        raise ValueError("Date must look like 15 Jan 2024 (or pick it with 📅)")
     if d > _date.today() and date != (original_date or "").strip():
         raise ValueError("The date is in the future.")
     symbol = (symbol or "").strip().upper()
@@ -129,7 +126,7 @@ def confirm_unusual(parent, qty: float, price: float, currency: str, last_price=
     reasons = sanity_warnings(qty, price, currency, last_price)
     if not reasons:
         return True
-    return messagebox.askyesno(
+    return dialogs.askyesno(
         "Please check this trade",
         "\n".join(reasons) + "\n\nSave it anyway?",
         parent=parent,
@@ -192,11 +189,26 @@ def show_stale_warning(parent, warning) -> None:
 
 
 # ── The form ───────────────────────────────────────────────────────────────────
+_EMOJI = re.compile(r"[\u2600-\u27BF\U0001F300-\U0001FAFF\uFE0F]+\s*")
+
+
+def _plain(text) -> str:
+    """Text without emoji (the dialogs show Lucide icons instead)."""
+    return _EMOJI.sub("", str(text or "")).strip()
+
+
 class TradeForm:
     """A two-column grid of labelled inputs in the theme colours.
 
     Labels go on grid row r*2 and their input on r*2+1. `accent` colours the focus ring.
+    Each label gets a small coloured Lucide icon, like the Trade Entry page.
     """
+
+    _LABEL_ICONS = {"Broker": ("landmark", "TEXT_ACCENT"), "Symbol": ("tag", "INFO"),
+                    "Date": ("calendar-days", "ERROR"), "Trade Type": ("arrow-left-right", "WARNING"),
+                    "Quantity": ("hash", "TEXT_PURPLE"), "Price": ("indian-rupee", "WARNING"),
+                    "Fees": ("receipt", "TEXT_SECONDARY")}
+    _FIELD_IPADY = 9   # 44 px boxes, as on the Trade Entry page
 
     def __init__(self, parent, *, accent=None):
         self.bg = ModernStyle.BG_PRIMARY
@@ -213,10 +225,20 @@ class TradeForm:
     def label(self, text, r, c):
         if "Quantity" in text:
             self._roles[(r, c)] = "qty"
-        lbl = tk.Label(self.frame, text=text, bg=self.bg, fg=ModernStyle.TEXT_SECONDARY,
-                       font=ModernStyle.FONT_BODY_BOLD)
-        lbl.grid(row=r * 2, column=c, sticky="w", pady=(10 if r > 0 else 0, 4),
-                 padx=(0, 12 if c < self.cols - 1 else 0))
+        text = _plain(text)
+        cell = tk.Frame(self.frame, bg=self.bg)
+        cell.grid(row=r * 2, column=c, sticky="w", pady=(12 if r > 0 else 0, 6),
+                  padx=(0, 12 if c < self.cols - 1 else 0))
+        icon = next((v for k, v in self._LABEL_ICONS.items() if text.startswith(k)), None)
+        glyph = icons.glyph(icon[0]) if icon else ""
+        icon_lbl = None
+        if glyph:
+            icon_lbl = tk.Label(cell, text=glyph, font=icons.font(16), bg=self.bg,
+                                fg=getattr(ModernStyle, icon[1]), bd=0, padx=0)
+            icon_lbl.pack(side="left", padx=(0, 6))
+        lbl = tk.Label(cell, text=text, bg=self.bg, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD)
+        lbl.pack(side="left")
+        lbl.icon = icon_lbl
         return lbl
 
     def _wrap(self, r, c, plain: bool = False):
@@ -230,39 +252,76 @@ class TradeForm:
             self._vars[self._roles[(r, c)]] = var
         wrap = self._wrap(r, c, plain=is_date)
         if is_date:
-            ent = _create_date_input(wrap, var)
+            ent = _create_date_input(wrap, var, ipady=self._FIELD_IPADY)
             ent.pack(fill="both", expand=True)
             return ent
         ent = tk.Entry(wrap, textvariable=var, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
-                       font=ModernStyle.FONT_TABLE, relief=tk.FLAT, highlightthickness=0,
+                       font=ModernStyle.FONT_INPUT, relief=tk.FLAT, highlightthickness=0, bd=0,
                        insertbackground=self.accent)
-        ent.bind("<FocusIn>", lambda e, w=wrap: w.configure(bg=self.accent))
-        ent.bind("<FocusOut>", lambda e, w=wrap: w.configure(bg=ModernStyle.BORDER_COLOR))
-        ent.pack(fill="both", expand=True, ipady=5, padx=8)
+        ent.pack(fill="both", expand=True, ipady=self._FIELD_IPADY, padx=10)
+        wrap.watch(ent)
         return ent
 
     def broker_box(self, r, c, var, brokers):
+        """The broker: a text box (a new name can be typed) with the broker's logo in front
+        and a ▾ that lists the known brokers with their logos. A plain Entry, not an editable
+        ttk drop-down, whose cursor always blinks (each blink redraws the window)."""
+        from ui.broker_logos import logo
         wrap = self._wrap(r, c)
-        cb = ttk.Combobox(wrap, textvariable=var, values=brokers, font=ModernStyle.FONT_INPUT, state="normal",
-                          style="Boxed.TCombobox")
-        cb.pack(fill="both", expand=True, ipady=3, padx=4, pady=1)
-        wrap.watch(cb)
-        return cb
+        mark = tk.Label(wrap, bg=ModernStyle.ENTRY_BG, bd=0)
+        chevron = icons.glyph("chevron-down")
+        arrow = tk.Label(wrap, text=chevron or "▾", font=icons.font(16) if chevron else ModernStyle.FONT_BODY,
+                         bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_SECONDARY, cursor="hand2", bd=0)
+        arrow.pack(side="right", padx=(4, 10))
+        ent = tk.Entry(wrap, textvariable=var, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
+                       font=ModernStyle.FONT_INPUT, relief=tk.FLAT, highlightthickness=0, bd=0,
+                       insertbackground=self.accent)
+        ent.pack(side="left", fill="both", expand=True, ipady=self._FIELD_IPADY, padx=(10, 0))
+
+        def _sync(*_):
+            img = logo(var.get(), 18)
+            try:
+                if img is None:
+                    mark.pack_forget()
+                else:
+                    mark.configure(image=img)
+                    if not mark.winfo_manager():
+                        mark.pack(side="left", padx=(10, 0), before=ent)
+            except tk.TclError:
+                pass
+
+        def _open(_e=None):
+            menu = tk.Menu(ent, tearoff=0)
+            for name in brokers:
+                menu.add_command(label=f"  {name}", image=logo(name, 18) or "", compound="left",
+                                 command=lambda v=name: (var.set(v), ent.icursor("end")))
+            menu.tk_popup(wrap.winfo_rootx(), wrap.winfo_rooty() + wrap.winfo_height() + 2)
+            return "break"
+
+        arrow.bind("<Button-1>", _open)
+        ent.bind("<Down>", _open)   # the keyboard way to the list
+        var.trace_add("write", _sync)
+        _sync()
+        wrap.watch(ent)
+        return ent
 
     def money_labels(self, price_rc, fee_rc, currency_var):
         """Price / Fees labels whose symbol follows the currency choice."""
-        self.price_label = self.label("", *price_rc)
-        self.fee_label = self.label("", *fee_rc) if fee_rc else None
+        self.price_label = self.label("Price", *price_rc)
+        self.fee_label = self.label("Fees", *fee_rc) if fee_rc else None
         self._roles[tuple(price_rc)] = "price"
         if fee_rc:
             self._roles[tuple(fee_rc)] = "fee"
 
         def _sync(*_):
-            sym = currency_symbol(currency_var.get())
+            sym = currency_symbol(currency_var.get()).strip()
             try:
-                self.price_label.configure(text=f"💰  Price ({sym})")
+                self.price_label.configure(text=f"Price ({sym})")
+                glyph = icons.glyph("japanese-yen" if str(currency_var.get()).upper() == "JPY" else "indian-rupee")
+                if self.price_label.icon is not None and glyph:
+                    self.price_label.icon.configure(text=glyph)
                 if self.fee_label is not None:
-                    self.fee_label.configure(text=f"💸  Fees ({sym})")
+                    self.fee_label.configure(text=f"Fees ({sym})")
             except tk.TclError:
                 pass
         currency_var.trace_add("write", _sync)
@@ -306,9 +365,11 @@ class TradeForm:
         holder.grid(row=grid_row, column=0, columnspan=self.cols, sticky="ew", pady=(12, 0))
         if with_type:
             _type_toggle(holder, type_var).pack(side="left", fill="y", padx=(0, 12))
-        lbl = tk.Label(holder, text="", bg=ModernStyle.ACCENT_PRIMARY_PALE, fg=ModernStyle.TEXT_ACCENT,
-                       font=ModernStyle.FONT_BODY_BOLD, anchor="w", padx=12, pady=8)
-        lbl.pack(side="left", fill="both", expand=True)
+        box = RoundedBox(holder, fill=ModernStyle.SUCCESS_PALE, border=ModernStyle.SUCCESS_PALE, padx=5, pady=5)
+        box.pack(side="left", fill="both", expand=True)
+        lbl = tk.Label(box, text="", bg=ModernStyle.SUCCESS_PALE, fg=ModernStyle.SUCCESS,
+                       font=ModernStyle.FONT_BODY_BOLD, anchor="w", padx=12, pady=9)
+        lbl.pack(fill="both", expand=True)
         qty_v, price_v, fee_v = self._vars["qty"], self._vars["price"], self._vars.get("fee")
 
         def _num(var):
@@ -330,8 +391,13 @@ class TradeForm:
                 what = "You receive" if is_sell else "Total to pay"
                 text = (f"{what}  {sym}{total:,.2f}   ({qty:g} × {sym}{price:,.2f} "
                         f"{'−' if is_sell else '+'} {sym}{fee:,.2f} fees)")
+            is_sell = str(type_var.get()).upper() == "SELL"
+            pale = ModernStyle.ERROR_PALE if is_sell else ModernStyle.SUCCESS_PALE
             try:
-                lbl.configure(text=text)
+                if str(lbl.cget("bg")) != pale:
+                    box.set_fill(pale)
+                    box.configure(bg=pale)
+                lbl.configure(text=text, bg=pale, fg=ModernStyle.ERROR if is_sell else ModernStyle.SUCCESS)
             except tk.TclError:
                 pass
         for v in (qty_v, price_v, fee_v, type_var, currency_var):
@@ -340,54 +406,69 @@ class TradeForm:
         _sync()
 
 
-def _type_toggle(parent, type_var):
-    return _segmented(parent, type_var, (("BUY", "▲ Buy", ModernStyle.SUCCESS_FILL),
-                                         ("SELL", "▼ Sell", ModernStyle.ERROR_FILL)))
-
-
-def currency_toggle(parent, currency_var, currencies):
-    """INR / JPY / USD toggle (the chosen one filled blue)."""
-    return _segmented(parent, currency_var, tuple((c, c, ModernStyle.ACCENT_PRIMARY) for c in currencies))
-
-
-def dialog_header(win, title: str, subtitle: str, title_fg: str):
-    """Compact header: the title, then a row with the subtitle on the left (returned as
-    (row, label) so a currency toggle can go at its right end) and a divider."""
-    bg = ModernStyle.BG_PRIMARY
-    header = tk.Frame(win, bg=bg)
-    header.pack(fill="x", padx=24, pady=(12, 0))
-    tk.Label(header, text=title, bg=bg, fg=title_fg, font=ModernStyle.FONT_SYMBOL_LARGE).pack(anchor="w")
-    row = tk.Frame(header, bg=bg)
-    row.pack(fill="x", pady=(2, 10))
-    lbl = tk.Label(row, text=subtitle, bg=bg, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY, anchor="w")
-    lbl.pack(side="left")
-    tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
-    return row, lbl
-
-
-def _segmented(parent, var, options):
-    """A row of joined toggle buttons for a StringVar: options = ((value, text, fill), ...)."""
-    wrap = tk.Frame(parent, bg=ModernStyle.BG_TERTIARY, highlightthickness=1,
-                    highlightbackground=ModernStyle.BORDER_COLOR)
-    labels = {}
-    for value, text, fill in options:
-        lbl = tk.Label(wrap, text=text, font=ModernStyle.FONT_SMALL_BOLD, padx=16, pady=6, cursor="hand2")
-        lbl.pack(side="left")
-        lbl.bind("<Button-1>", lambda _e, v=value: var.set(v))
-        labels[value] = (lbl, fill)
+def _toggle_buttons(parent, var, options, width=100):
+    """Rounded toggle buttons for a StringVar, like the Trade Entry page.
+    options = ((value, text, Lucide icon or "", fill when chosen), ...)."""
+    bg = str(parent.cget("bg"))
+    wrap = tk.Frame(parent, bg=bg)
+    buttons = {}
+    for i, (value, text, icon, fill) in enumerate(options):
+        glyph = icons.glyph(icon) if icon else ""
+        btn = ModernButton(wrap, text=text, command=lambda v=value: var.set(v), bg=ModernStyle.BG_TERTIARY,
+                           fg=ModernStyle.TEXT_SECONDARY, canvas_bg=bg, width=width, height=38, radius=16,
+                           font=ModernStyle.FONT_BODY_BOLD, glyph=glyph, glyph_font=icons.font(16))   # a pill, like every choice
+        btn.pack(side="left", padx=(0, 8) if i < len(options) - 1 else 0)
+        buttons[value] = (btn, fill, text)
 
     def _sync(*_):
         cur = str(var.get()).upper()
-        for value, (lbl, fill) in labels.items():
+        for value, (btn, fill, text) in buttons.items():
             on = cur == str(value).upper()
             try:
-                lbl.configure(bg=fill if on else ModernStyle.BG_TERTIARY,
-                              fg=ModernStyle.TEXT_ON_ACCENT if on else ModernStyle.TEXT_SECONDARY)
+                btn.set_palette(bg=fill if on else ModernStyle.BG_TERTIARY,
+                                fg=ModernStyle.TEXT_ON_ACCENT if on else ModernStyle.TEXT_SECONDARY)
             except tk.TclError:
                 pass
     var.trace_add("write", _sync)
     _sync()
     return wrap
+
+
+def _type_toggle(parent, type_var):
+    up, down = icons.glyph("trending-up"), icons.glyph("trending-down")
+    return _toggle_buttons(parent, type_var, (("BUY", "BUY" if up else "▲ BUY", "trending-up", ModernStyle.SUCCESS_FILL),
+                                              ("SELL", "SELL" if down else "▼ SELL", "trending-down",
+                                               ModernStyle.ERROR_FILL)))
+
+
+def currency_toggle(parent, currency_var, currencies):
+    """₹ INR / ¥ JPY buttons, green and purple when chosen (as on the Trade Entry page)."""
+    fills = {"INR": ModernStyle.SUCCESS_FILL, "JPY": ModernStyle.PURPLE_FILL}
+    return _toggle_buttons(parent, currency_var,
+                           [(c, f"{currency_symbol(c).strip()} {c}".strip(), "", fills.get(c, ModernStyle.ACCENT_PRIMARY))
+                            for c in currencies], width=92)
+
+
+def dialog_header(win, title: str, subtitle: str, title_fg: str):
+    """Header: a solid icon tile (a green plus to add a trade, a blue pencil to edit one), the
+    title and the subtitle. Returns (row, subtitle label): a currency toggle packed into the
+    row with side="right" sits at its right end. `title_fg` is no longer used."""
+    bg = ModernStyle.BG_PRIMARY
+    adding = re.search(r"\b(add|new)\b", f"{title} {subtitle}", re.I)
+    tile = "#16A34A" if adding else "#2563EB"   # a solid green (add) or blue (edit) tile, white symbol
+    row = tk.Frame(win, bg=bg)
+    row.pack(fill="x", padx=24, pady=(16, 14))
+    icon_tile(row, "circle-plus" if adding else "pencil", "➕" if adding else "✏️", "#FFFFFF", tile,
+              size=44).pack(side="left")
+    words = tk.Frame(row, bg=bg)
+    words.pack(side="left", padx=(12, 0))
+    tk.Label(words, text=_plain(title), bg=bg, fg=ModernStyle.TEXT_PRIMARY,
+             font=ModernStyle.FONT_SYMBOL_LARGE).pack(anchor="w")
+    lbl = tk.Label(words, text=_plain(subtitle), bg=bg, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL,
+                   anchor="w")
+    lbl.pack(anchor="w")
+    tk.Frame(win, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=20)
+    return row, lbl
 
 
 def follow_broker_currency(broker_var, currency_var, app_state=None) -> None:
@@ -405,25 +486,23 @@ def follow_broker_currency(broker_var, currency_var, app_state=None) -> None:
 def make_dialog(parent, title: str, size: str, accent: str):
     """A themed modal window with a coloured top bar."""
     win = tk.Toplevel(parent)
-    win.title(title)
+    win.withdraw()   # built hidden; _fit_dialog shows it once, at its final size, with a short fade
+    win.title(_plain(title).lstrip("+ ") or title)
     ModernStyle.style_modal(win)
     win.configure(bg=ModernStyle.BG_PRIMARY)
     win.resizable(False, False)
     win.geometry(size)
+    win._width = int(str(size).split("x")[0])
     try:
         win.transient(parent.winfo_toplevel())
-        win.grab_set()
     except Exception:
         pass
-    try:
-        center_window(win, parent=parent.winfo_toplevel())
-    except Exception:
-        pass
-    tk.Frame(win, bg=accent, height=4).pack(fill="x")
-    win.bind("<Escape>", lambda _e: _safe_destroy(win))
+    tk.Frame(win, bg=accent, height=ModernStyle.ACCENT_BAR).pack(fill="x")
+    win.bind("<Escape>", lambda _e: close_popup(win))
+    win.protocol("WM_DELETE_WINDOW", lambda: close_popup(win))
     # Once the form is built, make the window just tall enough for it, so the
     # buttons at the bottom are never cut off (fonts and text size change heights)
-    win.after_idle(lambda: _fit_dialog(win, parent))
+    win.after(1, lambda: _fit_dialog(win, parent))   # a timer: runs only once the form is built
     return win
 
 
@@ -433,10 +512,21 @@ def _fit_dialog(win, parent) -> None:
             return
         win.update_idletasks()
         h = min(win.winfo_reqheight(), win.winfo_screenheight() - 120)
-        win.geometry(f"{win.winfo_width()}x{h}")
-        center_window(win, parent=parent.winfo_toplevel())
+        place_centered(win, win._width, h, parent.winfo_toplevel())
+        win.deiconify()
+        _grab(win)
     except tk.TclError:
         pass
+
+
+def _grab(win, tries: int = 10) -> None:
+    """Keep the clicks in the dialog once it is on screen."""
+    try:
+        if win.winfo_exists():
+            win.grab_set()
+    except tk.TclError:
+        if tries:
+            win.after(30, lambda: _grab(win, tries - 1))
 
 
 def dialog_footer(win):
@@ -451,16 +541,18 @@ def dialog_footer(win):
 
 
 def dialog_button(parent, text, command, fill, width):
-    """Footer button. Cancel (grey) is a soft button; the first main button also answers Return."""
-    secondary = fill == ModernStyle.NEUTRAL_FILL
-    if not secondary:
-        win = parent.winfo_toplevel()
-        if not win.bind("<Return>"):
-            win.bind("<Return>", lambda _e: command())
-    return ModernButton(parent, text=text, command=command, bg=fill, fg=ModernStyle.TEXT_ON_ACCENT,
-                        variant="soft" if secondary else "solid",
-                        canvas_bg=ModernStyle.BG_PRIMARY, width=width, height=38, radius=8,
-                        font=ModernStyle.FONT_BODY_BOLD)
+    """Footer button. Cancel (grey) is a soft button; the first main button also answers Return;
+    a second blue button beside a green one (Add & Continue) is soft. A leading ✓ ✕ ⟳ + becomes
+    the matching Lucide icon."""
+    if fill == ModernStyle.NEUTRAL_FILL:   # Cancel: the soft grey every Cancel / Close shares
+        return secondary_button(parent, text, command, width=width, canvas_bg=ModernStyle.BG_PRIMARY)
+    win = parent.winfo_toplevel()
+    main = not win.bind("<Return>")
+    if main:
+        win.bind("<Return>", lambda _e: command())
+    kind = "success" if fill == ModernStyle.SUCCESS_FILL else "primary"
+    return action_button(parent, text, command, kind=kind, soft=not main, width=width,
+                         canvas_bg=ModernStyle.BG_PRIMARY)
 
 
 def _safe_destroy(win):
@@ -486,7 +578,7 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
                           trade_type: str, qty: str, price: str, fee: str, currency: str = "INR",
                           app_state=None) -> None:
     if not broker or not trade_id:
-        messagebox.showerror("Edit Trade", "This row has no broker or trade id, so it can't be edited.", parent=parent)
+        dialogs.showerror("Edit Trade", "This row has no broker or trade id, so it can't be edited.", parent=parent)
         return
 
     win = make_dialog(parent, "✏️ Edit Trade", "700x400", ModernStyle.ACCENT_PRIMARY)
@@ -528,7 +620,7 @@ def open_edit_trade_modal(parent: tk.Widget, reload_cb, broker: str, trade_id: s
 
         rename_all = False
         if values["symbol"] != (symbol or "").strip().upper():
-            rename_all = messagebox.askyesno(
+            rename_all = dialogs.askyesno(
                 "Rename Symbol",
                 f"Rename ALL trades for '{symbol}' under broker '{broker}' to '{values['symbol']}'?\n\n"
                 "Choose No to change only this trade.",
@@ -573,7 +665,7 @@ def open_quick_add_trade_modal(parent, reload_cb, symbol="", broker="", stock_na
                                app_state=None, trade_type="BUY", currency="INR") -> None:
     accent = ModernStyle.ACCENT_PRIMARY if keep_open else ModernStyle.SUCCESS_FILL
     win = make_dialog(parent, "➕ Add Trade & Continue" if keep_open else "+ Add Trade", "700x400", accent)
-    what = "➕  Quick Add Trade • Continue Mode" if keep_open else "➕  Quick Add Trade"
+    what = "Quick Add Trade  ·  Continue Mode" if keep_open else "Quick Add Trade"
     head_row, _ = dialog_header(win, symbol, f"{stock_name}  ·  {what}" if stock_name else what,
                                 ModernStyle.TEXT_ACCENT)
 
@@ -649,7 +741,7 @@ def open_quick_add_trade_modal(parent, reload_cb, symbol="", broker="", stock_na
             n = save_count[0]
             status_lbl.configure(text=f"✅ Trade saved!  ({n} trade{'s' if n != 1 else ''} added this session)",
                                  fg=ModernStyle.SUCCESS)
-            count_lbl.configure(text=f"📌 {n} added")
+            count_lbl.configure(text=f"{n} added")
             qty_var.set("")
             price_var.set("")
             fee_var.set("0.0")

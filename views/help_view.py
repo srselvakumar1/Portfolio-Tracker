@@ -73,7 +73,7 @@ SECTIONS = [
             ["**Tax Report**", "Realised capital gains for a financial year (see Tax Report below)."],
             ["**P&L Report**", "Invested, current value, profit and loss and XIRR for each broker, with a chart and a PDF."],
             ["**Watchlist**", "Shares you are watching, with fundamental and technical numbers."],
-            ["**Valuation**", "Fair value from a simple earnings model, with Accumulate / Hold / Reduce signals."],
+            ["**Valuation**", "Fair value, buy price, target and signal for any symbol, from the shared rules."],
             ["**Financial News**", "Market news headlines."],
             ["**Settings**", "Brokers, appearance, backups, the data cache, and deleting data."],
         ]),
@@ -267,23 +267,47 @@ SECTIONS = [
     ]),
 
     ("valuations", "⚖️  Valuations and action signals", "teal", [
-        ("p", "The **fair value** (intrinsic value) comes from a simple earnings model: earnings per share "
-              "(EPS) grow **12%** a year for 5 years, each year is discounted at **10%**, and a final value of "
-              "**15 ×** the year-5 EPS is added. The same numbers are used for every stock, so the fair value "
-              "is always about **21.7 × EPS**. A stock with zero or negative EPS has no fair value and no signal."),
-        ("table", ["Year", "Projected EPS", "Discount factor", "Present value"], [
-            ["Start", "₹10.00", "1.000", "–"],
-            ["Year 1", "₹11.20", "0.909", "₹10.18"],
-            ["Year 5", "₹17.62", "0.621", "₹10.94"],
-            ["Final value", "₹264.35", "0.621", "₹164.14"],
-            ["**Intrinsic value**", "–", "–", "**₹216.94** (all five years plus the final value)"],
+        ("p", "Holdings, Watchlist, Valuation and the Dashboard all use **one set of rules** with the same "
+              "company figures, so their signals agree. The rules are a formula, not advice. The assumptions "
+              "behind them (required return, growth limits, margins) are in **Settings → Valuation Assumptions**, "
+              "and every decision shows the ones it used."),
+        ("sub", "Fair value"),
+        ("p", "The **fair value** is the middle (median) of the methods that apply, shown with its low–high range:"),
+        ("bullets", [
+            "**Earnings model**: EPS grows for 5 years (the lowest of 3-year EPS growth, 3-year revenue growth + 2% "
+            "and a cap: **15%** India, **8%** Japan), then slows to long-run growth (**5%** India, **1.5%** Japan) by "
+            "year 10. Only the profit that needn't be reinvested counts (EPS × (1 − growth ÷ ROE)), discounted at the "
+            "required return (**12%** India, **7.5%** Japan). EPS that swings a lot is averaged over 3 years.",
+            "**Own P/E history**: the stock's median P/E at its last few year ends × EPS.",
+            "**Banks and credit companies**: a fair price-to-book = (ROE − long-run growth) ÷ "
+            "(required return − long-run growth), × book value per share.",
+            "A **reverse check** shows what growth today's price assumes.",
+        ]),
+        ("table", ["Confidence", "When"], [
+            ["**High**", "Two or more methods agree within 25%, and EPS was positive in each of the last 3 years"],
+            ["**Medium**", "One method, or methods agree within 50%"],
+            ["**Low**", "Methods disagree by more than 50%: no signal"],
+        ]),
+        ("sub", "Signals"),
+        ("table", ["Signal", "When", "Holdings / Watchlist"], [
+            ["**BUY**", "Price at or below the buy price: fair value less **25%** (High confidence) or **35%** "
+                        "(Medium), and the quality check passes", "Accumulate / Accumulate or Strong Buy"],
+            ["**HOLD**", "Between the buy price and the reduce level", "Hold / Wait / Watch"],
+            ["**REDUCE**", "Price more than **20%** above fair value", "Reduce / Avoid"],
+            ["**SELL**", "Bad news only: 12-month EPS at or below zero, fair value cut by more than 25% in the "
+                         "last 30 days, or the quality check newly failed (90 days)", "Sell / Avoid"],
+            ["**No signal**", "No figures yet, price older than 5 days, figures older than 120 days, "
+                              "or Low confidence", "No signal / No Data"],
         ]),
         ("bullets", [
-            "**ACCUMULATE**: the market price is below **70%** of the intrinsic value.",
-            "**HOLD**: the price is between 70% and 110% of the intrinsic value.",
-            "**REDUCE**: the price is above **110%** of the intrinsic value.",
-            "**Upside %** (Watchlist, Valuation and Dashboard) = fair value ÷ price − 1. "
-            "A negative upside means the price is above the fair value.",
+            "**Quality check** (pass/fail): ROE at least 12% (Japan 8%), EPS positive in each of the last 3 years, "
+            "free cash flow positive, debt to equity below 1; at most one may fail. Banks and credit companies: "
+            "ROE at least 12% (Japan 7%) and EPS positive for 3 years. A failed check means no BUY.",
+            "**Target** = the fair value, over 2–3 years. **Upside %** = fair value ÷ price − 1; negative when "
+            "the price is above the fair value.",
+            "The Watchlist's older **Quality scorecard** (P/E, ROE, margins, RSI…) is still shown in its pop-up, "
+            "as information only.",
+            "Yearly figures are fetched at most once a week per company; latest figures with every price refresh.",
         ]),
     ]),
 
@@ -297,7 +321,7 @@ SECTIONS = [
             ["**EPS**", "Double digits (> 10)", "The profit for each share."],
             ["**Debt to equity**", "Below 1", "Borrowing ÷ shareholders' money: is the company over-borrowed?"],
             ["**Book value**", "Compare with the price", "Net assets per share: roughly what is left if the company closed."],
-            ["**Fair value**", "Above the market price", "The earnings-model estimate (about 21.7 × EPS); blank for loss-making stocks."],
+            ["**Fair value**", "Above the market price", "From the shared rules (see Valuations); blank for loss-making stocks."],
         ]),
         ("sub", "Profitability"),
         ("table", ["Number", "Look for", "What it means"], [

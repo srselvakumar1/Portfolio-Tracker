@@ -102,14 +102,46 @@ def is_loss_making(row: dict) -> bool:
     return eps is not None and eps <= 0
 
 
+def row_price(row: dict) -> tuple[float | None, str | None]:
+    """The price the Watchlist values a stock at, with its date: the newest of the
+    market price and the price saved with the company figures, else the saved price."""
+    from model.fundamentals import best_price
+    price, when = best_price(row.get("_mkt"), (row.get("_fund") or {}).get("inputs"))
+    if price:
+        return price, when
+    return parse_num(row.get("current_value")), None
+
+
+def _attach_valuation_context(rows: list[dict]) -> list[dict]:
+    """Give each row its stored company figures ("_fund") and latest market price
+    ("_mkt": price, date) for the shared rules. One query each; background thread only."""
+    try:
+        from model import fundamentals
+        from model.valuation import canonical
+        symbols = [r.get("symbol") for r in rows if r.get("symbol")]
+        records = fundamentals.load_records(symbols)
+        prices = fundamentals.market_prices(symbols)
+        for r in rows:
+            r["_fund"] = records.get(canonical(r.get("symbol")))
+            r["_mkt"] = prices.get(r.get("symbol"))
+    except Exception:
+        log.warning("Couldn't load the company figures for the watchlist", exc_info=True)
+    return rows
+
+
+def row_decision(row: dict, assumptions: dict | None = None):
+    """The decision from the shared rules (model/valuation.py) for a watchlist row, from
+    the company figures load_data() attached to it. The same rules as Holdings,
+    Valuation and the Dashboard."""
+    from model.valuation import decide, load_assumptions
+    fund = row.get("_fund") or {}
+    price, when = row_price(row)
+    return decide(fund.get("inputs"), price, assumptions or load_assumptions(), fund.get("state"), when)
+
+
 def fair_value_of(row: dict) -> float | None:
-    """The saved fair value, or None when it can't be trusted (a loss, or the
-    EPS 1.00 placeholder that stands for missing earnings)."""
-    from model.engine import is_placeholder_eps
-    if is_loss_making(row) or is_placeholder_eps(row.get("eps"), row.get("pe_ratio"), row.get("current_value")):
-        return None
-    iv = parse_num(row.get("intrinsic_value"))
-    return iv if iv is not None and iv > 0 else None
+    """The fair value from the shared rules, or None (a loss, missing or untrusted figures)."""
+    return row_decision(row).fair_value
 
 
 def upside_pct(fair_value: float | None, price: float | None) -> float | None:
@@ -131,12 +163,11 @@ def _week52(row: dict) -> tuple[float, float] | None:
     return lo_f, hi_f
 
 
-def compute_signal(row: dict) -> tuple[str, str, str]:
-    """Score a watchlist row. Returns (signal key, badge text, reason text).
+def quality_scorecard(row: dict) -> tuple[int, int, list[str], list[str]]:
+    """The old checklist (P/E, ROE, margins, growth, RSI…), kept as information only:
+    it no longer decides the signal. Returns (score, checks counted, passes, fails).
 
-    Only metrics that are present are scored and counted, so a stock with
-    patchy data is judged on what is known instead of drifting to "Avoid".
-    Pure function: safe to call from a background thread.
+    Only metrics that are present are scored and counted. Pure function.
     """
     from model.engine import is_placeholder_eps
     if is_placeholder_eps(row.get("eps"), row.get("pe_ratio"), row.get("current_value")):
@@ -196,20 +227,8 @@ def compute_signal(row: dict) -> tuple[str, str, str]:
     check("Latest Qtr Op", "qoq_op_profit", lambda v: v > 0,
           "Latest quarter's operating profit is positive", "Latest quarter had an operating loss")
 
-    # === Fair value, Graham number, analyst target, 52-week range ===
-    cp = parse_num(row.get("current_value"))
-    iv = parse_num(row.get("intrinsic_value"))
-    if cp and iv and cp > 0 and iv > 0:
-        max_score += 2  # margin of safety counts double
-        if cp < iv * 0.8:
-            score += 2
-            reasons_pass.append("✅ Fair Value: Price is more than 20% below fair value (margin of safety)")
-        elif cp < iv:
-            score += 1
-            reasons_pass.append("✅ Fair Value: Price is below fair value")
-        else:
-            score -= 1
-            reasons_fail.append("❌ Fair Value: Price is above fair value (overvalued)")
+    # === Graham number, analyst target, 52-week range (fair value: see the decision) ===
+    cp, _when = row_price(row)
 
     gn = graham_number(row)
     if gn and cp:
@@ -250,30 +269,31 @@ def compute_signal(row: dict) -> tuple[str, str, str]:
     check("Beta", "beta", lambda v: v < 1.5, "Lower volatility vs market", "High beta — volatile stock")
     check("MACD", "macd", lambda v: v > 0, "Short-term momentum is bullish", "Short-term momentum is bearish")
 
-    # ── Badge ──
-    pct = score / max_score if max_score else 0
-    if max_score == 0:
-        key = "nodata"
-    elif pct >= 0.65:
-        key = "strong_buy"
-    elif pct >= 0.4:
-        key = "accumulate"
-    elif pct >= 0.1:
-        key = "wait"
-    else:
-        key = "avoid"
-    badge = signal_badge(key)
+    return score, max_score, reasons_pass, reasons_fail
 
-    tip_lines = [f"Signal: {badge}  (Score: {score}/{max_score})"]
-    if reasons_pass:
-        tip_lines.append("\nStrengths:")
-        tip_lines.extend(reasons_pass)
-    if reasons_fail:
-        tip_lines.append("\nWeaknesses:")
-        tip_lines.extend(reasons_fail)
-    if max_score == 0:
-        tip_lines.append("No metrics fetched yet. Use Edit Metrics → Auto-Fill, or Refresh All, to fetch them.")
-    return key, badge, "\n".join(tip_lines)
+
+def compute_signal(row: dict, decision=None) -> tuple[str, str, str]:
+    """The Watchlist signal for a row. Returns (signal key, badge text, reason text).
+
+    The signal comes from the shared rules (model/valuation.py): BUY → Accumulate
+    (Strong Buy when well below the buy price), HOLD → Wait / Watch, REDUCE or
+    SELL → Avoid, no signal → No Data. The quality scorecard is added as
+    information only. Pure function: safe to call from a background thread.
+    """
+    from model.valuation import watchlist_key
+    d = decision or row_decision(row)
+    key = watchlist_key(d)
+    badge = signal_badge(key)
+    explained = d.text().split("\n", 1)        # its first line repeats the signal
+    lines = [f"Signal: {badge}  (confidence {d.confidence})"] + explained[1:]
+    score, max_score, passes, fails = quality_scorecard(row)
+    if max_score:
+        lines.append(f"\nQuality scorecard (information only, it doesn't decide the signal): {score}/{max_score}")
+        lines.extend(passes)
+        lines.extend(fails)
+    elif not row.get("_fund"):
+        lines.append("No metrics fetched yet. Use Edit Metrics → Auto-Fill, or Refresh All, to fetch them.")
+    return key, badge, "\n".join(lines)
 
 
 # ── Fetching metrics from Yahoo Finance (BACKGROUND THREAD ONLY) ──────────────
@@ -401,14 +421,7 @@ def fetch_watchlist_metrics(symbol: str, columns: set[str]) -> tuple[str, dict[s
         else:
             put("volume", f"{vol:,.0f}")
 
-    if eps and eps > 0 and "intrinsic_value" in columns:
-        try:
-            from model.engine import calculate_intrinsic_value as _calc_iv
-            iv_val = _calc_iv(eps)
-            if iv_val and iv_val > 0:
-                put("intrinsic_value", iv_val, f"{cy}{{:,.2f}}")
-        except Exception:
-            log.debug("Intrinsic value for %s failed", yf_symbol, exc_info=True)
+    # (the fair value is worked out at the end, from the shared rules)
 
     # ── One year of prices: RSI, Sharpe ratio, MACD, support / resistance ──
     hist = safe(lambda: ticker.history(period="1y"))
@@ -451,6 +464,7 @@ def fetch_watchlist_metrics(symbol: str, columns: set[str]) -> tuple[str, dict[s
                     if len(op):
                         put_big("qoq_op_profit", float(op.iloc[0]))
                     break
+    fin = None
     if {"revenue_cagr_3y", "profit_cagr_3y"} & columns:
         fin = safe(lambda: ticker.financials)
         if fin is not None and not fin.empty:
@@ -459,6 +473,22 @@ def fetch_watchlist_metrics(symbol: str, columns: set[str]) -> tuple[str, dict[s
                     s = fin.loc[label].dropna()
                     if len(s) >= 4 and float(s.iloc[3]) > 0 and float(s.iloc[0]) > 0:
                         put(key, ((float(s.iloc[0]) / float(s.iloc[3])) ** (1 / 3) - 1) * 100, "{:.1f}%")
+
+    # ── Company figures for the shared valuation rules (Holdings and the Dashboard use them
+    # too), and the fair value from those rules. Only Indian and Tokyo listings are saved:
+    # a symbol typed without a suffix may have been found on another exchange, in another currency.
+    if yf_symbol.upper().endswith((".NS", ".BO", ".T")) and cur_price:
+        try:
+            from model import fundamentals
+            from model.valuation import canonical, decide, load_assumptions
+            fundamentals.save_inputs(symbol, fundamentals.extract_inputs(symbol, info, ticker, fin=fin))
+            rec = fundamentals.load_records([symbol]).get(canonical(symbol)) or {}
+            d = decide(rec.get("inputs"), cur_price, load_assumptions(), rec.get("state"),
+                       (rec.get("inputs") or {}).get("price_at"))
+            if "intrinsic_value" in columns:
+                out["intrinsic_value"] = f"{cy}{d.fair_value:,.2f}" if d.fair_value else ""
+        except Exception:
+            log.warning("Company figures for %s failed", yf_symbol, exc_info=True)
 
     return yf_symbol, out
 
@@ -775,10 +805,11 @@ class WatchlistView(BaseView):
             selectmode="browse", style="Watchlist.Treeview"
         )
         HeadingTips(self._tv, {
-            "Signal": "Score from the valuation checks (a formula, not advice)",
-            "Current Px": "Latest market price",
-            "Fair Value": "Earnings model: EPS grows 12% a year for 5 years, discounted at 10%, "
-                          "then 15 × EPS (about 21.7 × EPS). Blank for loss-making stocks",
+            "Signal": "The shared rules (a formula, not advice): Accumulate = below the buy price, "
+                      "Wait / Watch = hold zone, Avoid = reduce or sell, No Data = no signal",
+            "Current Px": "Latest known price (market refresh or Refresh All, whichever is newer)",
+            "Fair Value": "Median of the earnings model, the stock's own P/E history and (for lenders) "
+                          "price-to-book. Blank for loss-making stocks. Double-click a row for details",
             "Upside %": "Fair value ÷ price − 1. Negative means the price is above fair value",
             "Graham No.": "Benjamin Graham's fair price: √(22.5 × EPS × book value per share)",
             "Analyst Tgt": "Average analyst price target",
@@ -849,8 +880,13 @@ class WatchlistView(BaseView):
         self._data_loaded = True
         self._load_gen += 1
         gen = self._load_gen
+
+        def _load():
+            rows = get_all_watchlist()
+            return _attach_valuation_context(rows), watchlist_columns()
+
         run_in_background(
-            lambda: (get_all_watchlist(), watchlist_columns()),
+            _load,
             on_done=lambda res: self._on_loaded(gen, res),
             on_error=lambda err: self._notify(f"Couldn't load the watchlist: {err}", "error"),
             widget=self, name="watchlist-load",
@@ -920,6 +956,8 @@ class WatchlistView(BaseView):
             self._data = data
         self._tv.delete(*self._tv.get_children())
 
+        from model.valuation import load_assumptions
+        assumptions = load_assumptions()
         active_cur = self.wl_currency_var.get()
         counts = {k: 0 for k in SIGNAL_ORDER}
         currency_total = 0
@@ -931,7 +969,8 @@ class WatchlistView(BaseView):
                 continue
             currency_total += 1
 
-            key, signal_badge_text, _ = compute_signal(row)
+            decision = row_decision(row, assumptions)   # the shared rules: same as every other page
+            key, signal_badge_text, _ = compute_signal(row, decision)
             counts[key] += 1
             if self._signal_filter != "all" and key != self._signal_filter:
                 continue
@@ -943,12 +982,12 @@ class WatchlistView(BaseView):
                 return text.replace("₹", cy) if text and text != "None" else "—"
 
             sector_cell = " / ".join(filter(None, [row.get("sector") or "", row.get("industry") or ""])) or "—"
-            cv_f = parse_num(row.get("current_value"))
-            iv_f = fair_value_of(row)   # None for a loss-maker: its saved fair value is stale
+            cv_f = decision.price if decision.price else parse_num(row.get("current_value"))
+            iv_f = decision.fair_value   # None for a loss-maker or when the figures are missing
 
             mos_str = graham_str = from_high_str = "—"
             if cv_f is not None:
-                up = upside_pct(iv_f, cv_f)
+                up = decision.upside
                 if up is not None:
                     mos_str = f"{'▲ +' if up > 0 else '▼ '}{up:.1f}%"
                 gn = graham_number(row)
@@ -979,8 +1018,8 @@ class WatchlistView(BaseView):
                     sym,
                     signal_badge_text,
                     sector_cell,
-                    money(row.get("current_value")),
-                    money(row.get("intrinsic_value")) if iv_f is not None else "—",
+                    f"{cy}{cv_f:,.2f}" if cv_f else "—",
+                    f"{cy}{iv_f:,.2f}" if iv_f else "—",
                     mos_str,
                     graham_str,
                     money(row.get("analyst_target")),
@@ -1301,6 +1340,7 @@ class WatchlistView(BaseView):
                         continue
                     merged = dict(row)
                     merged.update(values)
+                    _attach_valuation_context([merged])     # the figures just saved
                     values["action_signal"] = compute_signal(merged)[1]
                     try:
                         update_watchlist(row["id"], **values)   # only the values found
@@ -1545,8 +1585,8 @@ class WatchlistView(BaseView):
         values["graham_number"] = f"{cy}{gn:,.2f}" if gn else ""
         values["target_price"] = (f"{cy}{parse_num(row.get('target_price')):,.2f}"
                                   if (parse_num(row.get("target_price")) or 0) > 0 else "")
-        if fair_value_of(row) is None:
-            values["intrinsic_value"] = ""   # a loss-maker's saved fair value is stale
+        fv = fair_value_of(row)              # from the shared rules, as in the banner above
+        values["intrinsic_value"] = f"{cy}{fv:,.2f}" if fv else ""
         if is_loss_making(row):
             values["pe_ratio"] = ""
         available = set(row.keys()) | {"graham_number"}

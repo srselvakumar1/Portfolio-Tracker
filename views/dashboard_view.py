@@ -1633,6 +1633,8 @@ class DashboardView(BaseView):
                 sig_text, tags = "▲ Accumulate", (stripe, "gain")
             elif signal == "REDUCE":
                 sig_text, tags = "▼ Reduce", (stripe, "loss")
+            elif signal == "SELL":
+                sig_text, tags = "⛔ Sell", (stripe, "loss")
             else:
                 sig_text, tags = signal.title() or "-", (stripe,)
             rows.append((
@@ -2160,7 +2162,8 @@ class DashboardView(BaseView):
                 cur.execute('''
                     SELECT a.intrinsic_value, a.action_signal, a.promoter_holding, a.fii_holding, a.dii_holding,
                            m.current_price, m.pe_ratio, m.eps, m.high_52w, m.low_52w, m.stock_name,
-                           m.pb_ratio, m.roe, m.roce, m.debt_to_equity, m.dividend_yield, m.sector, m.previous_close
+                           m.pb_ratio, m.roe, m.roce, m.debt_to_equity, m.dividend_yield, m.sector, m.previous_close,
+                           m.last_updated
                     FROM assets a
                     LEFT JOIN marketdata m ON a.symbol = m.symbol
                     WHERE a.symbol = ?
@@ -2171,7 +2174,18 @@ class DashboardView(BaseView):
                     return
 
                 (iv, signal, prom_hold, fii_hold, dii_hold, cp, pe, eps, high52, low52, name,
-                 pb, roe, roce, d2e, div_yield, sector, prev_close) = row
+                 pb, roe, roce, d2e, div_yield, sector, prev_close, price_date) = row
+
+                # The decision from the shared rules (the same as Holdings, Watchlist and
+                # Valuation), worked out now from the stored company figures and this price
+                decision = None
+                try:
+                    from model import fundamentals
+                    decision = fundamentals.evaluate(symbol, _num(cp), price_date,
+                                                     records=fundamentals.load_records([symbol], conn))
+                    iv, signal = decision.fair_value or 0.0, decision.stored_signal
+                except Exception:
+                    log.warning("Valuing %s for the insight pop-up failed", symbol, exc_info=True)
 
                 iv = _num(iv)
                 cp = _num(cp)
@@ -2226,12 +2240,13 @@ class DashboardView(BaseView):
 
         if signal == "ACCUMULATE":
             sig_color, sig_bg = S.SUCCESS, S.SUCCESS_PALE
-        elif signal == "REDUCE":
+        elif signal in ("REDUCE", "SELL"):
             sig_color, sig_bg = S.ERROR, S.ERROR_PALE
         else:
             sig_color, sig_bg = S.WARNING, S.WARNING_PALE
 
-        chip = f"{signal} (Upside: {diff_pct:+.1f}%)" if diff_pct is not None else signal
+        shown = decision.label if decision is not None else signal
+        chip = f"{shown} (Upside: {diff_pct:+.1f}%)" if diff_pct is not None else shown
         modal.add_chip("⚡", chip, bg_color=sig_bg, fg_color=sig_color)
 
         # Grid layout for cards (2 columns, 2 rows)
@@ -2294,8 +2309,33 @@ class DashboardView(BaseView):
         _kv(c4, "Unrealised P&L:", format_money(upnl, currency), S.SUCCESS if upnl >= 0 else S.ERROR)
         _kv(c4, "Today's P&L:", format_money(today_pnl, currency), S.SUCCESS if today_pnl >= 0 else S.ERROR)
 
-        # Actions: Quick Buy for ACCUMULATE, Quick Sell for REDUCE, nothing for HOLD / no signal
-        quick_type = {"ACCUMULATE": "BUY", "REDUCE": "SELL"}.get(signal)
+        # Card 5 (full width): the decision from the shared rules, and why
+        if decision is not None:
+            card = ModernCard(grid, bg=S.BG_TERTIARY, canvas_bg=S.BG_SECONDARY,
+                              highlight_color=S.BORDER_COLOR, radius=ModernStyle.RADIUS_CARD)
+            card.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=6, pady=6)
+            c5 = tk.Frame(card.content, bg=S.BG_TERTIARY)
+            c5.pack(fill="both", expand=True, padx=14, pady=10)
+            tk.Label(c5, text=f"🧭 Decision: {decision.label}", bg=S.BG_TERTIARY, fg=sig_color,
+                     font=S.FONT_SUBHEADING).pack(anchor="w", pady=(0, 8))
+            fv_text = format_money(decision.fair_value, currency) if decision.fair_value else "N/A"
+            if decision.fair_value and decision.low and decision.high and decision.high > decision.low:
+                fv_text += f"  ({format_money(decision.low, currency)} – {format_money(decision.high, currency)})"
+            _kv(c5, "Fair value (range):", fv_text)
+            if decision.fair_value:
+                _kv(c5, "Buy below:", format_money(decision.buy_below, currency))
+                _kv(c5, "Target (2–3 years):", format_money(decision.target, currency))
+                _kv(c5, "Reduce above:", format_money(decision.reduce_above, currency))
+                _kv(c5, "Confidence:", decision.confidence)
+            _kv(c5, "Data as of:", ", ".join(x for x in (
+                f"price {decision.price_date[:10]}" if decision.price_date else "",
+                f"yearly figures {decision.inputs_date[:10]}" if decision.inputs_date else "") if x) or "N/A")
+            for line in decision.reasons + [f"If: {c}" for c in decision.changes[:2]]:
+                tk.Label(c5, text=f"• {line}", bg=S.BG_TERTIARY, fg=S.TEXT_PRIMARY, font=S.FONT_BODY,
+                         justify="left", anchor="w", wraplength=700).pack(anchor="w", fill="x", pady=(4, 0))
+
+        # Actions: Quick Buy for ACCUMULATE, Quick Sell for REDUCE / SELL, nothing for HOLD / no signal
+        quick_type = {"ACCUMULATE": "BUY", "REDUCE": "SELL", "SELL": "SELL"}.get(signal)
 
         def _quick_trade():
             modal.destroy()

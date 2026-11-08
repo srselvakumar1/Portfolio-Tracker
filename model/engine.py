@@ -336,41 +336,13 @@ def is_placeholder_eps(eps, pe, price) -> bool:
     return abs(e - 1.0) < 0.005 and abs(p - c) <= 0.005 * c
 
 
-def calculate_intrinsic_value(eps: float, growth_rate: float = 0.12, discount_rate: float = 0.10, terminal_multiple: float = 15.0) -> float:
-    """Fair value from a simple earnings model (not a cash-flow DCF).
-
-    EPS grows `growth_rate` a year for 5 years, each year's EPS is discounted at
-    `discount_rate`, and a final value of `terminal_multiple` × year-5 EPS is added.
-    With the defaults this is always about 21.7 × EPS, for every stock."""
-    if eps is None or (isinstance(eps, float) and math.isnan(eps)) or eps <= 0:
-        return 0.0
-
-    cash_flows = []
-    current_eps = eps
-    for _ in range(5):
-        current_eps *= (1 + growth_rate)
-        cash_flows.append(current_eps)
-
-    terminal_value = cash_flows[-1] * terminal_multiple
-
-    iv = 0.0
-    for i, cf in enumerate(cash_flows, start=1):
-        iv += cf / ((1 + discount_rate) ** i)
-
-    iv += terminal_value / ((1 + discount_rate) ** 5)
-    return round(iv, 2)
+# Fair values and BUY / HOLD / REDUCE / SELL signals come from model/valuation.py
+# (one set of rules for every page); the company figures from model/fundamentals.py.
 
 # Only passed between _fetch_single_ticker() and fetch_and_update_market_data(), never
-# stored: "this stock has no positive earnings", so its old fair value and signal are cleared
+# stored: "this stock has no positive earnings", so its old P/E is cleared
 NO_EARNINGS = "NO_EARNINGS"
 
-
-def get_iv_signal(current_price: float, iv: float) -> str:
-    """Calculates action signal based on Intrinsic Value."""
-    if iv <= 0 or current_price <= 0: return "N/A"
-    if current_price < (0.70 * iv): return "ACCUMULATE"
-    elif current_price > (1.10 * iv): return "REDUCE"
-    else: return "HOLD"
 
 def calculate_trade_fees(trade_type: str, qty: float, price: float, is_delivery: bool = True) -> float:
     """
@@ -466,10 +438,11 @@ def calculate_xirr(cashflows, guesses=None, max_iter=100, tol=1e-4) -> float:
 
 _YFINANCE_TIMEOUT = 10  # seconds per future result
 
-def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
+def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str, want_history: bool = False):
     """Fetches a single ticker's data from yfinance. Runs isolated in a thread.
 
-    Skips the redundant fast_info call — ticker.info already contains all needed fields.
+    Returns (market row, asset row, company figures for model/valuation.py or None).
+    With want_history the yearly figures are fetched too (two more requests).
     """
     try:
         import yfinance as yf
@@ -510,6 +483,7 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
                                        bo_info.get('regularMarketPreviousClose', current_price) or current_price)
                 if current_price > 0:
                     full_info = bo_info
+                    ticker = bo
             except Exception:
                 pass
 
@@ -519,12 +493,19 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
         placeholder = is_placeholder_eps(eps, pe, current_price)
         if placeholder:
             eps = pe = 0.0   # no real earnings figure: store "unknown", not 1.00
-        iv = calculate_intrinsic_value(eps)
-        signal = get_iv_signal(current_price, iv)
-        # Yahoo answered and the company has no positive earnings (a loss, or the 1.00
-        # placeholder): the old fair value, P/E and signal must be cleared, not kept
+        # The fair value and signal are worked out after saving (model/valuation.py).
+        # NO_EARNINGS only tells the save to clear an old P/E: a loss is a real answer.
+        iv, signal = 0.0, "N/A"
         if current_price > 0 and (placeholder or (isinstance(raw_eps, (int, float)) and raw_eps <= 0)):
             signal = NO_EARNINGS
+
+        inputs = None
+        if current_price > 0:
+            try:
+                from model.fundamentals import extract_inputs
+                inputs = extract_inputs(orig_sym, full_info, ticker, want_history=want_history, now=now)
+            except Exception:
+                log.debug("Company figures for %s failed", orig_sym, exc_info=True)
 
         mkt_row = (
             orig_sym, current_price, previous_close,
@@ -553,23 +534,25 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
             0.0, now
         )
 
-        return mkt_row, asset_row
+        return mkt_row, asset_row, inputs
 
     except Exception:
         # Return a safe blank record so the app doesn't crash on this symbol
         mkt_row = (orig_sym, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '', '', '', now)
         asset_row = (orig_sym, 0.0, "N/A", 0.0, 0.0, 0.0, now)
-        return mkt_row, asset_row
+        return mkt_row, asset_row, None
 
-def fetch_market_rows(pairs: list, now: str) -> list:
-    """(market row, asset row) for each (Yahoo symbol, symbol). Runs in the price helper
-    process (or, if it can't start, in a thread of the app)."""
+def fetch_market_rows(pairs: list, now: str, need_history=None) -> list:
+    """(market row, asset row, company figures) for each (Yahoo symbol, symbol). Runs in the
+    price helper process (or, if it can't start, in a thread of the app). Symbols in
+    need_history also get their yearly figures."""
+    need_history = set(need_history or ())
     blank = lambda sym: ((sym, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '', '', '', now),
-                         (sym, 0.0, "N/A", 0.0, 0.0, 0.0, now))
+                         (sym, 0.0, "N/A", 0.0, 0.0, 0.0, now), None)
     rows, done = [], set()
     # 8 workers: enough to overlap network waits without 25 threads competing for the GIL
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_fetch_single_ticker, yf_sym, orig_sym, now): orig_sym
+        futures = {executor.submit(_fetch_single_ticker, yf_sym, orig_sym, now, orig_sym in need_history): orig_sym
                    for yf_sym, orig_sym in pairs}
         try:
             # No total timeout, so large batches finish; each answer still has _YFINANCE_TIMEOUT
@@ -610,16 +593,23 @@ def fetch_and_update_market_data(symbols: list):
     yf_symbols = [s + ".NS" if not ('.' in s or '=' in s) else s for s in symbols]
 
     pairs = list(zip(yf_symbols, symbols))
+    try:   # yearly company figures are fetched at most once a week per company
+        from model.fundamentals import needs_history
+        need_history = needs_history(symbols)
+    except Exception:
+        log.warning("Couldn't check which company figures are due", exc_info=True)
+        need_history = set()
     try:   # in the helper process, so the window never waits behind yfinance's Python work
         from model import price_worker
-        rows = price_worker.run(fetch_market_rows, pairs, now, timeout=60 + len(pairs) * _YFINANCE_TIMEOUT / 4)
+        rows = price_worker.run(fetch_market_rows, pairs, now, need_history,
+                                timeout=60 + len(pairs) * _YFINANCE_TIMEOUT / 4 + len(need_history) * 2)
     except Exception:
         log.warning("Price helper unavailable: fetching prices in the app instead", exc_info=True)
-        rows = fetch_market_rows(pairs, now)
-    marketdata_records = [m for m, _a in rows]
+        rows = fetch_market_rows(pairs, now, need_history)
+    marketdata_records = [m for m, _a, _i in rows]
     # Stocks with no positive earnings: store "N/A", then clear their old fair value and P/E below
-    no_earnings = [(m[6], m[0]) for m, a in rows if a[2] == NO_EARNINGS]
-    assets_records = [(a[0], a[1], "N/A", *a[3:]) if a[2] == NO_EARNINGS else a for _m, a in rows]
+    no_earnings = [(m[6], m[0]) for m, a, _i in rows if a[2] == NO_EARNINGS]
+    assets_records = [(a[0], a[1], "N/A", *a[3:]) if a[2] == NO_EARNINGS else a for _m, a, _i in rows]
 
     # Write to DB in a fraction of a second
     with db_session() as conn:
@@ -668,6 +658,31 @@ def fetch_and_update_market_data(symbols: list):
             cursor.executemany("UPDATE marketdata SET eps = ?, pe_ratio = 0 WHERE symbol = ?", no_earnings)
             cursor.executemany("UPDATE assets SET intrinsic_value = 0, action_signal = 'N/A' WHERE symbol = ?",
                                [(sym,) for _eps, sym in no_earnings])
+
+        # Fair value and signal from the shared rules (model/valuation.py), the same ones the
+        # Watchlist, Valuation and Dashboard use. A failed download keeps the old values.
+        _apply_valuations(conn, rows, now)
+
+
+def _apply_valuations(conn, rows, now: str) -> None:
+    """Save each answered stock's company figures, decide its zone, and store the fair value
+    and signal (BUY → ACCUMULATE, HOLD, REDUCE, SELL, no signal → N/A) in assets."""
+    from model import fundamentals
+    from model.valuation import load_assumptions
+    assumptions = load_assumptions()
+    updates = []
+    for mkt, _asset, inputs in rows:
+        sym, price = mkt[0], mkt[1]
+        if not inputs or not price or price <= 0 or "=" in sym:
+            continue
+        try:
+            fundamentals.save_inputs(sym, dict(inputs, price=price, price_at=now), conn)
+            d = fundamentals.record(sym, price, now, conn, assumptions)
+            updates.append((round(d.fair_value, 2) if d.fair_value else 0.0, d.stored_signal, sym))
+        except Exception:
+            log.warning("Valuing %s failed", sym, exc_info=True)
+    if updates:
+        conn.executemany("UPDATE assets SET intrinsic_value = ?, action_signal = ? WHERE symbol = ?", updates)
 
 
 # ── Database Rebuild Logic ───────────────────────────────────────────────────
@@ -1305,14 +1320,16 @@ def get_actionable_insights(limit: int = 10, currency_filter: str = "All") -> li
             SELECT DISTINCT h.symbol, a.action_signal, a.intrinsic_value, m.current_price, h.currency
             FROM holdings h JOIN assets a ON h.symbol = a.symbol
             LEFT JOIN marketdata m ON h.symbol = m.symbol
-            WHERE h.qty > 0 AND a.action_signal IN ('ACCUMULATE', 'REDUCE')
+            WHERE h.qty > 0 AND a.action_signal IN ('ACCUMULATE', 'REDUCE', 'SELL')
         '''
         params = []
         if currency_filter != "All":
             query += " AND h.currency = ?"
             params.append(currency_filter.upper())
-            
-        query += " ORDER BY ABS(a.intrinsic_value - m.current_price) / m.current_price DESC LIMIT ?"
+
+        # SELL (bad news) first, then the biggest gap between fair value and price
+        query += (" ORDER BY CASE a.action_signal WHEN 'SELL' THEN 0 ELSE 1 END,"
+                  " ABS(a.intrinsic_value - m.current_price) / m.current_price DESC LIMIT ?")
         params.append(limit)
         
         cursor.execute(query, params)
@@ -1336,13 +1353,19 @@ _ALERT_MIN_UPSIDE = -30.0   # % : skip alerts whose target is more than 30% belo
 
 
 def get_watchlist_alerts(currency_filter: str = "All", fill_to: int = 0) -> list:
-    """Watchlist stocks marked Accumulate or Strong Buy, with PE and EPS.
+    """Watchlist stocks in the BUY zone (Accumulate / Strong Buy on the Watchlist), with PE and EPS.
+
+    The zone is worked out now with the shared rules (model/valuation.py), from the
+    same figures and price as the Watchlist table, so the two always agree. The
+    target is your own target price, else the fair value.
 
     With fill_to, the list has at most fill_to items (the alerts with the most
     upside), and a shorter list is topped up with the other watchlist stocks
-    (never "Avoid") that have the most upside to their target; those items
-    carry "watch": True so the Dashboard can show them as "watching".
+    (never REDUCE / SELL, i.e. never "Avoid") that have the most upside to their
+    target; those items carry "watch": True so the Dashboard can show them as "watching".
     """
+    from model import fundamentals
+    from model.valuation import canonical, country_of, decide, load_assumptions
     
     def _parse_num(val_str) -> float:
         """'₹1,313.2', '¥7030', '$1298.9' (older Auto-Fill values) -> 1313.2 etc."""
@@ -1360,44 +1383,42 @@ def get_watchlist_alerts(currency_filter: str = "All", fill_to: int = 0) -> list
             SELECT w.symbol, w.target_price, COALESCE(NULLIF(m.current_price, 0.0), m.previous_close, 0.0) as current_price,
                    COALESCE(NULLIF(m.pe_ratio, 0.0), NULLIF(w.pe_ratio, '0'), NULLIF(w.pe_ratio, '0.0'), w.pe_ratio) as pe_ratio,
                    COALESCE(NULLIF(m.eps, 0.0), NULLIF(w.eps, '0'), NULLIF(w.eps, '0.0'), w.eps) as eps,
-                   w.analyst_target, w.intrinsic_value, COALESCE(w.action_signal, '')
+                   m.last_updated, w.current_value
             FROM watchlist w
             LEFT JOIN marketdata m ON w.symbol = m.symbol
         ''')
         rows = cursor.fetchall()
-        
+        records = fundamentals.load_records([r[0] for r in rows], conn)
+        assumptions = load_assumptions()
+
         alerts, watching = [], []
         for r in rows:
-            symbol, target, current, pe, eps, analyst_t, intrinsic_v, signal = r
-            is_alert = "Accumulate" in signal or "Strong Buy" in signal
-            if not is_alert and (not fill_to or "Avoid" in signal):
+            symbol, target, mkt_price, pe, eps, mkt_date, saved_price = r
+            rec = records.get(canonical(symbol)) or {}
+            # The same price as the Watchlist table: the newest known price, else the saved one
+            current, price_date = fundamentals.best_price((mkt_price, mkt_date), rec.get("inputs"))
+            if not current:
+                current, price_date = _parse_num(saved_price), None
+            d = decide(rec.get("inputs"), current, assumptions, rec.get("state"), price_date)
+            is_alert = d.zone == "BUY"
+            if not is_alert and (not fill_to or d.zone in ("REDUCE", "SELL")):
                 continue
-            
-            # The exchange suffix decides the currency (.T = Tokyo); the symbol
-            # stored with old values could be wrong (e.g. "$" on NSE stocks)
-            sym = str(symbol).upper()
-            currency = "INR"
-            if sym.endswith(".T") or (sym.isdigit() and len(sym) == 4) \
-                    or "¥" in str(analyst_t) or "¥" in str(intrinsic_v):
-                currency = "JPY"
-                
+
+            # The exchange suffix decides the currency (.T = Tokyo)
+            currency = "JPY" if country_of(symbol, d.currency) == "JP" else "INR"
             if currency_filter != "All" and currency != currency_filter.upper():
                 continue
-            
-            # A placeholder EPS (1.00, P/E = price) makes P/E and the fair value meaningless
-            fake_eps = is_placeholder_eps(eps, pe, current)
-            if fake_eps:
+
+            # A placeholder EPS (1.00, P/E = price) or a loss: no meaningful P/E
+            if is_placeholder_eps(eps, pe, current):
                 pe = eps = None
             elif eps not in (None, "", "-") and _parse_num(eps) <= 0:
-                fake_eps = True   # a loss: no P/E, and the saved fair value is from a profitable year
                 pe = None
 
-            # Fallbacks for target price (the fair value only when its EPS was real)
+            # Your own target, else the fair value from the shared rules
             if not target or target <= 0:
-                target = _parse_num(analyst_t)
-            if (not target or target <= 0) and not fake_eps:
-                target = _parse_num(intrinsic_v)
-                
+                target = d.fair_value or 0.0
+
             diff = target - current if target > 0 and current > 0 else 0
             # signed: negative when the price is already above the target
             pct = (diff / current) * 100 if current > 0 and target > 0 else 0

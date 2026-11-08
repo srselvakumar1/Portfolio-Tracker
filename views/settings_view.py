@@ -243,6 +243,17 @@ class SettingsView(BaseView):
         ToolTip(clear_btn, "The cache keeps filtering fast. Clear it if figures look out of date.")
         header_button(stats.head, "↻ Refresh", self._refresh_database_stats).pack(side="right", padx=(0, 6))
 
+        # 3. Valuation assumptions: the choices behind every fair value and signal
+        #    (model/valuation.py). Compact: a summary here, the fields in a pop-up.
+        valuation = _card(left_col, "Valuation Assumptions", ("scale", "⚖️", ModernStyle.TEXT_ACCENT,
+                                                             ModernStyle.ACCENT_PRIMARY_PALE, ModernStyle.TEXT_ACCENT),
+                          grow=False)
+        self._valuation_summary = tk.Label(valuation, text="", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY,
+                                           font=ModernStyle.FONT_SMALL, justify="left", anchor="w", wraplength=400)
+        self._valuation_summary.pack(fill="x")
+        _wrap_to_width(self._valuation_summary)
+        self._show_valuation_summary()
+        header_button(valuation.head, "Edit", self._edit_valuation_assumptions, icon="pencil").pack(side="right")
 
 
         # -------------- RIGHT COLUMN --------------
@@ -592,6 +603,104 @@ class SettingsView(BaseView):
                 btn.set_palette(bg=ModernStyle.ACCENT_PRIMARY, fg=ModernStyle.TEXT_ON_ACCENT)
             else:
                 btn.set_palette(bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY)
+
+    # ── Valuation assumptions ──────────────────────────────────────────────
+
+    _VALUATION_FIELDS = (   # (settings path, label)
+        (("IN", "required_return"), "India: required return"),
+        (("IN", "long_run_growth"), "India: long-run growth (after year 10)"),
+        (("IN", "growth_cap"), "India: highest growth used (years 1–5)"),
+        (("JP", "required_return"), "Japan: required return"),
+        (("JP", "long_run_growth"), "Japan: long-run growth (after year 10)"),
+        (("JP", "growth_cap"), "Japan: highest growth used (years 1–5)"),
+        (("mos_high",), "BUY: margin of safety at High confidence"),
+        (("mos_medium",), "BUY: margin of safety at Medium confidence"),
+        (("reduce_above",), "REDUCE: price above fair value by"),
+    )
+
+    @staticmethod
+    def _valuation_value(a: dict, path: tuple) -> float:
+        return a[path[0]][path[1]] if len(path) == 2 else a[path[0]]
+
+    def _show_valuation_summary(self) -> None:
+        from model.valuation import load_assumptions
+        a = load_assumptions()
+        pct = lambda v: f"{v * 100:g}%"
+        self._valuation_summary.config(text=(
+            f"India: required return {pct(a['IN']['required_return'])}, long-run growth "
+            f"{pct(a['IN']['long_run_growth'])}, growth cap {pct(a['IN']['growth_cap'])}.  "
+            f"Japan: {pct(a['JP']['required_return'])}, {pct(a['JP']['long_run_growth'])}, "
+            f"{pct(a['JP']['growth_cap'])}.  BUY needs {pct(a['mos_high'])} below fair value "
+            f"({pct(a['mos_medium'])} at Medium confidence); REDUCE above +{pct(a['reduce_above'])}."))
+
+    def _edit_valuation_assumptions(self) -> None:
+        """A pop-up with the assumptions in percent; saved to settings.json ("valuation")."""
+        from ui.ui_widgets import PremiumModal
+        from model.app_settings import save_settings
+        from model.valuation import DEFAULT_ASSUMPTIONS, load_assumptions, merge_assumptions
+
+        current = load_assumptions()
+        top = PremiumModal(self, title="Valuation Assumptions", geometry="560x600", icon="scale",
+                           icon_color=ModernStyle.TEXT_ACCENT)
+        body = tk.Frame(top.content_frame, bg=ModernStyle.BG_SECONDARY)
+        body.pack(fill="both", expand=True, padx=16, pady=8)
+        tk.Label(body, text="These are choices, not facts. Every fair value and signal shows the ones it used. "
+                            "The Watchlist, Valuation page and Dashboard use new values at once; Holdings "
+                            "signals change at the next price refresh.",
+                 fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY, font=ModernStyle.FONT_SMALL,
+                 justify="left", wraplength=500).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        variables = {}
+        for i, (path, label) in enumerate(self._VALUATION_FIELDS, start=1):
+            tk.Label(body, text=label, fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY,
+                     font=ModernStyle.FONT_BODY).grid(row=i, column=0, sticky="w", pady=3)
+            var = tk.StringVar(value=f"{self._valuation_value(current, path) * 100:g}")
+            box = RoundedBox(body)
+            entry = ModernEntry(box, textvariable=var, width=7, bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_PRIMARY,
+                                font=ModernStyle.FONT_INPUT, relief=tk.FLAT, highlightthickness=0, justify="right",
+                                insertbackground=ModernStyle.ACCENT_PRIMARY)
+            entry.pack(ipady=3, padx=8)
+            box.watch(entry)
+            box.grid(row=i, column=1, sticky="e", padx=(12, 4), pady=3)
+            tk.Label(body, text="%", fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY,
+                     font=ModernStyle.FONT_BODY).grid(row=i, column=2, sticky="w")
+            variables[path] = var
+        body.grid_columnconfigure(0, weight=1)
+
+        def _save():
+            saved: dict = {"IN": {}, "JP": {}}
+            for path, label in self._VALUATION_FIELDS:
+                try:
+                    v = float(variables[path].get().strip().replace("%", "")) / 100.0
+                except ValueError:
+                    top.set_status(f"⚠ {label}: enter a number, e.g. 12 or 7.5.", is_error=True)
+                    return
+                if not 0.0 <= v <= 0.6:
+                    top.set_status(f"⚠ {label}: use a value between 0 and 60.", is_error=True)
+                    return
+                if len(path) == 2:
+                    saved[path[0]][path[1]] = v
+                else:
+                    saved[path[0]] = v
+            for c, name in (("IN", "India"), ("JP", "Japan")):
+                if saved[c]["long_run_growth"] >= saved[c]["required_return"] - 0.01:
+                    top.set_status(f"⚠ {name}: long-run growth must be at least 1% below the required return.", is_error=True)
+                    return
+            if merge_assumptions(saved) == merge_assumptions(None):
+                saved = {}          # same as the defaults: store nothing
+            save_settings({"valuation": saved})
+            self._show_valuation_summary()
+            top.close()
+
+        def _defaults():
+            for path, _label in self._VALUATION_FIELDS:
+                variables[path].set(f"{self._valuation_value(DEFAULT_ASSUMPTIONS, path) * 100:g}")
+            top.set_status("Default values filled in. Press Save to keep them.")
+
+        action_button(top.actions_frame, "Save", _save, icon="check",
+                      canvas_bg=ModernStyle.BG_SECONDARY).pack(side="right")
+        action_button(top.actions_frame, "Defaults", _defaults, soft=True, icon="rotate-ccw",
+                      canvas_bg=ModernStyle.BG_SECONDARY).pack(side="left")
+        top.set_status("Values in percent. Esc closes without saving.")
 
     def _choose_appearance(self, key: str, value: str) -> None:
         from model.app_settings import save_settings

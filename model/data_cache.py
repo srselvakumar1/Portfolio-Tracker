@@ -149,6 +149,9 @@ class DataCache:
         if filters.iv_signal and filters.iv_signal != "All":
             if filters.iv_signal == "N/A":
                 df = df[(df["action_signal"].isna()) | (df["action_signal"].astype(str) == "N/A")]
+            elif filters.iv_signal.upper() == "REDUCE":
+                # The Reduce pill also lists SELL (bad news), which has no pill of its own
+                df = df[df["action_signal"].astype(str).str.upper().isin(["REDUCE", "SELL"])]
             else:
                 df = df[df["action_signal"].astype(str).str.upper() == filters.iv_signal.upper()]
 

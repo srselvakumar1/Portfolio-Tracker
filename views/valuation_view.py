@@ -348,15 +348,26 @@ def collect_valuation_data(symbol: str) -> dict:
     extract("h52", info.get("fiftyTwoWeekHigh"))
     extract("l52", info.get("fiftyTwoWeekLow"))
 
-    # ── Fair value (earnings model, about 21.7 × EPS) and Graham Number ────────
-    if eps_raw and eps_raw > 0:
-        try:
-            from model.engine import calculate_intrinsic_value as _calc_iv
-            iv_val = _calc_iv(eps_raw)
-            if iv_val and iv_val > 0:
-                extract("intrinsic_value", iv_val)
-        except Exception:
-            log.debug("Intrinsic value for %s failed", yf_symbol, exc_info=True)
+    # ── Fair value and decision from the shared rules (model/valuation.py) ────
+    # The same rules and company figures as Holdings, Watchlist and the Dashboard.
+    # Indian and Tokyo listings are saved for those pages too.
+    try:
+        from model import fundamentals
+        from model.valuation import canonical, decide, load_assumptions
+        from datetime import datetime as _dt
+        now = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        inputs = fundamentals.extract_inputs(yf_symbol, info, ticker, fin=fin, now=now)
+        state = {}
+        if yf_symbol.upper().endswith((".NS", ".BO", ".T")):
+            fundamentals.save_inputs(yf_symbol, dict(inputs, price=cur_price or None, price_at=now))
+            rec = fundamentals.load_records([yf_symbol]).get(canonical(yf_symbol)) or {}
+            inputs, state = rec.get("inputs") or inputs, rec.get("state") or {}
+        decision = decide(inputs, cur_price, load_assumptions(), state, now)
+        raw["decision"] = decision
+        if decision.fair_value:
+            extract("intrinsic_value", decision.fair_value)
+    except Exception:
+        log.warning("Valuing %s failed", yf_symbol, exc_info=True)
     bvps = info.get("bookValue")
     if eps_raw and bvps and eps_raw > 0 and bvps > 0:
         extract("graham_number", math.sqrt(22.5 * eps_raw * bvps))
@@ -513,6 +524,17 @@ class ValuationView(BaseView):
         self.gauge_rect = self.gauge_canvas.create_rectangle(0, 0, 0, 12, fill=ModernStyle.SUCCESS, outline="")
         self.gauge_canvas.create_line(110, 0, 110, 12, fill=ModernStyle.TEXT_SECONDARY, width=2)
 
+        # Buy below / Target / Reduce above / Confidence, from the shared rules
+        self._decision_labels = {}
+        for i, (key, text) in enumerate((("buy_below", "Buy below:"), ("target", "Target (2–3 yrs):"),
+                                         ("reduce_above", "Reduce above:"), ("confidence", "Confidence:")), start=4):
+            tk.Label(prices_frame, text=text, font=ModernStyle.FONT_FIELD_LABEL, bg=ModernStyle.BG_SECONDARY,
+                     fg=ModernStyle.TEXT_SECONDARY).grid(row=i, column=0, sticky="w", pady=(6 if i == 4 else 2, 2))
+            lbl = tk.Label(prices_frame, text="---", font=ModernStyle.FONT_BODY_BOLD, bg=ModernStyle.BG_SECONDARY,
+                           fg=ModernStyle.TEXT_PRIMARY)
+            lbl.grid(row=i, column=1, sticky="w", padx=10, pady=(6 if i == 4 else 2, 2))
+            self._decision_labels[key] = lbl
+
         # Right side: Rationale text
         right_summary = tk.Frame(summary_inner, bg=ModernStyle.BG_SECONDARY)
         right_summary.pack(side="left", fill="both", expand=True)
@@ -520,7 +542,7 @@ class ValuationView(BaseView):
         tk.Label(right_summary, text="Decision Rationale", font=ModernStyle.FONT_CARD_TITLE, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
         
         self.txt_rationale = tk.Text(
-            right_summary, height=12, bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY,
+            right_summary, height=18, bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY,
             font=ModernStyle.FONT_BODY, relief=tk.FLAT, highlightthickness=0,
             wrap=tk.WORD, padx=12, pady=10, cursor="arrow",
         )
@@ -528,6 +550,7 @@ class ValuationView(BaseView):
                                          spacing1=6, spacing3=2)
         self.txt_rationale.tag_configure("pass", foreground=ModernStyle.SUCCESS)
         self.txt_rationale.tag_configure("fail", foreground=ModernStyle.ERROR)
+        self.txt_rationale.tag_configure("body", foreground=ModernStyle.TEXT_PRIMARY)
         self.txt_rationale.pack(fill="both", expand=True)
         self.txt_rationale.configure(state="disabled")
 
@@ -887,9 +910,18 @@ class ValuationView(BaseView):
         else:
             self._lbl_company_name.config(text="")
 
-        # Summary Header
+        # Summary Header: the decision from the shared rules
         cur_price = self._raw_data.get("current_price")
         iv_val = self._raw_data.get("intrinsic_value")
+        decision = self._raw_data.get("decision")
+        fmt = lambda v: f"{cy}{v:,.2f}" if v else "---"
+        for key, lbl in self._decision_labels.items():
+            if decision is None:
+                lbl.config(text="---")
+            elif key == "confidence":
+                lbl.config(text=decision.confidence if decision.fair_value else "---")
+            else:
+                lbl.config(text=fmt(getattr(decision, key)))
 
         self.lbl_current_price.config(text=f"{cy}{cur_price:,.2f}" if cur_price else "---")
         self.lbl_intrinsic_value.config(text=f"{cy}{iv_val:,.2f}" if iv_val else "---")
@@ -912,24 +944,25 @@ class ValuationView(BaseView):
             self.gauge_frame.grid()
         else:
             eps = self._raw_data.get("eps")
-            no_fv = "No fair value: EPS is zero or negative" if eps is not None and eps <= 0 else ""
+            no_fv = "No fair value: EPS is zero or negative" if eps is not None and eps <= 0 else \
+                "No fair value" if decision is not None else ""
             self.lbl_margin_safety.config(text=no_fv, fg=ModernStyle.TEXT_SECONDARY)
             self.gauge_frame.grid_remove()
 
 
-        # 2. Logic Engine
-        badge, tip = self._compute_signal()
-        
-        if "Strong Buy" in badge or "Accumulate" in badge:
-            badge_fg = ModernStyle.SUCCESS
-        elif "Avoid" in badge:
-            badge_fg = ModernStyle.ERROR
-        elif "Not enough" in badge:
-            badge_fg = ModernStyle.TEXT_SECONDARY
+        # 2. The signal: the shared rules decide; the old checklist is information only
+        scorecard = self._quality_scorecard()
+        if decision is not None:
+            badge = decision.label
+            badge_fg = {"BUY": ModernStyle.SUCCESS, "REDUCE": ModernStyle.ERROR, "SELL": ModernStyle.ERROR,
+                        "HOLD": ModernStyle.WARNING}.get(decision.zone, ModernStyle.TEXT_SECONDARY)
+            explained = decision.text().split("\n", 1)[1:]      # its first line repeats the badge
+            tip = "\n".join([f"Confidence: {decision.confidence}"] + explained + ["", scorecard])
         else:
-            badge_fg = ModernStyle.WARNING
+            badge, badge_fg = "⚪ No signal", ModernStyle.TEXT_SECONDARY
+            tip = "The fair value couldn't be worked out for this symbol.\n\n" + scorecard
         self.lbl_signal_badge.config(text=badge, fg=badge_fg)
-            
+
         self.txt_rationale.configure(state="normal")
         self.txt_rationale.delete(1.0, tk.END)
         for line in tip.split("\n"):
@@ -939,6 +972,8 @@ class ValuationView(BaseView):
                 tag = "pass"
             elif line.startswith(("❌", "🚨", "📉")):
                 tag = "fail"
+            elif line.startswith(("•", "·")):
+                tag = "body"
             else:
                 tag = "head"
             self.txt_rationale.insert(tk.END, line + "\n", tag)
@@ -949,8 +984,9 @@ class ValuationView(BaseView):
         self.metrics_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
 
-    def _compute_signal(self) -> tuple[str, str]:
-        """Compute buy/sell signal and reason tip based on self._raw_data"""
+    def _quality_scorecard(self) -> str:
+        """The old checklist (P/E, ROE, margins, growth, RSI…) as information only; the
+        signal comes from the shared rules (model/valuation.py). Colours the metric values."""
         score = 0
         max_score = 0
         reasons_pass = []
@@ -1047,21 +1083,8 @@ class ValuationView(BaseView):
         check("Latest Qtr Op", "qoq_op_profit", lambda v: v > 0,
               "Latest quarter's operating profit is positive", "Latest quarter had an operating loss")
 
-        # === Intrinsic Value & Alternate ===
-        # Special check comparing IV to Current Price
-        iv = self._raw_data.get("intrinsic_value")
+        # === Graham number (the fair value itself is in the decision above) ===
         cp = self._raw_data.get("current_price")
-        if iv and cp and cp > 0:
-            max_score += 2 # Give higher weight to intrinsic value margin of safety
-            if cp < iv * 0.8: # >20% margin of safety
-                score += 2
-                reasons_pass.append("✅ Fair Value: Price is more than 20% below fair value (margin of safety)")
-            elif cp < iv: 
-                score += 1
-                reasons_pass.append("✅ Fair Value: Price is below fair value")
-            else:
-                score -= 1 # Not necessarily a double penalty
-                reasons_fail.append("❌ Fair Value: Price is above fair value (overvalued)")
 
         gn = self._raw_data.get("graham_number")
         if gn and cp:
@@ -1092,30 +1115,14 @@ class ValuationView(BaseView):
         check("Beta", "beta", lambda v: v < 1.5, "Lower portfolio volatility vs overall market trends", "High beta — susceptible to violent market swings")
 
 
-        # ── Determine badge ──
-        pct = score / max_score if max_score else 0
+        # ── The scorecard text (information only: it doesn't decide the signal) ──
         if max_score == 0:
-            badge = "⚪ Not enough data"
-        elif pct >= 0.65:
-            badge = "🟢 Strong Buy"
-        elif pct >= 0.4:
-            badge = "🟡 Accumulate"
-        elif pct >= 0.1:
-            badge = "⏳ Wait / Watch"
-        else:
-            badge = "🔴 Avoid"
-
-        # ── Build reason tip ──
-        tip_lines = [f"Analysis Score: {score}/{max_score} ({pct*100:.0f}%)"]
+            return "QUALITY SCORECARD: no ratios from Yahoo Finance for this symbol."
+        tip_lines = [f"QUALITY SCORECARD (information only, it doesn't decide the signal): {score}/{max_score}"]
         if reasons_pass:
-            tip_lines.append("\nSTRENGTHS:")
+            tip_lines.append("STRENGTHS:")
             tip_lines.extend(reasons_pass)
         if reasons_fail:
-            tip_lines.append("\nWEAKNESSES / RISKS:")
+            tip_lines.append("WEAKNESSES / RISKS:")
             tip_lines.extend(reasons_fail)
-        if max_score == 0:
-            tip_lines.append("Failed to fetch metric data: Yahoo Finance returned no ratios for this symbol.")
-        
-        tip = "\n".join(tip_lines)
-
-        return badge, tip
+        return "\n".join(tip_lines)

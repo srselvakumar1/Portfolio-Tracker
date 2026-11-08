@@ -148,7 +148,9 @@ def _signal_text(signal) -> str:
     s = str(signal if signal is not None else "").strip().upper()
     if s in {"ACCUMULATE", "BUY", "ADD"}:
         return "➕ Accumulate"
-    if s in {"REDUCE", "SELL", "TRIM"}:
+    if s in {"SELL"}:
+        return "⛔ Sell"          # bad news only: a loss, a big fair-value cut, or quality newly failed
+    if s in {"REDUCE", "TRIM"}:
         return "➖ Reduce"
     if s in {"HOLD", "WAIT"}:
         return "⏸ Hold"

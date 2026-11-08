@@ -14,9 +14,11 @@ The rules are written up in VALUATION_REVIEW.md (sections 6 and 7). In short:
   A reverse check shows what growth the current price implies.
 * Confidence: High when two or more methods agree within 25% and EPS has been
   positive for 3 years; Medium for one method or agreement within 50%; Low otherwise.
+  At Low confidence a signal needs every method to agree (BUY below the lowest
+  one's buy price, REDUCE above the highest one's reduce level), otherwise HOLD.
 * Zones: BUY below fair value × (1 − margin of safety), REDUCE above fair value
   × 1.2, HOLD in between. SELL only on bad news. NONE ("no signal") when the
-  data is missing, old or the methods disagree. Next to a boundary the zone from
+  data is missing or old, or no method applies (e.g. funds). Next to a boundary the zone from
   the last refresh stays until the price is 3% past it (no flip-flopping).
 
 The assumptions (required return, growth limits, margins) are settings. These
@@ -169,6 +171,20 @@ def _age_days(text, now: datetime):
     return None if d is None else max(0.0, (now - d).total_seconds() / 86400.0)
 
 
+def yearly_eps_usable(inputs: dict) -> bool:
+    """False when the yearly EPS can't be compared with today's EPS and price: reported in
+    another currency (Infosys files in US dollars), or from before a share split or bonus
+    issue that Yahoo hasn't adjusted for (the latest year more than 3× off the last 12 months)."""
+    cur = str(inputs.get("currency") or "").upper()
+    fin = str(inputs.get("financial_currency") or "").upper()
+    if cur and fin and cur != fin:
+        return False
+    ttm, hist = _num(inputs.get("eps_ttm")), _clean_list(inputs.get("eps_annual"))
+    if ttm and ttm > 0 and hist and hist[0] > 0 and not (1 / 3 <= ttm / hist[0] <= 3):
+        return False
+    return True
+
+
 def is_lender(inputs: dict) -> bool:
     """Banks and credit companies: valued on book value, not cash flow."""
     ind = str(inputs.get("industry") or "").lower()
@@ -180,11 +196,14 @@ def is_lender(inputs: dict) -> bool:
 def normalised_eps(inputs: dict) -> tuple[float | None, str]:
     """The EPS the fair value is built on, and a note on how it was chosen."""
     ttm = _num(inputs.get("eps_ttm"))
-    hist = _clean_list(inputs.get("eps_annual"))[:3]
+    hist = _clean_list(inputs.get("eps_annual"))[:3] if yearly_eps_usable(inputs) else []
     if len(hist) >= 3:
         lo, hi = min(hist), max(hist)
         if lo <= 0 or (hi / lo - 1.0) > 0.30:
-            return sum(hist) / 3.0, "average of the last 3 years' EPS (earnings swing a lot)"
+            # the middle value, so one odd year (a one-off loss or windfall) counts less
+            vals = hist + ([ttm] if ttm is not None else [])
+            return statistics.median(vals), ("middle value of the last 3 years' and the last 12 months' EPS "
+                                             "(earnings swing a lot)")
     if ttm is not None:
         return ttm, "last 12 months' EPS"
     if hist:
@@ -195,7 +214,7 @@ def normalised_eps(inputs: dict) -> tuple[float | None, str]:
 def growth_rate(inputs: dict, a: dict, roe: float) -> tuple[float, str]:
     """Growth for years 1–5: the lowest of 3-year EPS growth, 3-year revenue
     growth + 2% and the cap; never below 0, and at most 0.8 × ROE."""
-    eps = _clean_list(inputs.get("eps_annual"))
+    eps = _clean_list(inputs.get("eps_annual")) if yearly_eps_usable(inputs) else []
     rev = _clean_list(inputs.get("revenue_annual"))
     cands: list[tuple[float, str]] = []
     for series, extra, name in ((eps, 0.0, "EPS growth"), (rev, 0.02, "revenue growth + 2%")):
@@ -382,6 +401,10 @@ def fair_value(inputs: dict, a: dict, price: float | None = None):
         notes.append(f"Growth for years 1–5: {g*100:.1f}% ({g_note}), fading to "
                      f"{a['long_run_growth']*100:.1f}% by year 10")
         pes = [p for p in _clean_list(inputs.get("pe_history")) if p > 0]
+        if not yearly_eps_usable(inputs):
+            pes = []
+            notes.append("Yearly EPS ignored: it doesn't match today's EPS (another currency, "
+                         "or a share split Yahoo hasn't adjusted)")
         if len(pes) >= 2:
             med = min(statistics.median(pes), a["history_pe_cap"])
             methods.append(("Own P/E history", med * eps))
@@ -495,9 +518,12 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
 
     margin = a["mos_high"] if d.confidence == "High" else a["mos_medium"]
     d.margin = margin
-    d.buy_below = fv * (1.0 - margin)
+    # Methods that disagree (Low confidence) give a signal only where they all agree:
+    # BUY below the buy price of the lowest, REDUCE above the reduce level of the highest
+    buy_anchor, reduce_anchor = (lo, hi) if d.confidence == "Low" else (fv, fv)
+    d.buy_below = buy_anchor * (1.0 - margin)
     d.target = fv
-    d.reduce_above = fv * (1.0 + a["reduce_above"])
+    d.reduce_above = reduce_anchor * (1.0 + a["reduce_above"])
     dy = _num(inputs.get("dividend_yield")) or 0.0
     d.expected_return = ((fv / price) ** (1.0 / 3.0) - 1.0) * 100.0 + dy
 
@@ -505,11 +531,9 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
         d.changes.append(sell_rules)
         return d
     if d.confidence == "Low":
-        d.zone = "NONE"
-        d.reasons.append(f"Not enough confidence: the methods disagree by {spread*100:.0f}% "
-                         f"({', '.join(f'{n} {m(v)}' for n, v in methods)}).")
-        d.changes.append("A signal appears when the methods agree within 50%.")
-        return d
+        d.reasons.append(f"The methods disagree by {spread*100:.0f}% "
+                         f"({', '.join(f'{n} {m(v)}' for n, v in methods)}): BUY only below the lower one's "
+                         f"buy price, REDUCE only above the higher one's reduce level.")
 
     # ── Zones ──
     pct = lambda level: (level / price - 1.0) * 100.0
@@ -531,7 +555,7 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
     if zone == "BUY":
         if d.quality_pass:
             d.zone = "BUY"
-            d.strong = price <= fv * (1.0 - margin - a["strong_extra"])
+            d.strong = price <= buy_anchor * (1.0 - margin - a["strong_extra"])
             if not kept:
                 d.reasons.append(f"Price {m(price)} is at or below the buy price {m(d.buy_below)} "
                                  f"({margin*100:.0f}% below fair value, {d.confidence} confidence).")

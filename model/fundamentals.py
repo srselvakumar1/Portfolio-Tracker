@@ -83,6 +83,8 @@ def info_inputs(symbol: str, info: dict, now: str | None = None) -> dict:
         "price": price,                                     # the price these figures came with
         "price_at": now if price else None,
         "currency": str(info.get("currency") or "").upper() or None,
+        # the currency of the yearly figures (Infosys reports in USD while trading in INR)
+        "financial_currency": str(info.get("financialCurrency") or "").upper() or None,
         "eps_ttm": eps,
         "bvps": _num(info.get("bookValue")),
         "roe": _num(info.get("returnOnEquity")),          # fraction (0.25 = 25%)

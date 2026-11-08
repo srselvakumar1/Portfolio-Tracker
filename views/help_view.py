@@ -277,8 +277,10 @@ SECTIONS = [
             "**Earnings model**: EPS grows for 5 years (the lowest of 3-year EPS growth, 3-year revenue growth + 2% "
             "and a cap: **15%** India, **8%** Japan), then slows to long-run growth (**5%** India, **1.5%** Japan) by "
             "year 10. Only the profit that needn't be reinvested counts (EPS × (1 − growth ÷ ROE)), discounted at the "
-            "required return (**12%** India, **7.5%** Japan). EPS that swings a lot is averaged over 3 years.",
-            "**Own P/E history**: the stock's median P/E at its last few year ends × EPS.",
+            "required return (**12%** India, **7.5%** Japan). When EPS swings a lot, the middle value of the last "
+            "3 years and the last 12 months is used, so one odd year counts less.",
+            "**Own P/E history**: the stock's median P/E at its last few year ends × EPS. Yearly EPS that "
+            "doesn't match today's (another currency, or a share split Yahoo hasn't adjusted) is ignored.",
             "**Banks and credit companies**: a fair price-to-book = (ROE − long-run growth) ÷ "
             "(required return − long-run growth), × book value per share.",
             "A **reverse check** shows what growth today's price assumes.",
@@ -286,7 +288,8 @@ SECTIONS = [
         ("table", ["Confidence", "When"], [
             ["**High**", "Two or more methods agree within 25%, and EPS was positive in each of the last 3 years"],
             ["**Medium**", "One method, or methods agree within 50%"],
-            ["**Low**", "Methods disagree by more than 50%: no signal"],
+            ["**Low**", "Methods disagree by more than 50%: BUY only below the lower one's buy price, "
+                        "REDUCE only above the higher one's reduce level, otherwise HOLD"],
         ]),
         ("sub", "Signals"),
         ("table", ["Signal", "When", "Holdings / Watchlist"], [
@@ -297,7 +300,7 @@ SECTIONS = [
             ["**SELL**", "Bad news only: 12-month EPS at or below zero, fair value cut by more than 25% in the "
                          "last 30 days, or the quality check newly failed (90 days)", "Sell / Avoid"],
             ["**No signal**", "No figures yet, price older than 5 days, figures older than 120 days, "
-                              "or Low confidence", "No signal / No Data"],
+                              "or no method applies (e.g. funds)", "No signal / No Data"],
         ]),
         ("bullets", [
             "**Quality check** (pass/fail): ROE at least 12% (Japan 8%), EPS positive in each of the last 3 years, "

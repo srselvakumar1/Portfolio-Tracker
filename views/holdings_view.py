@@ -90,7 +90,7 @@ COLUMN_HELP = {
     "total":    "Total P&L (realised + unrealised)",
     "fees":     "Fees (all brokerage and charges)",
     "pe":       "P/E (price ÷ earnings per share)",
-    "signal":   "Signal (advisor suggestion)",
+    "signal":   "Signal (model: price vs fair value)",
 }
 
 # Signal filter: button label → value stored in the database

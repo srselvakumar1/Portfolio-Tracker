@@ -337,7 +337,11 @@ def is_placeholder_eps(eps, pe, price) -> bool:
 
 
 def calculate_intrinsic_value(eps: float, growth_rate: float = 0.12, discount_rate: float = 0.10, terminal_multiple: float = 15.0) -> float:
-    """Calculates Intrinsic Value using a 5-year DCF snapshot."""
+    """Fair value from a simple earnings model (not a cash-flow DCF).
+
+    EPS grows `growth_rate` a year for 5 years, each year's EPS is discounted at
+    `discount_rate`, and a final value of `terminal_multiple` × year-5 EPS is added.
+    With the defaults this is always about 21.7 × EPS, for every stock."""
     if eps is None or (isinstance(eps, float) and math.isnan(eps)) or eps <= 0:
         return 0.0
 
@@ -355,6 +359,11 @@ def calculate_intrinsic_value(eps: float, growth_rate: float = 0.12, discount_ra
 
     iv += terminal_value / ((1 + discount_rate) ** 5)
     return round(iv, 2)
+
+# Only passed between _fetch_single_ticker() and fetch_and_update_market_data(), never
+# stored: "this stock has no positive earnings", so its old fair value and signal are cleared
+NO_EARNINGS = "NO_EARNINGS"
+
 
 def get_iv_signal(current_price: float, iv: float) -> str:
     """Calculates action signal based on Intrinsic Value."""
@@ -504,12 +513,18 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
             except Exception:
                 pass
 
-        eps = float(full_info.get('trailingEps', 0.0) or 0.0)
+        raw_eps = full_info.get('trailingEps')
+        eps = float(raw_eps or 0.0)
         pe = float(full_info.get('trailingPE', 0.0) or 0.0)
-        if is_placeholder_eps(eps, pe, current_price):
+        placeholder = is_placeholder_eps(eps, pe, current_price)
+        if placeholder:
             eps = pe = 0.0   # no real earnings figure: store "unknown", not 1.00
         iv = calculate_intrinsic_value(eps)
         signal = get_iv_signal(current_price, iv)
+        # Yahoo answered and the company has no positive earnings (a loss, or the 1.00
+        # placeholder): the old fair value, P/E and signal must be cleared, not kept
+        if current_price > 0 and (placeholder or (isinstance(raw_eps, (int, float)) and raw_eps <= 0)):
+            signal = NO_EARNINGS
 
         mkt_row = (
             orig_sym, current_price, previous_close,
@@ -518,6 +533,9 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str):
             pe,
             eps,
             float(full_info.get('priceToBook', 0.0) or 0.0),
+            # Stored in Yahoo's own units; the Dashboard converts them for display:
+            # roe = fraction (0.25 = 25%), the "roce" column holds Return on ASSETS (a fraction,
+            # Yahoo has no ROCE), debt_to_equity = percent (45.0 = 0.45×)
             float(full_info.get('returnOnEquity', 0.0) or 0.0),
             float(full_info.get('returnOnAssets', 0.0) or 0.0),
             float(full_info.get('debtToEquity', 0.0) or 0.0),
@@ -599,7 +617,9 @@ def fetch_and_update_market_data(symbols: list):
         log.warning("Price helper unavailable: fetching prices in the app instead", exc_info=True)
         rows = fetch_market_rows(pairs, now)
     marketdata_records = [m for m, _a in rows]
-    assets_records = [a for _m, a in rows]
+    # Stocks with no positive earnings: store "N/A", then clear their old fair value and P/E below
+    no_earnings = [(m[6], m[0]) for m, a in rows if a[2] == NO_EARNINGS]
+    assets_records = [(a[0], a[1], "N/A", *a[3:]) if a[2] == NO_EARNINGS else a for _m, a in rows]
 
     # Write to DB in a fraction of a second
     with db_session() as conn:
@@ -641,6 +661,13 @@ def fetch_and_update_market_data(symbols: list):
                 dii_holding      = CASE WHEN excluded.dii_holding > 0 THEN excluded.dii_holding ELSE assets.dii_holding END,
                 last_updated     = excluded.last_updated
         ''', assets_records)
+
+        # The upserts above keep old values when a new one is missing (a failed fetch).
+        # A loss is a real answer, so a fair value / P/E / signal from a profitable year goes.
+        if no_earnings:
+            cursor.executemany("UPDATE marketdata SET eps = ?, pe_ratio = 0 WHERE symbol = ?", no_earnings)
+            cursor.executemany("UPDATE assets SET intrinsic_value = 0, action_signal = 'N/A' WHERE symbol = ?",
+                               [(sym,) for _eps, sym in no_earnings])
 
 
 # ── Database Rebuild Logic ───────────────────────────────────────────────────
@@ -1354,6 +1381,9 @@ def get_watchlist_alerts(currency_filter: str = "All", fill_to: int = 0) -> list
             fake_eps = is_placeholder_eps(eps, pe, current)
             if fake_eps:
                 pe = eps = None
+            elif eps not in (None, "", "-") and _parse_num(eps) <= 0:
+                fake_eps = True   # a loss: no P/E, and the saved fair value is from a profitable year
+                pe = None
 
             # Fallbacks for target price (the fair value only when its EPS was real)
             if not target or target <= 0:

@@ -96,6 +96,30 @@ def graham_number(row: dict) -> float | None:
     return None
 
 
+def is_loss_making(row: dict) -> bool:
+    """True when the saved EPS is zero or negative: the stock has no P/E or fair value."""
+    eps = parse_num(row.get("eps"))
+    return eps is not None and eps <= 0
+
+
+def fair_value_of(row: dict) -> float | None:
+    """The saved fair value, or None when it can't be trusted (a loss, or the
+    EPS 1.00 placeholder that stands for missing earnings)."""
+    from model.engine import is_placeholder_eps
+    if is_loss_making(row) or is_placeholder_eps(row.get("eps"), row.get("pe_ratio"), row.get("current_value")):
+        return None
+    iv = parse_num(row.get("intrinsic_value"))
+    return iv if iv is not None and iv > 0 else None
+
+
+def upside_pct(fair_value: float | None, price: float | None) -> float | None:
+    """Upside to fair value in percent: fair value ÷ price − 1. Negative when the price
+    is above fair value (never below −100%). The same formula as the Dashboard."""
+    if not fair_value or not price or fair_value <= 0 or price <= 0:
+        return None
+    return (fair_value / price - 1.0) * 100.0
+
+
 def _week52(row: dict) -> tuple[float, float] | None:
     text = str(row.get("week52_range") or "")
     if "–" not in text:
@@ -118,10 +142,18 @@ def compute_signal(row: dict) -> tuple[str, str, str]:
     if is_placeholder_eps(row.get("eps"), row.get("pe_ratio"), row.get("current_value")):
         # EPS 1.00 with P/E = price is missing data: don't score P/E, fair value or Graham on it
         row = {k: v for k, v in row.items() if k not in ("eps", "pe_ratio", "intrinsic_value")}
+    loss_making = is_loss_making(row)
+    if loss_making:
+        # A P/E or fair value saved in a profitable year is stale: score the loss instead
+        row = {k: v for k, v in row.items() if k not in ("pe_ratio", "intrinsic_value")}
     score = 0
     max_score = 0
     reasons_pass: list[str] = []
     reasons_fail: list[str] = []
+    if loss_making:
+        max_score += 1
+        score -= 1
+        reasons_fail.append("❌ Earnings: Loss-making (EPS at or below zero), so no P/E or fair value")
 
     def check(label, key, condition_fn, tip_pass, tip_fail):
         nonlocal score, max_score
@@ -161,22 +193,23 @@ def compute_signal(row: dict) -> tuple[str, str, str]:
           "Consistent 3-year revenue compounding", "Inconsistent long-term revenue")
     check("3Y Profit CAGR", "profit_cagr_3y", lambda v: v >= 10.0,
           "Consistent 3-year profit compounding", "Inconsistent long-term profit")
-    check("QoQ Op", "qoq_op_profit", lambda v: v > 0, "Sequential operating improvement", "Operating profit declined")
+    check("Latest Qtr Op", "qoq_op_profit", lambda v: v > 0,
+          "Latest quarter's operating profit is positive", "Latest quarter had an operating loss")
 
-    # === Intrinsic value, Graham number, analyst target, 52-week range ===
+    # === Fair value, Graham number, analyst target, 52-week range ===
     cp = parse_num(row.get("current_value"))
     iv = parse_num(row.get("intrinsic_value"))
     if cp and iv and cp > 0 and iv > 0:
         max_score += 2  # margin of safety counts double
         if cp < iv * 0.8:
             score += 2
-            reasons_pass.append("✅ Intrinsic Value: Trading at >20% discount to DCF value (Safety Margin)")
+            reasons_pass.append("✅ Fair Value: Price is more than 20% below fair value (margin of safety)")
         elif cp < iv:
             score += 1
-            reasons_pass.append("✅ Intrinsic Value: Trading below DCF intrinsic value")
+            reasons_pass.append("✅ Fair Value: Price is below fair value")
         else:
             score -= 1
-            reasons_fail.append("❌ Intrinsic Value: Trading above DCF intrinsic value (Overvalued)")
+            reasons_fail.append("❌ Fair Value: Price is above fair value (overvalued)")
 
     gn = graham_number(row)
     if gn and cp:
@@ -322,6 +355,12 @@ def fetch_watchlist_metrics(symbol: str, columns: set[str]) -> tuple[str, dict[s
         # Earnings unknown (EPS 1.00, P/E = price): clear the old figures, not store fake ones
         eps = None
         for key in ("eps", "pe_ratio", "intrinsic_value"):
+            if key in columns:
+                out[key] = ""
+    elif isinstance(eps, (int, float)) and eps <= 0:
+        # A loss: there is no P/E or fair value. Clear the ones saved in a profitable year
+        # (a save keeps any column it isn't given, so they would otherwise stay forever)
+        for key in ("pe_ratio", "intrinsic_value"):
             if key in columns:
                 out[key] = ""
     put("eps", eps, f"{cy}{{:,.2f}}")
@@ -718,7 +757,7 @@ class WatchlistView(BaseView):
         table_frame.content.grid_columnconfigure(0, weight=1)
         self._empty = EmptyState(table_frame.content)
 
-        cols = ("#", "Symbol", "Signal", "Sector / Industry", "Current Px", "IV (DCF)", "MoS %",
+        cols = ("#", "Symbol", "Signal", "Sector / Industry", "Current Px", "Fair Value", "Upside %",
                 "Graham No.", "Analyst Tgt", "My Target", "P/E", "PEG", "Div. Yield", "From 52W H",
                 "Tags", "Notes / Name", "Added")
 
@@ -736,10 +775,11 @@ class WatchlistView(BaseView):
             selectmode="browse", style="Watchlist.Treeview"
         )
         HeadingTips(self._tv, {
-            "Signal": "Suggestion from the valuation checks",
+            "Signal": "Score from the valuation checks (a formula, not advice)",
             "Current Px": "Latest market price",
-            "IV (DCF)": "Fair value from a discounted-cash-flow estimate",
-            "MoS %": "Margin of safety: how far the price is below fair value",
+            "Fair Value": "Earnings model: EPS grows 12% a year for 5 years, discounted at 10%, "
+                          "then 15 × EPS (about 21.7 × EPS). Blank for loss-making stocks",
+            "Upside %": "Fair value ÷ price − 1. Negative means the price is above fair value",
             "Graham No.": "Benjamin Graham's fair price: √(22.5 × EPS × book value per share)",
             "Analyst Tgt": "Average analyst price target",
             "My Target": "Your own target price",
@@ -749,12 +789,12 @@ class WatchlistView(BaseView):
             "From 52W H": "How far the price is below its 52-week high",
         })
         col_widths = [40, 120, 140, 250, 100, 100, 80, 100, 100, 100, 60, 60, 90, 100, 110, 220, 100]
-        sortable_cols = ("Symbol", "Signal", "Current Px", "IV (DCF)", "MoS %", "P/E", "Div. Yield", "From 52W H", "Added")
+        sortable_cols = ("Symbol", "Signal", "Current Px", "Fair Value", "Upside %", "P/E", "Div. Yield", "From 52W H", "Added")
 
         for c, w in zip(cols, col_widths):
             # numbers on the right so their digits line up; text and values with a ▲/▼ on the left
             anchor = ("center" if c in ("#", "Added") else
-                      "e" if c in ("Current Px", "IV (DCF)", "Graham No.", "Analyst Tgt", "My Target",
+                      "e" if c in ("Current Px", "Fair Value", "Graham No.", "Analyst Tgt", "My Target",
                                    "P/E", "PEG", "Div. Yield") else "w")
             if c in sortable_cols:
                 self._tv.heading(c, text=f"{c} ↕", anchor="center",
@@ -904,13 +944,13 @@ class WatchlistView(BaseView):
 
             sector_cell = " / ".join(filter(None, [row.get("sector") or "", row.get("industry") or ""])) or "—"
             cv_f = parse_num(row.get("current_value"))
-            iv_f = parse_num(row.get("intrinsic_value"))
+            iv_f = fair_value_of(row)   # None for a loss-maker: its saved fair value is stale
 
             mos_str = graham_str = from_high_str = "—"
             if cv_f is not None:
-                if iv_f is not None and iv_f > 0:
-                    mos_pct = (iv_f - cv_f) / iv_f * 100
-                    mos_str = f"{'▲ +' if mos_pct > 0 else '▼ '}{mos_pct:.1f}%"
+                up = upside_pct(iv_f, cv_f)
+                if up is not None:
+                    mos_str = f"{'▲ +' if up > 0 else '▼ '}{up:.1f}%"
                 gn = graham_number(row)
                 if gn:
                     graham_str = f"{cy}{gn:,.1f}"
@@ -940,12 +980,12 @@ class WatchlistView(BaseView):
                     signal_badge_text,
                     sector_cell,
                     money(row.get("current_value")),
-                    money(row.get("intrinsic_value")),
+                    money(row.get("intrinsic_value")) if iv_f is not None else "—",
                     mos_str,
                     graham_str,
                     money(row.get("analyst_target")),
                     my_target,
-                    row.get("pe_ratio") or "—",
+                    (row.get("pe_ratio") or "—") if not is_loss_making(row) else "—",
                     row.get("peg_ratio") or "—",
                     row.get("dividend_yield") or "—",
                     from_high_str,
@@ -956,7 +996,7 @@ class WatchlistView(BaseView):
                 tags=(row_tag,),
             )
             shown += 1
-        color_gain_loss(self._tv, ("MoS %", "From 52W H"))
+        color_gain_loss(self._tv, ("Upside %", "From 52W H"))
         color_signals(self._tv, "Signal")
 
         # A friendly empty screen when nothing is listed (once the data has loaded)
@@ -1320,13 +1360,13 @@ class WatchlistView(BaseView):
         groups = [
             ("Financial Ratios & Valuation", ModernStyle.ACCENT_PRIMARY, [
                 ("P/E Ratio", "pe_ratio"), ("PEG Ratio", "peg_ratio"), ("EPS", "eps"),
-                ("Debt to Equity", "debt_to_equity"), ("Book Value", "book_value"), ("Intrinsic Value", "intrinsic_value"),
+                ("Debt to Equity", "debt_to_equity"), ("Book Value", "book_value"), ("Fair Value", "intrinsic_value"),
                 ("P/B Ratio", "pb_ratio"), ("Current Ratio", "current_ratio"),
             ]),
             ("Profitability & Efficiency", ModernStyle.SUCCESS_FILL, [
                 ("ROE", "roe"), ("ROCE", "roce"), ("OPM (%)", "opm"), ("EBITDA Margin (%)", "ebitda_margin"),
                 ("Net Profit Margin (%)", "net_profit_margin"), ("Free Cash Flow", "free_cash_flow"),
-                ("Inventory Days", "inventory_days"), ("Capex", "capex"), ("QoQ Op. Profit", "qoq_op_profit"),
+                ("Inventory Days", "inventory_days"), ("Capex", "capex"), ("Latest Qtr Op. Profit", "qoq_op_profit"),
             ]),
             ("Growth Metrics", ModernStyle.WARNING_FILL, [
                 ("Sales Growth", "sales_growth"), ("Profit Growth", "profit_growth"),
@@ -1505,6 +1545,10 @@ class WatchlistView(BaseView):
         values["graham_number"] = f"{cy}{gn:,.2f}" if gn else ""
         values["target_price"] = (f"{cy}{parse_num(row.get('target_price')):,.2f}"
                                   if (parse_num(row.get("target_price")) or 0) > 0 else "")
+        if fair_value_of(row) is None:
+            values["intrinsic_value"] = ""   # a loss-maker's saved fair value is stale
+        if is_loss_making(row):
+            values["pe_ratio"] = ""
         available = set(row.keys()) | {"graham_number"}
 
         groups = [
@@ -1514,7 +1558,7 @@ class WatchlistView(BaseView):
                 ("EPS", "eps", "Double Digits (>10)"),
                 ("Debt to Equity", "debt_to_equity", "< 1.0"),
                 ("Book Value", "book_value", "Compare to Price"),
-                ("Intrinsic Value", "intrinsic_value", "Higher than Market Price"),
+                ("Fair Value", "intrinsic_value", "Higher than Market Price"),
                 ("Graham Number", "graham_number", "Higher than Market Price"),
                 ("My Target Price", "target_price", "Your own buy target"),
             ]),
@@ -1530,7 +1574,7 @@ class WatchlistView(BaseView):
                 ("3Y Profit CAGR", "profit_cagr_3y", "Consistent > 10%"),
                 ("Sales Growth", "sales_growth", "Double Digits"),
                 ("Profit Growth", "profit_growth", "Double Digits"),
-                ("QoQ Op. Profit", "qoq_op_profit", "Positive / Growth"),
+                ("Latest Qtr Op. Profit", "qoq_op_profit", "Positive"),
             ]),
             ("Operational & Ownership Metrics", [
                 ("Promoter Holding", "promoter_holding", "High & Stable"),

@@ -348,7 +348,7 @@ def collect_valuation_data(symbol: str) -> dict:
     extract("h52", info.get("fiftyTwoWeekHigh"))
     extract("l52", info.get("fiftyTwoWeekLow"))
 
-    # ── Intrinsic Value (DCF) and Graham Number ───────────────────────────────
+    # ── Fair value (earnings model, about 21.7 × EPS) and Graham Number ────────
     if eps_raw and eps_raw > 0:
         try:
             from model.engine import calculate_intrinsic_value as _calc_iv
@@ -495,7 +495,7 @@ class ValuationView(BaseView):
         self.lbl_current_price = tk.Label(prices_frame, text="---", font=ModernStyle.FONT_HEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY)
         self.lbl_current_price.grid(row=0, column=1, sticky="w", padx=10, pady=2)
 
-        tk.Label(prices_frame, text="Intrinsic Value:", font=ModernStyle.FONT_FIELD_LABEL, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY).grid(row=1, column=0, sticky="w", pady=2)
+        tk.Label(prices_frame, text="Fair Value:", font=ModernStyle.FONT_FIELD_LABEL, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_SECONDARY).grid(row=1, column=0, sticky="w", pady=2)
         self.lbl_intrinsic_value = tk.Label(prices_frame, text="---", font=ModernStyle.FONT_HEADING, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY)
         self.lbl_intrinsic_value.grid(row=1, column=1, sticky="w", padx=10, pady=2)
         
@@ -506,9 +506,12 @@ class ValuationView(BaseView):
         self.gauge_frame = tk.Frame(prices_frame, bg=ModernStyle.BG_SECONDARY)
         self.gauge_frame.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
+        # Centred gauge: the middle line is "price = fair value"; green grows right with the
+        # upside, red grows left when the price is above fair value (both ends = ±100%)
         self.gauge_canvas = tk.Canvas(self.gauge_frame, bg=ModernStyle.BG_TERTIARY, height=12, width=220, highlightthickness=0)
         self.gauge_canvas.pack(anchor="w")
         self.gauge_rect = self.gauge_canvas.create_rectangle(0, 0, 0, 12, fill=ModernStyle.SUCCESS, outline="")
+        self.gauge_canvas.create_line(110, 0, 110, 12, fill=ModernStyle.TEXT_SECONDARY, width=2)
 
         # Right side: Rationale text
         right_summary = tk.Frame(summary_inner, bg=ModernStyle.BG_SECONDARY)
@@ -561,7 +564,7 @@ class ValuationView(BaseView):
                 ("OPM",              "opm"),
                 ("Net Profit Margin","net_profit_margin"),
                 ("EBITDA Margin",    "ebitda_margin"),
-                ("QoQ Op. Profit",   "qoq_op_profit"),
+                ("Latest Qtr Op.",   "qoq_op_profit"),
                 ("Free Cash Flow",   "free_cash_flow"),
             ],
             "Growth & Health": [
@@ -594,7 +597,7 @@ class ValuationView(BaseView):
             ],
             "Alternate Valuations": [
                 ("Graham Number",    "graham_number"),
-                ("Intrinsic Value",  "intrinsic_value_display"),
+                ("Fair Value",       "intrinsic_value_display"),
             ],
         }
         
@@ -892,26 +895,25 @@ class ValuationView(BaseView):
         self.lbl_intrinsic_value.config(text=f"{cy}{iv_val:,.2f}" if iv_val else "---")
 
         if cur_price and iv_val and iv_val > 0:
-            margin = ((iv_val - cur_price) / iv_val) * 100
-            
-            # Update Gauge
-            # Let's say max gauge is 50% over/undervalue limit
-            gauge_w = 220
-            pct_fill = min((iv_val / cur_price) if cur_price > 0 else 1.0, 2.0) / 2.0
-            
-            if margin > 0:
-                self.lbl_margin_safety.config(text=f"({margin:.1f}% Undervalued)", fg=ModernStyle.SUCCESS)
+            # Upside to fair value = fair value ÷ price − 1: the same figure as the
+            # Watchlist and Dashboard. It can't go below −100%.
+            upside = (iv_val / cur_price - 1.0) * 100.0
+            half = 110   # the gauge is 220 wide; its middle is "price = fair value"
+            reach = min(abs(upside), 100.0) / 100.0 * half
+            if upside >= 0:
+                self.lbl_margin_safety.config(text=f"Upside to fair value: {upside:+.1f}%", fg=ModernStyle.SUCCESS)
                 self.gauge_canvas.itemconfig(self.gauge_rect, fill=ModernStyle.SUCCESS)
-                fill_w = min(pct_fill * gauge_w, gauge_w)
+                self.gauge_canvas.coords(self.gauge_rect, half, 0, half + reach, 12)
             else:
-                self.lbl_margin_safety.config(text=f"({abs(margin):.1f}% Overvalued)", fg=ModernStyle.ERROR)
+                self.lbl_margin_safety.config(text=f"Upside to fair value: {upside:+.1f}% (price above fair value)",
+                                              fg=ModernStyle.ERROR)
                 self.gauge_canvas.itemconfig(self.gauge_rect, fill=ModernStyle.ERROR)
-                fill_w = gauge_w # Full red if overvalued, or just visual representations
-                
-            self.gauge_canvas.coords(self.gauge_rect, 0, 0, fill_w, 12)
+                self.gauge_canvas.coords(self.gauge_rect, half - reach, 0, half, 12)
             self.gauge_frame.grid()
         else:
-            self.lbl_margin_safety.config(text="")
+            eps = self._raw_data.get("eps")
+            no_fv = "No fair value: EPS is zero or negative" if eps is not None and eps <= 0 else ""
+            self.lbl_margin_safety.config(text=no_fv, fg=ModernStyle.TEXT_SECONDARY)
             self.gauge_frame.grid_remove()
 
 
@@ -1042,7 +1044,8 @@ class ValuationView(BaseView):
         check("5Y Rev CAGR", "revenue_cagr_5y", lambda v: v >= 10.0, "Excellent 5-year historical revenue tracking", "Weak 5-year cyclical revenue", "revenue_cagr_5y")
         check("3Y Profit CAGR", "profit_cagr_3y", lambda v: v >= 10.0, "Consistent 3-year profit compounding", "Inconsistent long-term profit", "profit_cagr_3y")
         check("5Y Profit CAGR", "profit_cagr_5y", lambda v: v >= 10.0, "Excellent 5-year historical earnings compounding", "Weak 5-year cyclical earnings", "profit_cagr_5y")
-        check("QoQ Op", "qoq_op_profit", lambda v: v > 0, "Sequential operating improvement", "Operating profit declined")
+        check("Latest Qtr Op", "qoq_op_profit", lambda v: v > 0,
+              "Latest quarter's operating profit is positive", "Latest quarter had an operating loss")
 
         # === Intrinsic Value & Alternate ===
         # Special check comparing IV to Current Price
@@ -1052,13 +1055,13 @@ class ValuationView(BaseView):
             max_score += 2 # Give higher weight to intrinsic value margin of safety
             if cp < iv * 0.8: # >20% margin of safety
                 score += 2
-                reasons_pass.append("✅ Intrinsic Value: Trading at >20% discount to DCF value (Safety Margin)")
+                reasons_pass.append("✅ Fair Value: Price is more than 20% below fair value (margin of safety)")
             elif cp < iv: 
                 score += 1
-                reasons_pass.append("✅ Intrinsic Value: Trading below DCF intrinsic value")
+                reasons_pass.append("✅ Fair Value: Price is below fair value")
             else:
                 score -= 1 # Not necessarily a double penalty
-                reasons_fail.append("❌ Intrinsic Value: Trading above DCF intrinsic value (Overvalued)")
+                reasons_fail.append("❌ Fair Value: Price is above fair value (overvalued)")
 
         gn = self._raw_data.get("graham_number")
         if gn and cp:
@@ -1080,10 +1083,10 @@ class ValuationView(BaseView):
             max_score += 1
             if dma_50 > dma_200:
                 score += 1
-                reasons_pass.append("📈 Golden Cross: 50-Day MA is actively crossing above the 200-Day MA macro-trend")
+                reasons_pass.append("📈 Uptrend: the 50-day average is above the 200-day average")
             elif dma_50 < dma_200:
                 score -= 1
-                reasons_fail.append("📉 Death Cross: 50-Day MA is trapped below the 200-Day MA indicating long-term bear control")
+                reasons_fail.append("📉 Downtrend: the 50-day average is below the 200-day average")
 
         check("RSI", "rsi", lambda v: 30.0 <= v <= 65.0, "Relative Strength Index shows accumulation/neutrality", "Overbought momentum or deeply oversold (Falling Knife)")
         check("Beta", "beta", lambda v: v < 1.5, "Lower portfolio volatility vs overall market trends", "High beta — susceptible to violent market swings")

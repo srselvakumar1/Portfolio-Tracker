@@ -2182,9 +2182,11 @@ class DashboardView(BaseView):
                 fii_hold = _num(fii_hold)
                 dii_hold = _num(dii_hold)
                 pb = _num(pb)
-                roe = _num(roe)
-                roce = _num(roce)
-                d2e = _num(d2e)
+                # marketdata keeps Yahoo's units: ROE and ROA (in the "roce" column) as
+                # fractions, debt-to-equity in percent. Shown as %, %, and a plain ratio.
+                roe = _num(roe) * 100.0
+                roa = _num(roce) * 100.0
+                d2e = _num(d2e) / 100.0
                 div_yield = _num(div_yield)
                 prev_close = _num(prev_close)
                 sector = (sector or "").strip()
@@ -2215,7 +2217,9 @@ class DashboardView(BaseView):
         if sector:
             modal.add_chip("🏢", sector, bg_color=S.BG_TERTIARY, fg_color=S.TEXT_SECONDARY)
 
-        diff_pct = ((iv - cp) / cp * 100.0) if cp else 0.0
+        # Upside to fair value = fair value ÷ price − 1 (the same formula on every page);
+        # none when there is no fair value (a loss-maker, a fund)
+        diff_pct = ((iv - cp) / cp * 100.0) if cp > 0 and iv > 0 else None
 
         if signal == "ACCUMULATE":
             sig_color, sig_bg = S.SUCCESS, S.SUCCESS_PALE
@@ -2224,7 +2228,8 @@ class DashboardView(BaseView):
         else:
             sig_color, sig_bg = S.WARNING, S.WARNING_PALE
 
-        modal.add_chip("⚡", f"{signal} (Gap: {diff_pct:+.1f}%)", bg_color=sig_bg, fg_color=sig_color)
+        chip = f"{signal} (Upside: {diff_pct:+.1f}%)" if diff_pct is not None else signal
+        modal.add_chip("⚡", chip, bg_color=sig_bg, fg_color=sig_color)
 
         # Grid layout for cards (2 columns, 2 rows)
         # In a scroll area: on a small screen the pop-up is capped and the cards scroll
@@ -2256,10 +2261,11 @@ class DashboardView(BaseView):
         # Card 1: Valuation
         c1 = _card(0, 0, "🎯 Valuation", S.TEXT_ACCENT)
         _kv(c1, "Current Price:", format_money(cp, currency), font=S.FONT_SUBHEADING)
-        _kv(c1, "Intrinsic Value:", format_money(iv, currency), font=S.FONT_SUBHEADING)
+        _kv(c1, "Fair Value:", format_money(iv, currency) if iv > 0 else "N/A", font=S.FONT_SUBHEADING)
         _kv(c1, "52W High:", format_money(high52, currency))
         _kv(c1, "52W Low:", format_money(low52, currency))
-        _kv(c1, "Deviation:", f"{diff_pct:+.2f}%", sig_color, font=S.FONT_BODY_BOLD)
+        _kv(c1, "Upside:", f"{diff_pct:+.2f}%" if diff_pct is not None else "N/A", sig_color,
+            font=S.FONT_BODY_BOLD)
 
         # Card 2: Extended Fundamentals
         c2 = _card(0, 1, "📈 Fundamentals", S.TEXT_PURPLE)
@@ -2267,7 +2273,7 @@ class DashboardView(BaseView):
         _kv(c2, "P/B Ratio:", f"{pb:.2f}" if pb else "N/A")
         _kv(c2, "EPS:", f"{eps:.2f}" if eps else "N/A")
         _kv(c2, "ROE:", f"{roe:.1f}%" if roe else "N/A")
-        _kv(c2, "ROCE:", f"{roce:.1f}%" if roce else "N/A")
+        _kv(c2, "ROA:", f"{roa:.1f}%" if roa else "N/A")
         _kv(c2, "Debt to Equity:", f"{d2e:.2f}" if d2e else "N/A")
         _kv(c2, "Dividend Yield:", f"{div_yield:.2f}%" if div_yield else "N/A")
 
@@ -2285,8 +2291,8 @@ class DashboardView(BaseView):
         _kv(c4, "Unrealised P&L:", format_money(upnl, currency), S.SUCCESS if upnl >= 0 else S.ERROR)
         _kv(c4, "Today's P&L:", format_money(today_pnl, currency), S.SUCCESS if today_pnl >= 0 else S.ERROR)
 
-        # Actions
-        quick_type = "BUY" if signal == "ACCUMULATE" else "SELL"
+        # Actions: Quick Buy for ACCUMULATE, Quick Sell for REDUCE, nothing for HOLD / no signal
+        quick_type = {"ACCUMULATE": "BUY", "REDUCE": "SELL"}.get(signal)
 
         def _quick_trade():
             modal.destroy()
@@ -2301,10 +2307,10 @@ class DashboardView(BaseView):
                 app_state=self.app_state,
             )
 
-        btn_text = "▲ Quick Buy" if quick_type == "BUY" else "▼ Quick Sell"
-
-        action_button(modal.actions_frame, btn_text, _quick_trade, width=160, canvas_bg=S.BG_SECONDARY,
-                      kind="success" if quick_type == "BUY" else "danger").pack(side="left")
+        if quick_type:
+            btn_text = "▲ Quick Buy" if quick_type == "BUY" else "▼ Quick Sell"
+            action_button(modal.actions_frame, btn_text, _quick_trade, width=160, canvas_bg=S.BG_SECONDARY,
+                          kind="success" if quick_type == "BUY" else "danger").pack(side="left")
 
         secondary_button(modal.actions_frame, "✕ Close", modal.close,
                          canvas_bg=S.BG_SECONDARY).pack(side="right")
@@ -2955,7 +2961,7 @@ class DashboardView(BaseView):
     def _copy_insights(self):
         try:
             data = self._current_insights or []
-            lines = ["Signal\tSymbol\tIV\tCurrent\tGap"]
+            lines = ["Signal\tSymbol\tFair Value\tCurrent\tUpside %"]
             for item in data:
                 if not isinstance(item, dict):
                     continue

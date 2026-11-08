@@ -73,7 +73,7 @@ SECTIONS = [
             ["**Tax Report**", "Realised capital gains for a financial year (see Tax Report below)."],
             ["**P&L Report**", "Invested, current value, profit and loss and XIRR for each broker, with a chart and a PDF."],
             ["**Watchlist**", "Shares you are watching, with fundamental and technical numbers."],
-            ["**Valuation**", "Intrinsic value from a discounted-cash-flow (DCF) estimate, with Accumulate / Hold / Reduce signals."],
+            ["**Valuation**", "Fair value from a simple earnings model, with Accumulate / Hold / Reduce signals."],
             ["**Financial News**", "Market news headlines."],
             ["**Settings**", "Brokers, appearance, backups, the data cache, and deleting data."],
         ]),
@@ -267,9 +267,10 @@ SECTIONS = [
     ]),
 
     ("valuations", "⚖️  Valuations and action signals", "teal", [
-        ("p", "The **intrinsic value** is a discounted-cash-flow estimate: earnings per share (EPS) grow "
-              "**12%** a year for 5 years, each year is discounted at **10%**, and a final value of "
-              "**15 ×** the year-5 EPS is added."),
+        ("p", "The **fair value** (intrinsic value) comes from a simple earnings model: earnings per share "
+              "(EPS) grow **12%** a year for 5 years, each year is discounted at **10%**, and a final value of "
+              "**15 ×** the year-5 EPS is added. The same numbers are used for every stock, so the fair value "
+              "is always about **21.7 × EPS**. A stock with zero or negative EPS has no fair value and no signal."),
         ("table", ["Year", "Projected EPS", "Discount factor", "Present value"], [
             ["Start", "₹10.00", "1.000", "–"],
             ["Year 1", "₹11.20", "0.909", "₹10.18"],
@@ -281,6 +282,8 @@ SECTIONS = [
             "**ACCUMULATE**: the market price is below **70%** of the intrinsic value.",
             "**HOLD**: the price is between 70% and 110% of the intrinsic value.",
             "**REDUCE**: the price is above **110%** of the intrinsic value.",
+            "**Upside %** (Watchlist, Valuation and Dashboard) = fair value ÷ price − 1. "
+            "A negative upside means the price is above the fair value.",
         ]),
     ]),
 
@@ -294,7 +297,7 @@ SECTIONS = [
             ["**EPS**", "Double digits (> 10)", "The profit for each share."],
             ["**Debt to equity**", "Below 1", "Borrowing ÷ shareholders' money: is the company over-borrowed?"],
             ["**Book value**", "Compare with the price", "Net assets per share: roughly what is left if the company closed."],
-            ["**Intrinsic value**", "Above the market price", "The estimated fair value of the business."],
+            ["**Fair value**", "Above the market price", "The earnings-model estimate (about 21.7 × EPS); blank for loss-making stocks."],
         ]),
         ("sub", "Profitability"),
         ("table", ["Number", "Look for", "What it means"], [

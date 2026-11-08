@@ -65,6 +65,15 @@ ZONE_LABEL = {"BUY": "🟢 Accumulate", "HOLD": "⏸ Hold", "REDUCE": "🔻 Redu
 
 _assumption_cache: dict = {"mtime": None, "value": None}
 
+# Bump when the way the fair value is worked out changes, so the new figure is never
+# taken for a "fair value cut" (a SELL) against one from the old method.
+RULES_VERSION = 3
+
+
+def _basis_key(a: dict, methods) -> str:
+    """What a stored fair value was worked out with: rules version, assumptions, methods."""
+    return json.dumps([RULES_VERSION, a, sorted(n for n, _v in methods)], sort_keys=True)
+
 
 def merge_assumptions(saved: dict | None) -> dict:
     """The defaults with any saved values laid over them (bad values are ignored)."""
@@ -104,11 +113,14 @@ def load_assumptions() -> dict:
 # ── Symbols ───────────────────────────────────────────────────────────────────
 
 def canonical(symbol) -> str:
-    """One name per company: "INFY", "INFY.NS" and "INFY.BO" are all "INFY"."""
+    """One name per company: "INFY", "INFY.NS" and "INFY.BO" are all "INFY";
+    a Tokyo code typed without ".T" ("7203") is "7203.T"."""
     s = str(symbol or "").strip().upper()
     for suffix in (".NS", ".BO"):
         if s.endswith(suffix):
             return s[: -len(suffix)]
+    if len(s) == 4 and s.isdigit():
+        return s + ".T"
     return s
 
 
@@ -478,7 +490,9 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
         return d
     if fv:
         prev, changed = _num(state.get("fair_value_prev")), _parse_date(state.get("fv_changed_on"))
-        if prev and changed and (now - changed).days <= A["fv_cut_days"] and fv < prev * (1 - A["fv_cut_sell"]):
+        same_basis = state.get("basis") == _basis_key(a, methods)   # a cut only under the same rules
+        if prev and changed and same_basis and (now - changed).days <= A["fv_cut_days"] \
+                and fv < prev * (1 - A["fv_cut_sell"]):
             d.zone = "SELL"
             d.reasons.append(f"Fair value cut by {(1 - fv / prev)*100:.0f}% on {changed:%Y-%m-%d} "
                              f"(from {m(prev)} to {m(fv)}).")
@@ -597,7 +611,7 @@ def next_state(state: dict | None, d: Decision, assumptions: dict | None = None,
     A change of assumptions or of the methods used doesn't count as a cut."""
     now = now or datetime.now()
     st = dict(state or {})
-    key = json.dumps([d.assumptions, sorted(n for n, _v in d.methods)], sort_keys=True)
+    key = _basis_key(d.assumptions, d.methods)
     fv = d.fair_value
     old = _num(st.get("fair_value"))
     if st.get("basis") != key:

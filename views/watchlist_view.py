@@ -112,6 +112,12 @@ def row_price(row: dict) -> tuple[float | None, str | None]:
     return parse_num(row.get("current_value")), None
 
 
+def _is_tokyo(symbol) -> bool:
+    """A Tokyo listing: "7203.T", or the 4-digit code typed without ".T"."""
+    from model.valuation import country_of
+    return country_of(symbol) == "JP"
+
+
 def _attach_valuation_context(rows: list[dict]) -> list[dict]:
     """Give each row its stored company figures ("_fund") and latest market price
     ("_mkt": price, date) for the shared rules. One query each; background thread only."""
@@ -964,7 +970,7 @@ class WatchlistView(BaseView):
         shown = 0
         for row in self._data:
             sym = row.get("symbol", "")
-            row_cur = "JPY" if str(sym).upper().endswith(".T") else "INR"
+            row_cur = "JPY" if _is_tokyo(sym) else "INR"     # ".T", or a 4-digit code typed without it
             if row_cur != active_cur:
                 continue
             currency_total += 1
@@ -1107,7 +1113,7 @@ class WatchlistView(BaseView):
             return
 
         sym = row.get("symbol", "") or ""
-        cy = "¥" if sym.upper().endswith(".T") else "₹"
+        cy = "¥" if _is_tokyo(sym) else "₹"
         target = parse_num(row.get("target_price")) or 0.0
 
         self._selected_id = row["id"]
@@ -1579,7 +1585,7 @@ class WatchlistView(BaseView):
                 return val >= 1.5
             return None  # P/E needs an industry comparison; others are context only
 
-        cy = "¥" if str(sym).upper().endswith(".T") else "₹"
+        cy = "¥" if _is_tokyo(sym) else "₹"
         gn = graham_number(row)
         values = dict(row)
         values["graham_number"] = f"{cy}{gn:,.2f}" if gn else ""

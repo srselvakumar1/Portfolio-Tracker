@@ -532,8 +532,9 @@ class DashboardView(BaseView):
                   ("avg", "Avg Price", 86, "center"), ("ltp", "Last Price", 86, "center"),
                   ("day", "Day Chg", 80, "w"), ("pnl", "P&L", 96, "w"), ("roi", "ROI %", 72, "w"))
     _INSIGHT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
-                     ("signal", "Signal", 110, "w"), ("current", "Current", 90, "e"),
-                     ("iv", "Fair Value", 90, "e"), ("diff", "Upside %", 80, "w"))
+                     ("signal", "Signal", 110, "center"), ("current", "Current", 90, "center"),
+                     ("day", "Day Chg", 80, "center"), ("iv", "Fair Value", 90, "center"),
+                     ("diff", "Upside %", 80, "w"))
     _ALERT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                    ("target", "Target", 90, "e"), ("current", "Current", 90, "e"),
                    ("pe", "P/E", 56, "e"), ("eps", "EPS", 60, "e"), ("diff", "Upside %", 80, "w"))
@@ -545,8 +546,9 @@ class DashboardView(BaseView):
         "current": "Latest market price",
         "pnl": "Profit (▲) or loss (▼) on the shares you still hold",
         "roi": "Gain or loss as a % of what you paid",
-        "signal": "▲ Accumulate: price is below fair value\n▼ Reduce: price is above fair value",
-        "iv": "Fair value: what the share may really be worth (from the Watchlist valuation)",
+        "signal": "▲ Accumulate: price is below the buy price\n▼ Reduce: price is more than 20% above fair value\n"
+                  "⛔ Sell: bad news (a loss, a big fair-value cut, quality newly failed)",
+        "iv": "Fair value from the shared valuation rules (— when the company is losing money)",
         "target": "Your target price from the Watchlist",
         "pe": "Price ÷ earnings per share (lower can mean cheaper)",
         "eps": "Earnings per share over the last year",
@@ -1622,13 +1624,16 @@ class DashboardView(BaseView):
             i = len(rows)
             stripe = "evenrow" if i % 2 == 0 else "oddrow"
             if not isinstance(item, dict):  # older plain-text insights
-                rows.append(((f"{i + 1}", str(item), "-", "-", "-", "-"), (stripe,)))
+                rows.append(((f"{i + 1}", str(item), "-", "-", "-", "-", "-"), (stripe,)))
                 continue
             signal = str(item.get("signal", "") or "").strip().upper()
             iv = _num(item.get("iv"))
             cp = _num(item.get("current_price"))
+            prev = _num(item.get("previous_close"))
             currency = str(item.get("currency", "INR") or "INR").upper()
-            diff_pct = ((iv - cp) / cp * 100.0) if cp else 0.0
+            # No fair value (a loss-making company: SELL): show "—", not ₹0.00 and ▼ 100%
+            diff_pct = ((iv - cp) / cp * 100.0) if cp > 0 and iv > 0 else None
+            day_pct = ((cp - prev) / prev * 100.0) if cp > 0 and prev > 0 else None
             if signal == "ACCUMULATE":
                 sig_text, tags = "▲ Accumulate", (stripe, "gain")
             elif signal == "REDUCE":
@@ -1639,7 +1644,9 @@ class DashboardView(BaseView):
                 sig_text, tags = signal.title() or "-", (stripe,)
             rows.append((
                 (f"{i + 1}", str(item.get("symbol", "")).strip() or "—", sig_text,
-                 format_money(cp, currency), format_money(iv, currency), _pct_cell(diff_pct)),
+                 format_money(cp, currency), _day_cell(day_pct) if day_pct is not None else "—",
+                 format_money(iv, currency) if iv > 0 else "—",
+                 _pct_cell(diff_pct) if diff_pct is not None else "—"),
                 tags,
             ))
         self._fill_table(frame, rows)
@@ -3004,7 +3011,7 @@ class DashboardView(BaseView):
     def _copy_insights(self):
         try:
             data = self._current_insights or []
-            lines = ["Signal\tSymbol\tFair Value\tCurrent\tUpside %"]
+            lines = ["Signal\tSymbol\tFair Value\tCurrent\tDay Chg\tUpside %"]
             for item in data:
                 if not isinstance(item, dict):
                     continue
@@ -3013,8 +3020,11 @@ class DashboardView(BaseView):
                 iv = _num(item.get("iv"))
                 cp = _num(item.get("current_price"))
                 cur = str(item.get("currency", "INR") or "INR").upper()
-                diff = ((iv - cp) / cp * 100.0) if cp else 0.0
-                lines.append(f"{signal}\t{sym}\t{format_money(iv, cur)}\t{format_money(cp, cur)}\t{diff:+.1f}%")
+                prev = _num(item.get("previous_close"))
+                fv_text = format_money(iv, cur) if iv > 0 else "—"
+                day_text = f"{(cp - prev) / prev * 100.0:+.2f}%" if cp > 0 and prev > 0 else "—"
+                diff_text = f"{(iv - cp) / cp * 100.0:+.1f}%" if cp > 0 and iv > 0 else "—"
+                lines.append(f"{signal}\t{sym}\t{fv_text}\t{format_money(cp, cur)}\t{day_text}\t{diff_text}")
             if len(lines) == 1:
                 show_toast(self, "No insights to copy.", type="info")
                 return

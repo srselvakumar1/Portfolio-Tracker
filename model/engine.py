@@ -590,7 +590,10 @@ def fetch_and_update_market_data(symbols: list):
         pass
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    yf_symbols = [s + ".NS" if not ('.' in s or '=' in s) else s for s in symbols]
+    # Yahoo's symbol: as typed when it has a suffix; a 4-digit code is a Tokyo listing
+    # ("7203" → "7203.T"); anything else is NSE ("TCS" → "TCS.NS")
+    yf_symbols = [s if ('.' in s or '=' in s) else s + ".T" if (len(s) == 4 and s.isdigit()) else s + ".NS"
+                  for s in symbols]
 
     pairs = list(zip(yf_symbols, symbols))
     try:   # yearly company figures are fetched at most once a week per company
@@ -1317,7 +1320,8 @@ def get_actionable_insights(limit: int = 10, currency_filter: str = "All") -> li
     with db_session() as conn:
         cursor = conn.cursor()
         query = '''
-            SELECT DISTINCT h.symbol, a.action_signal, a.intrinsic_value, m.current_price, h.currency
+            SELECT DISTINCT h.symbol, a.action_signal, a.intrinsic_value, m.current_price, h.currency,
+                   m.previous_close
             FROM holdings h JOIN assets a ON h.symbol = a.symbol
             LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE h.qty > 0 AND a.action_signal IN ('ACCUMULATE', 'REDUCE', 'SELL')
@@ -1339,7 +1343,8 @@ def get_actionable_insights(limit: int = 10, currency_filter: str = "All") -> li
                 "signal": r[1],
                 "iv": r[2],
                 "current_price": r[3],
-                "currency": r[4]
+                "currency": r[4],
+                "previous_close": r[5],     # for the Day Chg column
             }
             for r in cursor.fetchall()
         ]

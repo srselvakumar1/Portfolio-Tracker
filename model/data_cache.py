@@ -76,6 +76,7 @@ class DataCache:
                     h.earliest_date,
                     h.total_fees,
                     a.action_signal,
+                    COALESCE(a.intrinsic_value, 0) AS intrinsic_value,   -- fair value (model/valuation.py)
                     COALESCE(m.current_price, 0) as market_price,
                     COALESCE(m.previous_close, 0) as previous_close,
                     m.pe_ratio,
@@ -111,7 +112,8 @@ class DataCache:
 
         if not holdings_df.empty:
             _numeric(holdings_df, ["qty", "avg_price", "realized_pnl", "running_pnl", "xirr", "cagr",
-                                   "total_fees", "market_price", "previous_close", "pe_ratio", "current_value"])
+                                   "total_fees", "market_price", "previous_close", "pe_ratio", "current_value",
+                                   "intrinsic_value"])
 
         if not trades_df.empty:
             _numeric(trades_df, ["qty", "price", "fee", "run_qty", "avg_cost", "running_pnl", "trade_pnl"])

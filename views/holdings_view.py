@@ -64,12 +64,14 @@ COLUMNS = [
     ("total",    "Total P&L",      "▼ ₹123,456",       "w"),
     ("fees",     "Fees",           "₹12,345.67",       "center"),
     ("pe",       "P/E",            "106.68",           "center"),
+    ("fair",     "Fair Value",     "₹12,345.67",       "center"),
+    ("upside",   "Upside %",       "▼ 12.3%",          "w"),
     ("signal",   "Signal",         "➕ Accumulate",    "center"),
 ]
 COLUMN_IDS = [c[0] for c in COLUMNS]
 HEADINGS = {c[0]: c[1] for c in COLUMNS}
 ALWAYS_SHOWN = ("num", "symbol")
-GAIN_LOSS_COLS = ("day", "unreal", "pnl_pct", "xirr", "cagr", "realised", "total")   # green / red text
+GAIN_LOSS_COLS = ("day", "unreal", "pnl_pct", "xirr", "cagr", "realised", "total", "upside")   # green / red text
 # Hidden until the user turns them on, so the table fits a normal window.
 DEFAULT_HIDDEN = ["day", "xirr", "cagr", "realised", "total", "fees", "pe"]
 
@@ -90,6 +92,8 @@ COLUMN_HELP = {
     "total":    "Total P&L (realised + unrealised)",
     "fees":     "Fees (all brokerage and charges)",
     "pe":       "P/E (price ÷ earnings per share)",
+    "fair":     "Fair Value (from the shared valuation rules; blank for losses and funds)",
+    "upside":   "Upside % (fair value ÷ price − 1; negative when the price is above it)",
     "signal":   "Signal (model: price vs fair value)",
 }
 
@@ -258,6 +262,10 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
         broker = str(getattr(row, "broker", "") or "")
         stock_name = _clean_name(getattr(row, "stock_name", ""))
         signal = getattr(row, "action_signal", None)
+        # Fair value stored by the last price refresh (model/valuation.py), and the upside
+        # to it at this price: the same figures the signal was decided on
+        fair = _num(getattr(row, "intrinsic_value", 0))
+        upside = (fair / mkt - 1.0) * 100.0 if fair > 0 and mkt > 0 else None
 
         held = qty > 0
         unreal = (mkt - avg) * qty if held and mkt > 0 else None
@@ -295,6 +303,8 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
             _pnl_text(running, cur),
             format_money(fees, cur),
             f"{pe:.2f}" if pe > 0 else "—",
+            format_money(fair, cur) if fair > 0 else "—",
+            _pct_text(upside, 1) if upside is not None else "—",
             _signal_text(signal),
         )
         meta = {

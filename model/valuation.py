@@ -16,7 +16,8 @@ The rules are written up in VALUATION_REVIEW.md (sections 6 and 7). In short:
   positive for 3 years; Medium for one method or agreement within 50%; Low otherwise.
 * Zones: BUY below fair value × (1 − margin of safety), REDUCE above fair value
   × 1.2, HOLD in between. SELL only on bad news. NONE ("no signal") when the
-  data is missing, old or the methods disagree.
+  data is missing, old or the methods disagree. Next to a boundary the zone from
+  the last refresh stays until the price is 3% past it (no flip-flopping).
 
 The assumptions (required return, growth limits, margins) are settings. These
 are choices, not facts, and every decision carries the ones it used.
@@ -46,6 +47,7 @@ DEFAULT_ASSUMPTIONS: dict = {
     "quality_fail_days": 90,     # SELL for this long after the quality check newly fails
     "price_max_age_days": 5,
     "fundamentals_max_age_days": 120,
+    "hysteresis": 0.03,          # a zone changes only when the price is 3% past the boundary
     "terminal_pe_cap": 30.0,
     "history_pe_cap": 60.0,
     "default_roe": 0.15,         # used when Yahoo has no ROE (shown as an assumption)
@@ -511,32 +513,54 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
 
     # ── Zones ──
     pct = lambda level: (level / price - 1.0) * 100.0
-    if price <= d.buy_below:
+    zone = "BUY" if price <= d.buy_below else "REDUCE" if price > d.reduce_above else "HOLD"
+    # No flip-flopping: next to a boundary, the zone from the last refresh stays until
+    # the price is more than `hysteresis` (3%) past it. All pages read the same state.
+    band, prev = A.get("hysteresis", 0.0), state.get("zone")
+    kept = None
+    if band > 0 and prev in ("BUY", "HOLD", "REDUCE") and prev != zone:
+        near_buy = d.buy_below * (1.0 - band) < price <= d.buy_below * (1.0 + band)
+        near_reduce = d.reduce_above * (1.0 - band) < price <= d.reduce_above * (1.0 + band)
+        if {prev, zone} == {"BUY", "HOLD"} and near_buy and (prev != "BUY" or d.quality_pass):
+            kept, zone = f"the buy price {m(d.buy_below)}", prev
+        elif {prev, zone} == {"HOLD", "REDUCE"} and near_reduce:
+            kept, zone = f"the reduce level {m(d.reduce_above)}", prev
+    if kept:
+        d.reasons.append(f"Kept {prev}: the price {m(price)} is within {band*100:.0f}% of {kept}, "
+                         f"so the signal doesn't flip back and forth.")
+    if zone == "BUY":
         if d.quality_pass:
             d.zone = "BUY"
             d.strong = price <= fv * (1.0 - margin - a["strong_extra"])
-            d.reasons.append(f"Price {m(price)} is at or below the buy price {m(d.buy_below)} "
-                             f"({margin*100:.0f}% below fair value, {d.confidence} confidence).")
-            d.changes.append(f"Stops being a BUY above {m(d.buy_below)} ({pct(d.buy_below):+.1f}%).")
+            if not kept:
+                d.reasons.append(f"Price {m(price)} is at or below the buy price {m(d.buy_below)} "
+                                 f"({margin*100:.0f}% below fair value, {d.confidence} confidence).")
+            d.changes.append(f"Stops being a BUY above {m(d.buy_below * (1.0 + band))} "
+                             f"({pct(d.buy_below * (1.0 + band)):+.1f}%).")
         else:
             d.zone = "HOLD"
             why = "the quality check failed" if d.quality_pass is False else "there isn't enough data for the quality check"
             d.reasons.append(f"Price is below the buy price {m(d.buy_below)}, but {why}, so not a BUY.")
             d.changes.append("Becomes a BUY when the quality check passes.")
-    elif price > d.reduce_above:
+    elif zone == "REDUCE":
         d.zone = "REDUCE"
-        d.reasons.append(f"Price {m(price)} is more than {a['reduce_above']*100:.0f}% above fair value "
-                         f"({m(d.reduce_above)}).")
-        d.changes.append(f"Back to HOLD at or below {m(d.reduce_above)} ({pct(d.reduce_above):+.1f}%).")
+        if not kept:
+            d.reasons.append(f"Price {m(price)} is more than {a['reduce_above']*100:.0f}% above fair value "
+                             f"({m(d.reduce_above)}).")
+        back = d.reduce_above * (1.0 - band)
+        d.changes.append(f"Back to HOLD at or below {m(back)} ({pct(back):+.1f}%).")
     else:
         d.zone = "HOLD"
-        d.reasons.append(f"Price {m(price)} is between the buy price {m(d.buy_below)} and the reduce level "
-                         f"{m(d.reduce_above)}.")
+        if not kept:
+            d.reasons.append(f"Price {m(price)} is between the buy price {m(d.buy_below)} and the reduce level "
+                             f"{m(d.reduce_above)}.")
+        to_buy = d.buy_below * (1.0 - band) if prev == "HOLD" else d.buy_below
+        to_reduce = d.reduce_above * (1.0 + band) if prev == "HOLD" else d.reduce_above
         if d.quality_pass:
-            d.changes.append(f"Becomes a BUY at or below {m(d.buy_below)} ({pct(d.buy_below):+.1f}%).")
+            d.changes.append(f"Becomes a BUY at or below {m(to_buy)} ({pct(to_buy):+.1f}%).")
         else:
-            d.changes.append(f"A BUY needs the price at or below {m(d.buy_below)} and the quality check to pass.")
-        d.changes.append(f"Becomes REDUCE above {m(d.reduce_above)} ({pct(d.reduce_above):+.1f}%).")
+            d.changes.append(f"A BUY needs the price at or below {m(to_buy)} and the quality check to pass.")
+        d.changes.append(f"Becomes REDUCE above {m(to_reduce)} ({pct(to_reduce):+.1f}%).")
     d.changes.append(sell_rules)
     d.changes.append(stale_rule)
     return d
@@ -565,6 +589,8 @@ def next_state(state: dict | None, d: Decision, assumptions: dict | None = None,
         st["quality_failed_on"] = None
     if d.quality_pass is not None:
         st["quality_pass"] = d.quality_pass
+    if d.zone != st.get("zone"):        # for the no-flip-flop band (and, later, "since" dates)
+        st["zone"], st["zone_since"] = d.zone, now.strftime("%Y-%m-%d")
     return st
 
 

@@ -304,7 +304,9 @@ SECTIONS = [
             "free cash flow positive, debt to equity below 1; at most one may fail. Banks and credit companies: "
             "ROE at least 12% (Japan 7%) and EPS positive for 3 years. A failed check means no BUY.",
             "**Target** = the fair value, over 2–3 years. **Upside %** = fair value ÷ price − 1; negative when "
-            "the price is above the fair value.",
+            "the price is above the fair value. Holdings shows both as columns.",
+            "**No flip-flopping**: next to the buy price or the reduce level, a signal changes only once the price "
+            "is **3%** past it.",
             "The Watchlist's older **Quality scorecard** (P/E, ROE, margins, RSI…) is still shown in its pop-up, "
             "as information only.",
             "Yearly figures are fetched at most once a week per company; latest figures with every price refresh.",

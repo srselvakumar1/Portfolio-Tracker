@@ -333,9 +333,14 @@ class TradeHistoryView(BaseView):
                                         height=18, selectmode="extended")
         HeadingTips(self.trade_table, _COLUMN_TIPS)
         for col, w in COLUMNS:
-            # numbers on the right so their digits line up; row numbers centred; text and
-            # values with a ▲/▼ indicator on the left
-            anchor = "center" if col == "#" else ("w" if col in ("Date", "Symbol", "Type", "Trade P&L", "Running PnL") else "e")
+            # centred: row numbers, side, type, qty, prices and fees; on the left: text and
+            # values with a ▲/▼ indicator; other numbers on the right so their digits line up
+            if col in ("#", "Buy/Sell", "Type", "Qty", "Price", "AvgCost", "Fees", "Cum. Fees"):
+                anchor = "center"
+            elif col in ("Date", "Symbol", "Trade P&L", "Running PnL"):
+                anchor = "w"
+            else:
+                anchor = "e"
             self.trade_table.heading(col, anchor="center")
             if col in SORTABLE:
                 self.trade_table.heading(col, command=lambda c=col: treeview_sort_column(self.trade_table, c, False))

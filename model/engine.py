@@ -772,7 +772,10 @@ def rebuild_holdings(*, sync_trade_calcs: bool = True):
                         # CAGR
                         try:
                             start_dt = datetime.strptime(data['earliest_date'], '%Y-%m-%d')
-                            years = (now - start_dt).days / 365.25
+                            # Under a year, show the plain return instead of a yearly rate: a few
+                            # days' gain raised to the power 365/days gives absurd numbers (e.g. a
+                            # fund imported with today's date but an old purchase price)
+                            years = max((now - start_dt).days / 365.25, 1.0)
                             if years > 0:
                                 invested = data['cost']
                                 total_return_val = terminal_value + data['realized_pnl']
@@ -1243,7 +1246,8 @@ def get_top_worst_performers(limit: int = 3, currency_filter: str = "All") -> di
         cursor = conn.cursor()
         query = '''
             SELECT h.symbol, SUM(h.qty), SUM(h.qty * h.avg_price), SUM(h.realized_pnl),
-                   MAX(COALESCE(NULLIF(m.current_price, 0.0), h.avg_price))
+                   MAX(COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)),
+                   MAX(COALESCE(m.current_price, 0.0)), MAX(COALESCE(m.previous_close, 0.0))
             FROM holdings h LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE h.qty > 0
         '''
@@ -1260,13 +1264,16 @@ def get_top_worst_performers(limit: int = 3, currency_filter: str = "All") -> di
         cost, total_pnl = row[2], (row[1] * row[4] - row[2]) + row[3]
         qty, cp = row[1], row[4]
         avg_price = cost / qty if qty > 0 else 0
+        live, prev = row[5] or 0.0, row[6] or 0.0
         performers.append({
             "symbol": row[0],
             "pnl": total_pnl,
             "pnl_pct": (total_pnl / cost * 100) if cost > 0 else 0,
             "avg_price": avg_price,
             "current_price": cp,
-            "invested": cost
+            "invested": cost,
+            # today's price change; None when there is no live price or previous close
+            "day_pct": (live / prev - 1) * 100 if live > 0 and prev > 0 else None,
         })
 
     performers.sort(key=lambda x: x["pnl"], reverse=True)

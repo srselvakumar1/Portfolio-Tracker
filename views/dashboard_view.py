@@ -73,10 +73,11 @@ _TABLE_ROWS = 10           # rows visible in each dashboard table
 _COMPACT_BELOW = 750       # page height (px) under which the spacing tightens
 
 
-def _roi_bar(v: float, biggest: float) -> str:
-    """A 4-block bar showing how big this ROI is next to the table's biggest."""
-    n = 0 if not v else max(1, min(4, round(4 * abs(v) / biggest)))
-    return "▰" * n + "▱" * (4 - n)
+def _day_cell(v: float) -> str:
+    """Today's price change: ▲ 0.37% / ▼ 1.20% / 0.00% (two decimals, as in Holdings)."""
+    if abs(v) < 0.005:
+        return "0.00%"
+    return f"{'▲' if v > 0 else '▼'} {abs(v):.2f}%"
 
 
 def _pct_cell(v: float) -> str:
@@ -528,8 +529,8 @@ class DashboardView(BaseView):
 
     # Table columns: (id, heading, width, anchor)
     _PERF_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
-                  ("avg", "Avg Price", 86, "e"), ("ltp", "Last Price", 86, "e"),
-                  ("pnl", "P&L", 96, "w"), ("roi", "ROI %", 72, "w"), ("bar", "", 46, "w"))
+                  ("avg", "Avg Price", 86, "center"), ("ltp", "Last Price", 86, "center"),
+                  ("day", "Day Chg", 80, "w"), ("pnl", "P&L", 96, "w"), ("roi", "ROI %", 72, "w"))
     _INSIGHT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                      ("signal", "Signal", 110, "w"), ("current", "Current", 90, "e"),
                      ("iv", "Fair Value", 90, "e"), ("diff", "Upside %", 80, "w"))
@@ -540,6 +541,7 @@ class DashboardView(BaseView):
     _COL_TIPS = {
         "avg": "Average price you paid per share",
         "ltp": "Latest market price",
+        "day": "Today's price change vs the previous close",
         "current": "Latest market price",
         "pnl": "Profit (▲) or loss (▼) on the shares you still hold",
         "roi": "Gain or loss as a % of what you paid",
@@ -1599,16 +1601,17 @@ class DashboardView(BaseView):
         cur = self.currency_var.get()
         rows = []
         items = [it for it in (data or [])[:_TABLE_ROWS] if isinstance(it, dict)]
-        biggest = max((abs(_num(it.get("pnl_pct"))) for it in items), default=0) or 1
         for item in items:
             pnl = _num(item.get("pnl"))
+            day = item.get("day_pct")
             i = len(rows)
             rows.append((
                 (f"{i + 1}", str(item.get("symbol", "")),
                  _compact_money(_num(item.get("avg_price")), cur),
                  _compact_money(_num(item.get("current_price")), cur),
+                 _day_cell(_num(day)) if day is not None else "—",
                  f"{'▲' if pnl >= 0 else '▼'} {_compact_money(abs(pnl), cur)}",
-                 _pct_cell(_num(item.get("pnl_pct"))), _roi_bar(_num(item.get("pnl_pct")), biggest)),
+                 _pct_cell(_num(item.get("pnl_pct")))),
                 ("evenrow" if i % 2 == 0 else "oddrow", "gain" if pnl >= 0 else "loss"),
             ))
         self._fill_table(frame, rows)

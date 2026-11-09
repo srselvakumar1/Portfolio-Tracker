@@ -534,10 +534,10 @@ class DashboardView(BaseView):
     _INSIGHT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                      ("signal", "Signal", 110, "center"), ("current", "Current", 90, "center"),
                      ("day", "Day Chg", 80, "center"), ("iv", "Fair Value", 90, "center"),
-                     ("diff", "Upside %", 80, "w"))
+                     ("diff", "Value Gap %", 100, "w"))
     _ALERT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                    ("target", "Target", 90, "e"), ("current", "Current", 90, "e"),
-                   ("pe", "P/E", 56, "e"), ("eps", "EPS", 60, "e"), ("diff", "Upside %", 80, "w"))
+                   ("pe", "P/E", 56, "e"), ("eps", "EPS", 60, "e"), ("diff", "To Target", 90, "w"))
     # What each column means, shown when the pointer rests on a heading
     _COL_TIPS = {
         "avg": "Average price you paid per share",
@@ -547,7 +547,7 @@ class DashboardView(BaseView):
         "pnl": "Profit (▲) or loss (▼) on the shares you still hold",
         "roi": "Gain or loss as a % of what you paid",
         "signal": "▲ Accumulate: price is below the buy price\n▼ Reduce: price is more than 20% above fair value\n"
-                  "⛔ Sell: bad news (a loss, a big fair-value cut, quality newly failed)",
+                  "🚨 Sell: bad news (a loss, a big fair-value cut, quality newly failed)",
         "iv": "Fair value from the shared valuation rules (— when the company is losing money)",
         "target": "Your target price from the Watchlist",
         "pe": "Price ÷ earnings per share (lower can mean cheaper)",
@@ -1639,7 +1639,7 @@ class DashboardView(BaseView):
             elif signal == "REDUCE":
                 sig_text, tags = "▼ Reduce", (stripe, "loss")
             elif signal == "SELL":
-                sig_text, tags = "⛔ Sell", (stripe, "loss")
+                sig_text, tags = "🚨 Sell", (stripe, "loss")
             else:
                 sig_text, tags = signal.title() or "-", (stripe,)
             rows.append((
@@ -2253,7 +2253,7 @@ class DashboardView(BaseView):
             sig_color, sig_bg = S.WARNING, S.WARNING_PALE
 
         shown = decision.label if decision is not None else signal
-        chip = f"{shown} (Upside: {diff_pct:+.1f}%)" if diff_pct is not None else shown
+        chip = f"{shown} (Value gap: {diff_pct:+.1f}%)" if diff_pct is not None else shown
         modal.add_chip("⚡", chip, bg_color=sig_bg, fg_color=sig_color)
 
         # Grid layout for cards (2 columns, 2 rows)
@@ -2289,7 +2289,7 @@ class DashboardView(BaseView):
         _kv(c1, "Fair Value:", format_money(iv, currency) if iv > 0 else "N/A", font=S.FONT_SUBHEADING)
         _kv(c1, "52W High:", format_money(high52, currency))
         _kv(c1, "52W Low:", format_money(low52, currency))
-        _kv(c1, "Upside:", f"{diff_pct:+.2f}%" if diff_pct is not None else "N/A", sig_color,
+        _kv(c1, "Value gap:", f"{diff_pct:+.2f}%" if diff_pct is not None else "N/A", sig_color,
             font=S.FONT_BODY_BOLD)
 
         # Card 2: Extended Fundamentals
@@ -3011,7 +3011,7 @@ class DashboardView(BaseView):
     def _copy_insights(self):
         try:
             data = self._current_insights or []
-            lines = ["Signal\tSymbol\tFair Value\tCurrent\tDay Chg\tUpside %"]
+            lines = ["Signal\tSymbol\tFair Value\tCurrent\tDay Chg\tValue Gap %"]
             for item in data:
                 if not isinstance(item, dict):
                     continue

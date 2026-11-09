@@ -288,13 +288,14 @@ SECTIONS = [
         ("table", ["Confidence", "When"], [
             ["**High**", "Two or more methods agree within 25%, and EPS was positive in each of the last 3 years"],
             ["**Medium**", "One method, or methods agree within 50%"],
-            ["**Low**", "Methods disagree by more than 50%: BUY only below the lower one's buy price, "
-                        "REDUCE only above the higher one's reduce level, otherwise HOLD"],
+            ["**Low**", "Methods disagree by more than 50%: the buy price is at most the lowest method, "
+                        "the reduce level at least the highest (practical levels)"],
         ]),
         ("sub", "Signals"),
         ("table", ["Signal", "When", "Holdings / Watchlist"], [
-            ["**BUY**", "Price at or below the buy price: fair value less **25%** (High confidence) or **35%** "
-                        "(Medium), and the quality check passes", "Accumulate / Accumulate or Strong Buy"],
+            ["**BUY**", "Price at or below the practical buy price: fair value less **25%** (High confidence) or "
+                        "**35%** (Medium), and the quality check passes. **Strong Buy** at or below the strict buy "
+                        "price (or a further 15% below when the methods agree)", "Accumulate / Accumulate or Strong Buy"],
             ["**HOLD**", "Between the buy price and the reduce level", "Hold / Wait / Watch"],
             ["**REDUCE**", "Price more than **20%** above fair value", "Reduce / Avoid"],
             ["**SELL**", "Bad news only: 12-month EPS at or below zero, fair value cut by more than 25% in the "
@@ -306,10 +307,14 @@ SECTIONS = [
             "**Quality check** (pass/fail): ROE at least 12% (Japan 8%), EPS positive in each of the last 3 years, "
             "free cash flow positive, debt to equity below 1; at most one may fail. Banks and credit companies: "
             "ROE at least 12% (Japan 7%) and EPS positive for 3 years. A failed check means no BUY.",
-            "**Target** = the fair value, over 2–3 years. **Upside %** = fair value ÷ price − 1; negative when "
+            "**Target** = the fair value, over 2–3 years. **Value Gap %** = fair value ÷ price − 1; negative when "
             "the price is above the fair value. Holdings shows both as columns.",
             "**No flip-flopping**: next to the buy price or the reduce level, a signal changes only once the price "
             "is **3%** past it.",
+            "**Practical and Strict prices**: the signal uses the practical buy price (fair value less the cushion, "
+            "and no higher than the lowest method). The strict buy price takes the cushion off the lowest method "
+            "itself, so it is lower; it is shown for reference on the Watchlist and the Valuation page. When the "
+            "methods agree, both are the same. Reduce levels work the same way.",
             "The Watchlist's older **Quality scorecard** (P/E, ROE, margins, RSI…) is still shown in its pop-up, "
             "as information only.",
             "Yearly figures are fetched at most once a week per company; latest figures with every price refresh.",

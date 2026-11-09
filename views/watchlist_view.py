@@ -118,9 +118,11 @@ def _is_tokyo(symbol) -> bool:
     return country_of(symbol) == "JP"
 
 
-def _attach_valuation_context(rows: list[dict]) -> list[dict]:
+def _attach_valuation_context(rows: list[dict], previous: dict | None = None) -> list[dict]:
     """Give each row its stored company figures ("_fund") and latest market price
-    ("_mkt": price, date) for the shared rules. One query each; background thread only."""
+    ("_mkt": price, date) for the shared rules. One query each; background thread only.
+    If they can't be read, rows keep the figures they had (`previous`: {id: (fund, mkt)}),
+    so a passing database problem doesn't turn every signal into No Data."""
     try:
         from model import fundamentals
         from model.valuation import canonical
@@ -132,6 +134,10 @@ def _attach_valuation_context(rows: list[dict]) -> list[dict]:
             r["_mkt"] = prices.get(r.get("symbol"))
     except Exception:
         log.warning("Couldn't load the company figures for the watchlist", exc_info=True)
+        for r in rows:
+            old = (previous or {}).get(r.get("id"))
+            if old:
+                r["_fund"], r["_mkt"] = old
     return rows
 
 
@@ -167,6 +173,36 @@ def _week52(row: dict) -> tuple[float, float] | None:
     if lo_f is None or hi_f is None:
         return None
     return lo_f, hi_f
+
+
+# The Watchlist scorecard's checks: name → (benchmark, column whose value it is judged on)
+WL_SCORE_INFO = {
+    "Earnings": ("EPS > 0", "eps"),
+    "P/E": ("0 – 30", "pe_ratio"),
+    "PEG Ratio": ("< 2", "peg_ratio"),
+    "P/B Ratio": ("< 3", "pb_ratio"),
+    "Debt/Equity": ("< 1", "debt_to_equity"),
+    "Current Ratio": ("≥ 1.5", "current_ratio"),
+    "ROE": ("≥ 12%", "roe"),
+    "ROCE": ("≥ 12%", "roce"),
+    "OPM": ("≥ 10%", "opm"),
+    "Net Profit Margin": ("≥ 8%", "net_profit_margin"),
+    "Free Cash Flow": ("> 0", "free_cash_flow"),
+    "EBITDA Margin": ("≥ 15%", "ebitda_margin"),
+    "Sales Gr": ("≥ 10%", "sales_growth"),
+    "Profit Gr": ("≥ 10%", "profit_growth"),
+    "3Y Rev CAGR": ("≥ 10%", "revenue_cagr_3y"),
+    "3Y Profit CAGR": ("≥ 10%", "profit_cagr_3y"),
+    "Latest Qtr Op": ("> 0", "qoq_op_profit"),
+    "Graham Number": ("above the price", "graham"),
+    "Dividend": ("≥ 1.2%", "dividend_yield"),
+    "Analyst Target": ("price ≥ 10% below it", "analyst_target"),
+    "52W Range": ("in the lowest 25%", "week52_range"),
+    "Promoters": ("≥ 40%", "promoter_holding"),
+    "RSI": ("30 – 65", "rsi"),
+    "Beta": ("< 1.5", "beta"),
+    "MACD": ("> 0", "macd"),
+}
 
 
 def quality_scorecard(row: dict) -> tuple[int, int, list[str], list[str]]:
@@ -275,7 +311,16 @@ def quality_scorecard(row: dict) -> tuple[int, int, list[str], list[str]]:
     check("Beta", "beta", lambda v: v < 1.5, "Lower volatility vs market", "High beta — volatile stock")
     check("MACD", "macd", lambda v: v > 0, "Short-term momentum is bullish", "Short-term momentum is bearish")
 
-    return score, max_score, reasons_pass, reasons_fail
+    # each line with the value it was judged on and its benchmark (ui/decision_panel.py)
+    from ui.decision_panel import with_benchmarks
+
+    def shown(key):
+        if key == "graham":
+            return f"{gn:,.0f}" if gn else ""
+        v = row.get(key)
+        return "" if v in (None, "") else str(v)
+    return (score, max_score, with_benchmarks(reasons_pass, WL_SCORE_INFO, shown),
+            with_benchmarks(reasons_fail, WL_SCORE_INFO, shown))
 
 
 def compute_signal(row: dict, decision=None) -> tuple[str, str, str]:
@@ -565,6 +610,9 @@ def _alive(widget) -> bool:
 class WatchlistView(BaseView):
     """Watchlist view with inline CRUD form and a live Treeview table."""
 
+    # The hint in the form's title line when no row is selected
+    FORM_HINT = "Click a row to edit it  ·  double-click for the full analysis"
+
     # Metric columns the form keeps values for (Edit Metrics dialog / Auto-Fill).
     # stock_name has no field; it is kept so Auto-Fill can store the company name.
     BASE_METRIC_KEYS = [
@@ -640,13 +688,19 @@ class WatchlistView(BaseView):
         form_inner = tk.Frame(form_card.content, bg=ModernStyle.BG_SECONDARY)
         form_inner.pack(fill="x", padx=16, pady=(8, 10))
 
-        # Row 1: Symbol (+ Add) | Notes | Tags | My Target
+        # Title line: what the card is for, what you are editing, and the less-used actions (small)
+        head_row = tk.Frame(form_inner, bg=ModernStyle.BG_SECONDARY)
+        head_row.pack(fill="x", pady=(0, 6))
+        tk.Label(head_row, text="Add or edit a stock", bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY,
+                 font=ModernStyle.FONT_HEADING).pack(side="left")
+
+        # Row: Symbol | Tags | My Target, then + Add / Save / Clear in line with the boxes
         fields_row = tk.Frame(form_inner, bg=ModernStyle.BG_SECONDARY)
         fields_row.pack(fill="x")
 
         def _field(parent, label: str, var: tk.StringVar, width: int = 14, expand=False, placeholder: str = "") -> ModernEntry:
             col = tk.Frame(parent, bg=ModernStyle.BG_SECONDARY)
-            col.pack(side="left", padx=(0, 16), fill="x" if expand else None, expand=expand)
+            col.pack(side="left", padx=(0, 12), fill="x" if expand else None, expand=expand)
 
             lbl_frame = tk.Frame(col, bg=ModernStyle.BG_SECONDARY)
             lbl_frame.pack(anchor="w", pady=(0, 4))
@@ -666,7 +720,7 @@ class WatchlistView(BaseView):
                     fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_SMALL_BOLD
                 ).pack(side="left")
 
-            box = RoundedBox(col, padx=5, pady=5)
+            box = RoundedBox(col, padx=5, pady=2)
             inner = tk.Frame(box, bg=ModernStyle.ENTRY_BG)
             inner.pack(fill="both", expand=True)
 
@@ -681,7 +735,28 @@ class WatchlistView(BaseView):
                 font=ModernStyle.FONT_INPUT,
                 width=width
             )
-            e.pack(side="left", fill="x", expand=True, padx=(10, 8), pady=3, ipady=4)
+            e.pack(side="left", fill="x", expand=True, padx=(10, 4), pady=1, ipady=2)
+
+            # A ✕ inside the box clears it; shown only while there is text
+            clear_x = tk.Label(inner, text="✕", bg=ModernStyle.ENTRY_BG, fg=ModernStyle.TEXT_TERTIARY,
+                               font=ModernStyle.FONT_SMALL, cursor="hand2")
+
+            def _clear_field(_evt=None):
+                var.set("")
+                e.focus_set()
+
+            def _show_x(*_a):
+                if var.get():
+                    if not clear_x.winfo_ismapped():
+                        clear_x.pack(side="right", padx=(0, 8), before=e)
+                else:
+                    clear_x.pack_forget()
+
+            clear_x.bind("<Button-1>", _clear_field)
+            clear_x.clear = _clear_field          # the same action, callable directly
+            clear_x.bind("<Enter>", lambda _e: clear_x.config(fg=ModernStyle.ERROR))
+            clear_x.bind("<Leave>", lambda _e: clear_x.config(fg=ModernStyle.TEXT_TERTIARY))
+            var.trace_add("write", _show_x)
 
             # Enhanced hover & focus border effects
             is_focused = [False]
@@ -705,7 +780,7 @@ class WatchlistView(BaseView):
 
             e.bind("<FocusIn>", _on_focus_in, add="+")
             e.bind("<FocusOut>", _on_focus_out, add="+")
-            for w in (box, inner, e):
+            for w in (box, inner, e, clear_x):
                 w.bind("<Enter>", _on_hover_in, add="+")
                 w.bind("<Leave>", _on_hover_out, add="+")
 
@@ -722,44 +797,37 @@ class WatchlistView(BaseView):
         self._metrics_keys = list(self.BASE_METRIC_KEYS)
         self._metrics_vars = {k: tk.StringVar() for k in self._metrics_keys}
 
-        self._e_symbol = _field(fields_row, "Symbol *", self._v_symbol, width=12, placeholder="e.g. INFY")
+        # No Notes box: notes already saved stay in the database (a save leaves them as they are)
+        self._e_symbol = _field(fields_row, "Symbol *", self._v_symbol, width=16, placeholder="e.g. INFY, 7203")
+        self._e_tags = _field(fields_row, "Tags", self._v_tags, width=15, placeholder="e.g. Bluechip, Tech")
+        self._e_target = _field(fields_row, "My Target Price", self._v_target, width=10, placeholder="₹ Target")
+        self._entries = (self._e_symbol, self._e_tags, self._e_target)
 
-        # Add-as-new button next to the symbol
-        add_btn = action_button(fields_row, "+ Add", self._on_quick_add, kind="success",
+        actions = tk.Frame(fields_row, bg=ModernStyle.BG_SECONDARY)
+        actions.pack(side="left", anchor="s", pady=(0, 1))     # bottom-aligned with the boxes
+        add_btn = action_button(actions, "+ Add", self._on_quick_add, kind="success", size="sm",
                                 canvas_bg=ModernStyle.BG_SECONDARY)
-        add_btn.pack(side="left", padx=(0, 16), pady=(22, 0))
+        add_btn.pack(side="left", padx=(0, 8))
         ToolTip(add_btn, "Add this symbol as a new watchlist entry")
+        save_btn = action_button(actions, "✓ Save", self._on_save, size="sm", canvas_bg=ModernStyle.BG_SECONDARY)
+        save_btn.pack(side="left", padx=(0, 8))
+        ToolTip(save_btn, "Save the changes to the selected row (or add a new symbol)")
+        secondary_button(actions, "Clear", self._clear_form, icon="eraser", size="sm",
+                         canvas_bg=ModernStyle.BG_SECONDARY).pack(side="left")
 
-        self._e_notes = _field(fields_row, "Notes", self._v_notes, width=14, expand=True, placeholder="Investment thesis / key notes...")
-        self._e_tags = _field(fields_row, "Tags", self._v_tags, width=12, placeholder="e.g. Bluechip, Tech")
-        self._e_target = _field(fields_row, "My Target Price", self._v_target, width=11, placeholder="₹ Target")
-        self._entries = (self._e_symbol, self._e_notes, self._e_tags, self._e_target)
-
-        # Row 2: Buttons
-        btn_row = tk.Frame(form_inner, bg=ModernStyle.BG_SECONDARY)
-        btn_row.pack(fill="x", pady=(8, 0))
-
-        action_button(btn_row, "✓ Save", self._on_save,
-                      canvas_bg=ModernStyle.BG_SECONDARY).pack(side="left", padx=(0, 8))
-
-        secondary_button(btn_row, "Clear", self._clear_form, icon="eraser",
-                         canvas_bg=ModernStyle.BG_SECONDARY).pack(side="left", padx=(0, 8))
-
-        action_button(btn_row, "Edit Metrics", self._open_metrics_dialog, soft=True, icon="gauge",
-                      canvas_bg=ModernStyle.BG_SECONDARY).pack(side="left", padx=(0, 8))
-
-        self._del_btn = action_button(btn_row, "Delete", self._on_delete, kind="danger", soft=True,
+        # In the title line: what you are doing, and the less-used actions as small buttons
+        self._del_btn = action_button(head_row, "Delete", self._on_delete, kind="danger", soft=True, size="sm",
                                       icon="trash-2", canvas_bg=ModernStyle.BG_SECONDARY)
-        self._del_btn.pack(side="left")
+        self._del_btn.pack(side="right")
         self._set_delete_enabled(False)   # enabled only when a row is selected
-
+        action_button(head_row, "Edit Metrics", self._open_metrics_dialog, soft=True, size="sm", icon="gauge",
+                      canvas_bg=ModernStyle.BG_SECONDARY).pack(side="right", padx=(0, 8))
         self._form_status = tk.Label(
-            btn_row,
-            text="",
+            head_row, text=self.FORM_HINT,
             fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY,
-            font=ModernStyle.FONT_SMALL_BOLD,
+            font=ModernStyle.FONT_SMALL, anchor="w",
         )
-        self._form_status.pack(side="right", padx=4)
+        self._form_status.pack(side="left", padx=(14, 0), fill="x", expand=True)
 
         # ── Signal filter pills ───────────────────────────────────────────────
         filter_bar = tk.Frame(self, bg=ModernStyle.BG_PRIMARY)
@@ -793,9 +861,9 @@ class WatchlistView(BaseView):
         table_frame.content.grid_columnconfigure(0, weight=1)
         self._empty = EmptyState(table_frame.content)
 
-        cols = ("#", "Symbol", "Signal", "Sector / Industry", "Current Px", "Fair Value", "Upside %",
+        cols = ("#", "Symbol", "Signal", "Name", "Current Px", "Practical Buy", "Strict Buy", "Fair Value", "Value Gap %",
                 "Graham No.", "Analyst Tgt", "My Target", "P/E", "PEG", "Div. Yield", "From 52W H",
-                "Tags", "Notes / Name", "Added")
+                "Tags", "Added", "Sector / Industry")
 
         style = ttk.Style()
         style.configure("Watchlist.Treeview", font=ModernStyle.FONT_TABLE, rowheight=ModernStyle.TABLE_ROW_HEIGHT)
@@ -816,21 +884,29 @@ class WatchlistView(BaseView):
             "Current Px": "Latest known price (market refresh or Refresh All, whichever is newer)",
             "Fair Value": "Median of the earnings model, the stock's own P/E history and (for lenders) "
                           "price-to-book. Blank for loss-making stocks. Double-click a row for details",
-            "Upside %": "Fair value ÷ price − 1. Negative means the price is above fair value",
+            "Value Gap %": "How far the price is from fair value (fair value ÷ price − 1): "
+                             "▲ green = below fair value, ▼ red = above it",
             "Graham No.": "Benjamin Graham's fair price: √(22.5 × EPS × book value per share)",
             "Analyst Tgt": "Average analyst price target",
             "My Target": "Your own target price",
+            "Name": "Company name",
+            "Practical Buy": "Buy below this price, the signal says Accumulate: fair value less the margin "
+                             "of safety (and no higher than the lowest method when they disagree)",
+            "Strict Buy": "The cautious price: the margin of safety taken off the lowest method. The same as "
+                          "Practical Buy when the methods agree",
             "P/E": "Price ÷ earnings per share (lower can mean cheaper)",
             "PEG": "P/E ÷ earnings growth (under 1 can mean cheap for its growth)",
             "Div. Yield": "Yearly dividend as a % of the price",
             "From 52W H": "How far the price is below its 52-week high",
         })
-        col_widths = [40, 120, 140, 250, 100, 100, 80, 100, 100, 100, 60, 60, 90, 100, 110, 220, 100]
-        sortable_cols = ("Symbol", "Signal", "Current Px", "Fair Value", "Upside %", "P/E", "Div. Yield", "From 52W H", "Added")
+        col_widths = [40, 120, 140, 220, 100, 110, 100, 100, 120, 100, 100, 100, 60, 60, 90, 100, 110, 100, 250]
+        sortable_cols = ("Symbol", "Signal", "Name", "Current Px", "Practical Buy", "Strict Buy", "Fair Value",
+                         "Value Gap %", "P/E",
+                         "Div. Yield", "From 52W H", "Added")
 
         for c, w in zip(cols, col_widths):
             # numbers on the right so their digits line up; text and values with a ▲/▼ on the left
-            anchor = ("center" if c in ("#", "Added") else
+            anchor = ("center" if c in ("#", "Added", "Practical Buy", "Strict Buy") else
                       "e" if c in ("Current Px", "Fair Value", "Graham No.", "Analyst Tgt", "My Target",
                                    "P/E", "PEG", "Div. Yield") else "w")
             if c in sortable_cols:
@@ -887,9 +963,13 @@ class WatchlistView(BaseView):
         self._load_gen += 1
         gen = self._load_gen
 
+        # the figures shown now, kept if the next ones can't be read
+        previous = {r.get("id"): (r.get("_fund"), r.get("_mkt"))
+                    for r in (getattr(self, "_data", None) or []) if r.get("_fund")}
+
         def _load():
             rows = get_all_watchlist()
-            return _attach_valuation_context(rows), watchlist_columns()
+            return _attach_valuation_context(rows, previous), watchlist_columns()
 
         run_in_background(
             _load,
@@ -975,8 +1055,14 @@ class WatchlistView(BaseView):
                 continue
             currency_total += 1
 
-            decision = row_decision(row, assumptions)   # the shared rules: same as every other page
-            key, signal_badge_text, _ = compute_signal(row, decision)
+            try:   # the shared rules: the same as every other page
+                decision = row_decision(row, assumptions)
+                key, signal_badge_text, _ = compute_signal(row, decision)
+            except Exception:   # one odd row must not leave the table half-filled
+                log.exception("Watchlist: couldn't work out the signal for %s", sym)
+                from model.valuation import decide
+                decision = decide(None, None, assumptions)
+                key, signal_badge_text = "nodata", signal_badge("nodata")
             counts[key] += 1
             if self._signal_filter != "all" and key != self._signal_filter:
                 continue
@@ -1023,8 +1109,10 @@ class WatchlistView(BaseView):
                     shown + 1,
                     sym,
                     signal_badge_text,
-                    sector_cell,
+                    row.get("stock_name") or "—",
                     f"{cy}{cv_f:,.2f}" if cv_f else "—",
+                    f"{cy}{decision.buy_below:,.2f}" if decision.buy_below else "—",
+                    f"{cy}{decision.strict_buy_below:,.2f}" if decision.strict_buy_below else "—",
                     f"{cy}{iv_f:,.2f}" if iv_f else "—",
                     mos_str,
                     graham_str,
@@ -1035,13 +1123,13 @@ class WatchlistView(BaseView):
                     row.get("dividend_yield") or "—",
                     from_high_str,
                     row.get("tags") or "",
-                    row.get("notes") or row.get("stock_name") or "",
                     format_date(row.get("added_on", "")),
+                    sector_cell,
                 ),
                 tags=(row_tag,),
             )
             shown += 1
-        color_gain_loss(self._tv, ("Upside %", "From 52W H"))
+        color_gain_loss(self._tv, ("Value Gap %", "From 52W H"))
         color_signals(self._tv, "Signal")
 
         # A friendly empty screen when nothing is listed (once the data has loaded)
@@ -1090,7 +1178,7 @@ class WatchlistView(BaseView):
         self._v_target.set("")
         for v in self._metrics_vars.values():
             v.set("")
-        self._form_status.config(text="", fg=ModernStyle.TEXT_TERTIARY)
+        self._form_status.config(text=self.FORM_HINT, fg=ModernStyle.TEXT_TERTIARY)
         self._set_delete_enabled(False)
         try:
             self._tv.selection_remove(*self._tv.selection())
@@ -1136,7 +1224,8 @@ class WatchlistView(BaseView):
             val = "" if val is None else str(val).replace("₹", cy)
             v.set(val)
             self._loaded_metrics[k] = val.strip()
-        self._form_status.config(text=f"✏️ Editing {sym}", fg=ModernStyle.TEXT_ACCENT)
+        self._form_status.config(text=f"✏️ Editing {sym}: change Tags or My Target and press Save",
+                                 fg=ModernStyle.TEXT_ACCENT)
         self._set_delete_enabled(True)
 
     def _read_form(self) -> dict | None:
@@ -1276,9 +1365,18 @@ class WatchlistView(BaseView):
         self._autofill_running = True
         self._set_fetch_btn("🔄 Fetching…")
         columns = set(self._db_columns)
+        def work():
+            from views.valuation_view import SymbolNotFound, YahooUnavailable
+            try:
+                return fetch_watchlist_metrics(symbol, columns)
+            except (SymbolNotFound, YahooUnavailable) as exc:   # a message for the user, not a bug
+                log.info("Auto-Fill for %s: %s", symbol, exc)
+                return exc
+
         run_in_background(
-            lambda: fetch_watchlist_metrics(symbol, columns),
-            on_done=lambda res: self._on_autofill_done(symbol, res),
+            work,
+            on_done=lambda res: (self._on_autofill_failed(symbol, res) if isinstance(res, LookupError)
+                                 else self._on_autofill_done(symbol, res)),
             on_error=lambda err: self._on_autofill_failed(symbol, err),
             widget=self, name="watchlist-autofill",
         )
@@ -1534,7 +1632,7 @@ class WatchlistView(BaseView):
         top.set_status("Esc closes this window.")
 
         # ── Signal banner ──────────────────────────────────────────────────
-        key, badge, tip = compute_signal(row)
+        key, badge, _tip = compute_signal(row)
         badge_fg, badge_bg, _fill = signal_colours(key)
         wrap = max(360, popup_w - 200)
 
@@ -1545,22 +1643,10 @@ class WatchlistView(BaseView):
 
         tk.Label(sig_inner, text=badge, fg=badge_fg, bg=badge_bg,
                  font=ModernStyle.FONT_MODAL_TITLE).pack(anchor="w")
-        tk.Label(sig_inner, text="ℹ️ Decision Rationale:", fg=badge_fg, bg=badge_bg,
-                 font=ModernStyle.FONT_HEADING).pack(anchor="w", pady=(8, 4))
-        for line in tip.split("\n"):
-            if not line.strip():
-                continue
-            if line.startswith("✅"):
-                line_fg = ModernStyle.SUCCESS if key != "strong_buy" else badge_fg
-            elif line.startswith("❌"):
-                line_fg = ModernStyle.ERROR if key != "avoid" else badge_fg
-            else:
-                line_fg = ModernStyle.TEXT_PRIMARY
-            tk.Label(
-                sig_inner, text=line, fg=line_fg, bg=badge_bg,
-                font=ModernStyle.FONT_HEADING if line.startswith("Signal:") else ModernStyle.FONT_TABLE,
-                justify="left", anchor="w", wraplength=wrap
-            ).pack(anchor="w", padx=5)
+        # The decision laid out: key figures, why, what would change it, quality, how it was worked out
+        from ui.decision_panel import DecisionPanel
+        DecisionPanel(sig_inner, row_decision(row), bg=badge_bg, accent=badge_fg, wrap=wrap,
+                      scorecard=quality_scorecard(row)).pack(fill="x", pady=(6, 0))
 
         def evaluate_benchmark(key: str, val_str: str) -> bool | None:
             val = parse_num(val_str)

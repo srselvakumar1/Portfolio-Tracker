@@ -55,6 +55,8 @@ COLUMNS = [
     ("avg",      "Avg Cost",       "₹12,345.67",       "center"),
     ("price",    "Price",          "₹12,345.67",       "center"),
     ("day",      "Day Chg",        "▼ 12.34%",         "w"),
+    ("buy",      "Buy Below",      "₹12,345.67",       "center"),
+    ("signal",   "Signal",         "✅ Accumulate",    "w"),
     ("unreal",   "Unrealised P&L", "▼ ₹123,456",       "w"),
     ("pnl_pct",  "P&L %",          "▼ 12.3%",          "w"),
     ("weight",   "Weight",         "▰▰▰▰▰  12.3%",     "w"),
@@ -65,8 +67,7 @@ COLUMNS = [
     ("fees",     "Fees",           "₹12,345.67",       "center"),
     ("pe",       "P/E",            "106.68",           "center"),
     ("fair",     "Fair Value",     "₹12,345.67",       "center"),
-    ("upside",   "Upside %",       "▼ 12.3%",          "w"),
-    ("signal",   "Signal",         "➕ Accumulate",    "center"),
+    ("upside",   "Value Gap %",    "▼ 12.3%",          "w"),
 ]
 COLUMN_IDS = [c[0] for c in COLUMNS]
 HEADINGS = {c[0]: c[1] for c in COLUMNS}
@@ -92,8 +93,9 @@ COLUMN_HELP = {
     "total":    "Total P&L (realised + unrealised)",
     "fees":     "Fees (all brokerage and charges)",
     "pe":       "P/E (price ÷ earnings per share)",
+    "buy":      "Buy Below (the price at or below which the rules say Accumulate)",
     "fair":     "Fair Value (from the shared valuation rules; blank for losses and funds)",
-    "upside":   "Upside % (fair value ÷ price − 1; negative when the price is above it)",
+    "upside":   "Value Gap % (how far the price is from fair value: ▲ below it, ▼ above it)",
     "signal":   "Signal (model: price vs fair value)",
 }
 
@@ -151,15 +153,15 @@ def _weight_text(pct: float) -> str:
 def _signal_text(signal) -> str:
     s = str(signal if signal is not None else "").strip().upper()
     if s in {"ACCUMULATE", "BUY", "ADD"}:
-        return "➕ Accumulate"
+        return "✅ Accumulate"
     if s in {"SELL"}:
-        return "⛔ Sell"          # bad news only: a loss, a big fair-value cut, or quality newly failed
+        return "🚨 Sell"          # bad news only: a loss, a big fair-value cut, or quality newly failed
     if s in {"REDUCE", "TRIM"}:
-        return "➖ Reduce"
+        return "🔻 Reduce"
     if s in {"HOLD", "WAIT"}:
-        return "⏸ Hold"
+        return "✋ Hold"
     if s in {"", "N/A", "NA", "NAN", "NONE"}:
-        return "No signal"
+        return "❔ No signal"
     return str(signal).title()
 
 
@@ -206,6 +208,32 @@ def _broker_info(app_state) -> tuple[list, dict]:
         return [], {}
 
 
+def _buy_below_levels(df) -> dict:
+    """{symbol: buy-below price} from the shared rules (model/valuation.py), the same decision
+    the Signal column comes from. One database read; worker thread only."""
+    if df is None or df.empty or "symbol" not in df.columns:
+        return {}
+    try:
+        from model import fundamentals
+        from model.valuation import canonical, decide, load_assumptions
+        symbols = sorted({str(s) for s in df["symbol"].dropna()})
+        records = fundamentals.load_records(symbols)
+        prices = fundamentals.market_prices(symbols)
+        assumptions = load_assumptions()
+        out = {}
+        for sym in symbols:
+            rec = records.get(canonical(sym))
+            price, when = prices.get(sym, (None, None))
+            if rec and price:
+                d = decide(rec["inputs"], price, assumptions, rec["state"], when)
+                if d.buy_below and d.zone != "SELL":
+                    out[sym] = d.buy_below
+        return out
+    except Exception:
+        log.warning("Holdings: could not work out the buy-below prices", exc_info=True)
+        return {}
+
+
 def _compute_holdings(cache: DataCache, p: dict) -> dict:
     """Filter the cache and build every table row and total. Worker thread only.
 
@@ -219,6 +247,7 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
         iv_signal=p["signal"], exclude_zero_qty=(state == "Active"), zero_qty_only=(state == "Closed"),
     )
     df, summary = cache.get_holdings_filtered(filters)
+    buy_below = _buy_below_levels(df)
     if p["symbol"] or p["signal"] != "All":
         # Weight % is measured against everything you hold, not just the matches
         base = HoldingsFilters(broker=p["broker"], currency=p["currency"],
@@ -265,6 +294,7 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
         # Fair value stored by the last price refresh (model/valuation.py), and the upside
         # to it at this price: the same figures the signal was decided on
         fair = _num(getattr(row, "intrinsic_value", 0))
+        buy = buy_below.get(symbol)
         upside = (fair / mkt - 1.0) * 100.0 if fair > 0 and mkt > 0 else None
 
         held = qty > 0
@@ -294,6 +324,8 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
             format_money(avg, cur) if avg > 0 else "—",
             format_money(mkt, cur) if mkt > 0 else "—",
             _pct_text(day_pct) if day_pct is not None else "—",
+            format_money(buy, cur) if buy else "—",
+            _signal_text(signal),
             _pnl_text(unreal, cur) if unreal is not None else "—",
             _pct_text(pnl_pct, 1) if pnl_pct is not None else "—",
             _weight_text(weight) if weight is not None else "—",
@@ -305,7 +337,6 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
             f"{pe:.2f}" if pe > 0 else "—",
             format_money(fair, cur) if fair > 0 else "—",
             _pct_text(upside, 1) if upside is not None else "—",
-            _signal_text(signal),
         )
         meta = {
             "broker": broker, "symbol": symbol, "stock_name": stock_name, "currency": cur,

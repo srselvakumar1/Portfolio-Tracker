@@ -14,8 +14,10 @@ The rules are written up in VALUATION_REVIEW.md (sections 6 and 7). In short:
   A reverse check shows what growth the current price implies.
 * Confidence: High when two or more methods agree within 25% and EPS has been
   positive for 3 years; Medium for one method or agreement within 50%; Low otherwise.
-  At Low confidence a signal needs every method to agree (BUY below the lowest
-  one's buy price, REDUCE above the highest one's reduce level), otherwise HOLD.
+  At Low confidence (practical levels) the buy price is the lower of fair value less
+  the cushion and the lowest method; the reduce level the higher of fair value + 20%
+  and the highest method. Strict levels (shown for reference) put the cushion on the
+  lowest / highest method itself.
 * Zones: BUY below fair value × (1 − margin of safety), REDUCE above fair value
   × 1.2, HOLD in between. SELL only on bad news. NONE ("no signal") when the
   data is missing or old, or no method applies (e.g. funds). Next to a boundary the zone from
@@ -60,8 +62,9 @@ CURRENCY_SIGNS = {"INR": "₹", "JPY": "¥", "USD": "$", "GBP": "£", "EUR": "�
 
 # What each page shows for a zone
 STORED_SIGNAL = {"BUY": "ACCUMULATE", "HOLD": "HOLD", "REDUCE": "REDUCE", "SELL": "SELL", "NONE": "N/A"}
-ZONE_LABEL = {"BUY": "🟢 Accumulate", "HOLD": "⏸ Hold", "REDUCE": "🔻 Reduce",
-              "SELL": "⛔ Sell", "NONE": "⚪ No signal"}
+# The same on every page: ✅ buy more, ✋ keep, 🔻 trim, 🚨 bad news, ❔ can't tell
+ZONE_LABEL = {"BUY": "✅ Accumulate", "HOLD": "✋ Hold", "REDUCE": "🔻 Reduce",
+              "SELL": "🚨 Sell", "NONE": "❔ No signal"}
 
 _assumption_cache: dict = {"mtime": None, "value": None}
 
@@ -292,7 +295,10 @@ class Decision:
     high: float | None = None
     methods: list = field(default_factory=list)          # [(name, value)]
     upside: float | None = None           # % : fair value ÷ price − 1
-    buy_below: float | None = None
+    buy_below: float | None = None        # practical: decides the signal
+    strict_buy_below: float | None = None # strict (for reference): the cushion on the lowest method
+    strict_reduce_above: float | None = None
+    strong_below: float | None = None     # Strong Buy at or below this (the strict buy price, if lower)
     target: float | None = None
     reduce_above: float | None = None
     expected_return: float | None = None  # % a year to reach the target in 3 years, plus dividends
@@ -311,11 +317,14 @@ class Decision:
     inputs_date: str | None = None
     info_date: str | None = None
     assumptions: dict = field(default_factory=dict)
+    analyst_target: float | None = None   # for reference only (not part of the fair value)
+    analyst_count: int | None = None
+    dividend_yield: float | None = None   # percent
 
     @property
     def label(self) -> str:
         if self.zone == "BUY" and self.strong:
-            return "🟢 Strong Buy"
+            return "🌟 Strong Buy"
         return ZONE_LABEL[self.zone]
 
     @property
@@ -330,7 +339,7 @@ class Decision:
             rng = f"  (range {m(self.low)} – {m(self.high)})" if self.low and self.high and self.high > self.low else ""
             lines.append(f"Fair value: {m(self.fair_value)}{rng}")
             if self.upside is not None:
-                lines.append(f"Upside to fair value: {self.upside:+.1f}%")
+                lines.append(f"Value gap: {self.upside:+.1f}%")
             lines.append(f"Buy below: {m(self.buy_below)}   ·   Target (2–3 years): {m(self.target)}"
                          f"   ·   Reduce above: {m(self.reduce_above)}")
             if self.expected_return is not None:
@@ -349,20 +358,59 @@ class Decision:
             for label, passed, detail in self.quality:
                 mark = "✅" if passed else "❌" if passed is False else "·"
                 lines.append(f"{mark} {detail}")
+        if self.assumptions_text():
+            lines.append(self.assumptions_text())
+        if self.dates_text():
+            lines.append(self.dates_text())
+        return "\n".join(lines)
+
+    def summary(self) -> str:
+        """The decision in one or two plain sentences, for the top of a page or pop-up."""
+        m = lambda v: money(v, self.currency)
+        first_reason = self.reasons[0] if self.reasons else ""
+        if self.zone == "NONE":
+            return f"No signal: {first_reason}"
+        if self.zone == "SELL":
+            return f"Sell: {first_reason}"
+        if not self.fair_value or not self.price:
+            return first_reason
+        gap = self.upside or 0.0
+        if gap >= 0:
+            where = f"Fair value {m(self.fair_value)} is {gap:.0f}% above today's price {m(self.price)}."
+        else:
+            where = (f"Today's price {m(self.price)} is {(self.price / self.fair_value - 1) * 100:.0f}% above "
+                     f"the fair value of {m(self.fair_value)}.")
+        to = lambda level: f"{(level / self.price - 1) * 100:+.0f}%"
+        if self.zone == "BUY" and self.strong:
+            what = (f"That is at or below the Strong Buy level of {m(self.strong_below)}, so the rules say "
+                    f"Strong Buy.")
+        elif self.zone == "BUY":
+            what = (f"That is below the buy price of {m(self.buy_below)}, so the rules say Accumulate "
+                    f"(Strong Buy at or below {m(self.strong_below)}).")
+        elif self.zone == "REDUCE":
+            what = (f"That is more than {self.assumptions.get('reduce_above', 0.2) * 100:.0f}% above fair value, so the "
+                    f"rules say Reduce (back to Hold at or below {m(self.reduce_above)}).")
+        else:
+            what = (f"Hold: it becomes a buy at or below {m(self.buy_below)} ({to(self.buy_below)}) and a reduce "
+                    f"above {m(self.reduce_above)} ({to(self.reduce_above)}).")
+        return f"{where} {what}"
+
+    def assumptions_text(self) -> str:
         a = self.assumptions
-        if a:
-            lines.append(f"Assumptions ({COUNTRY_NAMES.get(self.country, self.country)}): required return "
-                         f"{a['required_return']*100:.1f}%, long-run growth {a['long_run_growth']*100:.1f}%, "
-                         f"growth cap {a['growth_cap']*100:.0f}%, margin of safety "
-                         f"{a['mos_high']*100:.0f}% (High) / {a['mos_medium']*100:.0f}% (Medium), "
-                         f"reduce above +{a['reduce_above']*100:.0f}%")
+        if not a:
+            return ""
+        return (f"Assumptions ({COUNTRY_NAMES.get(self.country, self.country)}): required return "
+                f"{a['required_return']*100:.1f}%, long-run growth {a['long_run_growth']*100:.1f}%, "
+                f"growth cap {a['growth_cap']*100:.0f}%, margin of safety "
+                f"{a['mos_high']*100:.0f}% (High) / {a['mos_medium']*100:.0f}% (Medium), "
+                f"reduce above +{a['reduce_above']*100:.0f}%")
+
+    def dates_text(self) -> str:
         dates = [f"price {self.price_date[:10]}" if self.price_date else "",
                  f"yearly figures {self.inputs_date[:10]}" if self.inputs_date else "",
                  f"latest figures {self.info_date[:10]}" if self.info_date else ""]
         dates = [d for d in dates if d]
-        if dates:
-            lines.append("Data as of: " + ", ".join(dates))
-        return "\n".join(lines)
+        return ("Data as of: " + ", ".join(dates)) if dates else ""
 
 
 def check_quality(inputs: dict, a: dict, lender: bool) -> tuple[bool | None, list]:
@@ -454,7 +502,9 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
     d = Decision(price=price, currency=currency, country=country, assumptions=a,
                  price_date=str(price_date) if price_date else None,
                  inputs_date=inputs.get("inputs_updated_at") or None,
-                 info_date=inputs.get("info_updated_at") or None)
+                 info_date=inputs.get("info_updated_at") or None,
+                 analyst_target=_num(inputs.get("analyst_target")), analyst_count=inputs.get("analyst_count"),
+                 dividend_yield=_num(inputs.get("dividend_yield")))
     m = lambda v: money(v, currency)
     sell_rules = (f"SELL if 12-month EPS turns negative, fair value is cut by more than "
                   f"{A['fv_cut_sell']*100:.0f}% within {A['fv_cut_days']} days, or the quality check newly fails.")
@@ -532,12 +582,26 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
 
     margin = a["mos_high"] if d.confidence == "High" else a["mos_medium"]
     d.margin = margin
-    # Methods that disagree (Low confidence) give a signal only where they all agree:
-    # BUY below the buy price of the lowest, REDUCE above the reduce level of the highest
-    buy_anchor, reduce_anchor = (lo, hi) if d.confidence == "Low" else (fv, fv)
-    d.buy_below = buy_anchor * (1.0 - margin)
+    # Practical levels (these decide the signal): fair value less the cushion, and fair value
+    # + 20%. When the methods disagree (Low confidence), no method may disagree with the
+    # signal either: the buy price is at most the lowest method, the reduce level at least
+    # the highest. The strict levels (shown for reference) put the cushion on the lowest /
+    # highest method itself, i.e. cautious twice over.
+    d.buy_below = fv * (1.0 - margin)
+    d.reduce_above = fv * (1.0 + a["reduce_above"])
+    d.strict_buy_below, d.strict_reduce_above = d.buy_below, d.reduce_above
+    if d.confidence == "Low":
+        d.buy_below = min(d.buy_below, lo)
+        d.reduce_above = max(d.reduce_above, hi)
+        d.strict_buy_below = lo * (1.0 - margin)
+        d.strict_reduce_above = hi * (1.0 + a["reduce_above"])
+    # Strong Buy: at or below the strict buy price (cheap even by the cautious measure). When the
+    # methods agree the strict and practical prices are the same, so it is a further 15% below.
+    if d.strict_buy_below < d.buy_below * 0.995:
+        d.strong_below = d.strict_buy_below
+    else:
+        d.strong_below = fv * (1.0 - margin - a["strong_extra"])
     d.target = fv
-    d.reduce_above = reduce_anchor * (1.0 + a["reduce_above"])
     dy = _num(inputs.get("dividend_yield")) or 0.0
     d.expected_return = ((fv / price) ** (1.0 / 3.0) - 1.0) * 100.0 + dy
 
@@ -546,8 +610,11 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
         return d
     if d.confidence == "Low":
         d.reasons.append(f"The methods disagree by {spread*100:.0f}% "
-                         f"({', '.join(f'{n} {m(v)}' for n, v in methods)}): BUY only below the lower one's "
-                         f"buy price, REDUCE only above the higher one's reduce level.")
+                         f"({', '.join(f'{n} {m(v)}' for n, v in methods)}): the buy price is the lower of "
+                         f"fair value less {margin*100:.0f}% and the lowest method ({m(d.buy_below)}); the reduce "
+                         f"level is the higher of fair value + {a['reduce_above']*100:.0f}% and the highest "
+                         f"method ({m(d.reduce_above)}). Strict levels: buy below {m(d.strict_buy_below)}, "
+                         f"reduce above {m(d.strict_reduce_above)}.")
 
     # ── Zones ──
     pct = lambda level: (level / price - 1.0) * 100.0
@@ -569,12 +636,27 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
     if zone == "BUY":
         if d.quality_pass:
             d.zone = "BUY"
-            d.strong = price <= buy_anchor * (1.0 - margin - a["strong_extra"])
+            # the same 3% band at the Strong Buy step as at the others
+            prev_strong = state.get("strong") if prev == "BUY" else None
+            if prev_strong is True:
+                d.strong = price <= d.strong_below * (1.0 + band)
+            elif prev_strong is False:
+                d.strong = price <= d.strong_below * (1.0 - band)
+            else:
+                d.strong = price <= d.strong_below
             if not kept:
                 d.reasons.append(f"Price {m(price)} is at or below the buy price {m(d.buy_below)} "
                                  f"({margin*100:.0f}% below fair value, {d.confidence} confidence).")
-            d.changes.append(f"Stops being a BUY above {m(d.buy_below * (1.0 + band))} "
-                             f"({pct(d.buy_below * (1.0 + band)):+.1f}%).")
+            if d.strong:
+                d.reasons.append(f"It is also at or below the Strong Buy level {m(d.strong_below)}"
+                                 + (" (the strict buy price)." if d.strong_below == d.strict_buy_below
+                                    and d.strict_buy_below < d.buy_below else "."))
+            else:
+                d.changes.append(f"Becomes a Strong Buy at or below {m(d.strong_below)} ({pct(d.strong_below):+.1f}%).")
+            stop = d.buy_below * (1.0 + band)
+            d.changes.append(f"Stops being a BUY above {m(stop)} ({pct(stop):+.1f}%)"
+                             + (f": {band*100:.0f}% above the buy price {m(d.buy_below)}, so the signal "
+                                f"doesn't flip back and forth." if band > 0 else "."))
         else:
             d.zone = "HOLD"
             why = "the quality check failed" if d.quality_pass is False else "there isn't enough data for the quality check"
@@ -586,19 +668,28 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
             d.reasons.append(f"Price {m(price)} is more than {a['reduce_above']*100:.0f}% above fair value "
                              f"({m(d.reduce_above)}).")
         back = d.reduce_above * (1.0 - band)
-        d.changes.append(f"Back to HOLD at or below {m(back)} ({pct(back):+.1f}%).")
+        d.changes.append(f"Back to HOLD at or below {m(back)} ({pct(back):+.1f}%)"
+                         + (f": {band*100:.0f}% below the reduce level {m(d.reduce_above)}, so the signal "
+                            f"doesn't flip back and forth." if band > 0 else "."))
     else:
         d.zone = "HOLD"
         if not kept:
             d.reasons.append(f"Price {m(price)} is between the buy price {m(d.buy_below)} and the reduce level "
                              f"{m(d.reduce_above)}.")
-        to_buy = d.buy_below * (1.0 - band) if prev == "HOLD" else d.buy_below
-        to_reduce = d.reduce_above * (1.0 + band) if prev == "HOLD" else d.reduce_above
+        banded = prev == "HOLD" and band > 0       # coming from HOLD: 3% past each level
+        to_buy = d.buy_below * (1.0 - band) if banded else d.buy_below
+        to_reduce = d.reduce_above * (1.0 + band) if banded else d.reduce_above
+        why_buy = (f": {band*100:.0f}% below the buy price {m(d.buy_below)}, so the signal doesn't flip "
+                   f"back and forth" if banded else "")
+        why_reduce = (f": {band*100:.0f}% above the reduce level {m(d.reduce_above)}, for the same reason"
+                      if banded else "")
         if d.quality_pass:
-            d.changes.append(f"Becomes a BUY at or below {m(to_buy)} ({pct(to_buy):+.1f}%).")
+            d.changes.append(f"Becomes a BUY at or below {m(to_buy)} ({pct(to_buy):+.1f}%){why_buy}; "
+                             f"a Strong Buy at or below {m(d.strong_below)} ({pct(d.strong_below):+.1f}%).")
         else:
-            d.changes.append(f"A BUY needs the price at or below {m(to_buy)} and the quality check to pass.")
-        d.changes.append(f"Becomes REDUCE above {m(to_reduce)} ({pct(to_reduce):+.1f}%).")
+            d.changes.append(f"A BUY needs the price at or below {m(to_buy)}{why_buy}, and the quality check "
+                             f"to pass.")
+        d.changes.append(f"Becomes REDUCE above {m(to_reduce)} ({pct(to_reduce):+.1f}%){why_reduce}.")
     d.changes.append(sell_rules)
     d.changes.append(stale_rule)
     return d
@@ -629,6 +720,7 @@ def next_state(state: dict | None, d: Decision, assumptions: dict | None = None,
         st["quality_pass"] = d.quality_pass
     if d.zone != st.get("zone"):        # for the no-flip-flop band (and, later, "since" dates)
         st["zone"], st["zone_since"] = d.zone, now.strftime("%Y-%m-%d")
+    st["strong"] = bool(d.strong) if d.zone == "BUY" else None     # the band at the Strong Buy step
     return st
 
 

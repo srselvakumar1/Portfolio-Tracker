@@ -27,6 +27,101 @@ import pandas as pd
 CURRENCY_SYMBOLS = {"INR": "₹", "JPY": "¥", "CNY": "¥", "GBP": "£", "USD": "$", "EUR": "€"}
 
 
+# ── Benchmarks shown beside each metric ───────────────────────────────────────
+# Rules of thumb for a typical company, the same thresholds as the quality scorecard
+# below. Each: key → (benchmark text, rule(value, raw data) → True good / False weak /
+# None in between or no rule). They are rough guides, not targets.
+def _price(raw):
+    return raw.get("current_price") or 0
+
+
+BENCHMARKS = {
+    # Valuation
+    "pe_ratio":       ("good < 15 · high > 30", lambda v, r: False if v <= 0 else True if v < 15 else False if v > 30 else None),
+    "forward_pe":     ("below P/E = growing", lambda v, r: (v < r["pe_ratio"]) if r.get("pe_ratio") and v > 0 else None),
+    "peg_ratio":      ("good < 1 · high > 1.5", lambda v, r: True if 0 < v < 1 else False if v > 1.5 else None),
+    "pb_ratio":       ("good < 3", lambda v, r: v < 3),
+    "price_to_sales": ("lower < 2", lambda v, r: True if v < 2 else False if v > 8 else None),
+    "enterprise_value": ("company size", None),
+    "analyst_target": ("above price", lambda v, r: (v > _price(r)) if _price(r) else None),
+    "beta":           ("calmer < 1.5", lambda v, r: v < 1.5),
+    "dividend_yield": ("strong > 4% (check payout)",
+                       lambda v, r: (False if (r.get("payout_ratio") or 0) > 90 else True) if v > 4 else None),
+    "payout_ratio":   ("safe < 90%", lambda v, r: (v < 90) if v > 0 else None),
+    "market_cap":     ("company size", None),
+    # Profitability
+    "eps":            ("positive", lambda v, r: v > 0),
+    "roe":            ("good ≥ 12%", lambda v, r: v >= 12),
+    "roce":           ("good ≥ 12%", lambda v, r: v >= 12),
+    "roa":            ("good ≥ 5%", lambda v, r: True if v >= 5 else False if v < 2 else None),
+    "opm":            ("good ≥ 10%", lambda v, r: v >= 10),
+    "net_profit_margin": ("good ≥ 8%", lambda v, r: True if v >= 8 else False if v < 3 else None),
+    "ebitda_margin":  ("good ≥ 15%", lambda v, r: v >= 15),
+    "qoq_op_profit":  ("positive", lambda v, r: v > 0),
+    "free_cash_flow": ("positive", lambda v, r: v > 0),
+    # Growth & health
+    "revenue_cagr_3y": ("good ≥ 10%", lambda v, r: v >= 10),
+    "revenue_cagr_5y": ("good ≥ 10%", lambda v, r: v >= 10),
+    "profit_cagr_3y": ("good ≥ 10%", lambda v, r: v >= 10),
+    "profit_cagr_5y": ("good ≥ 10%", lambda v, r: v >= 10),
+    "sales_growth":   ("good ≥ 10%", lambda v, r: v >= 10),
+    "profit_growth":  ("good ≥ 10%", lambda v, r: v >= 10),
+    "debt_to_equity": ("low < 1 · high > 1.5", lambda v, r: True if v < 1 else False if v > 1.5 else None),
+    "current_ratio":  ("safe ≥ 1.5", lambda v, r: v >= 1.5),
+    "quick_ratio":    ("safe ≥ 1", lambda v, r: v >= 1),
+    # Technical
+    "dma_50":         ("price above = rising", lambda v, r: (_price(r) > v) if _price(r) else None),
+    "dma_200":        ("price above = rising", lambda v, r: (_price(r) > v) if _price(r) else None),
+    "dma_50_200":     ("50 above 200 = uptrend", lambda v, r: (r["dma_50"] > r["dma_200"]) if r.get("dma_50") and r.get("dma_200") else None),
+    "week52_range":   ("near the low = cheaper", None),
+    "rsi":            ("normal 30–65", lambda v, r: 30 <= v <= 65),
+    "macd":           ("> 0 = momentum up", lambda v, r: v > 0),
+    "sharpe_ratio":   ("good > 1", lambda v, r: True if v > 1 else False if v < 0 else None),
+    "volume":         ("trading activity", None),
+    "short_ratio":    ("low < 5", lambda v, r: v < 5),
+    "support_resistance": ("60-day low / high", None),
+    # Ownership
+    "promoter_holding": ("≥ 40% (rarer in Japan)", lambda v, r: v >= 40),
+    "institution_holding": ("≥ 10%", lambda v, r: v >= 10),
+    "institution_count": ("more = wider following", None),
+    # Alternate valuations
+    "graham_number":  ("above price = cheap", lambda v, r: (v > _price(r)) if _price(r) else None),
+    "intrinsic_value_display": ("above price = cheap", lambda v, r: (v > _price(r)) if _price(r) else None),
+}
+# The quality scorecard's checks: name → (benchmark, metric whose shown value it is judged on)
+VAL_SCORE_INFO = {
+    "P/E Ratio": ("good < 15 · high > 30", "pe_ratio"),
+    "PEG Ratio": ("good < 1 · high > 1.5", "peg_ratio"),
+    "P/B": ("< 3", "pb_ratio"),
+    "HEALTH RISK": ("not: FCF < 0 with D/E > 1.5", "health"),
+    "FUNDAMENTAL STRENGTH": ("FCF > 0, D/E < 0.5, net margin > 10%", "health"),
+    "Cash Flow": ("FCF > 0", "free_cash_flow"),
+    "Curr Ratio": ("≥ 1.5", "current_ratio"),
+    "ROE": ("≥ 12%", "roe"),
+    "ROCE": ("≥ 12%", "roce"),
+    "Dividend Trap": ("payout < 90%", "payout_ratio"),
+    "Safe Yield": ("> 4% and payout < 90%", "dividend_yield"),
+    "OPM": ("≥ 10%", "opm"),
+    "EBITDA Mg": ("≥ 15%", "ebitda_margin"),
+    "Sales Gr": ("≥ 10%", "sales_growth"),
+    "Profit Gr": ("≥ 10%", "profit_growth"),
+    "3Y Rev CAGR": ("≥ 10%", "revenue_cagr_3y"),
+    "5Y Rev CAGR": ("≥ 10%", "revenue_cagr_5y"),
+    "3Y Profit CAGR": ("≥ 10%", "profit_cagr_3y"),
+    "5Y Profit CAGR": ("≥ 10%", "profit_cagr_5y"),
+    "Latest Qtr Op": ("> 0", "qoq_op_profit"),
+    "Graham Number": ("above the price", "graham_number"),
+    "Promoters": ("≥ 40%", "promoter_holding"),
+    "Institutions": ("≥ 10%", "institution_holding"),
+    "Uptrend": ("50-day above 200-day", "dma_50_200"),
+    "Downtrend": ("50-day above 200-day", "dma_50_200"),
+    "RSI": ("30–65", "rsi"),
+    "Beta": ("< 1.5", "beta"),
+}
+# Where a row's number comes from when its key isn't in the raw data under the same name
+BENCH_SOURCE = {"intrinsic_value_display": "intrinsic_value", "dma_50_200": "dma_50", "week52_range": "h52"}
+
+
 # ── Shared Yahoo Finance helpers (used by the Watchlist view too) ─────────────
 
 def yf_symbol_candidates(symbol: str) -> list[str]:
@@ -53,13 +148,56 @@ def _has_price(info) -> bool:
     return any(info.get(k) not in (None, 0, "") for k in ("regularMarketPrice", "currentPrice", "previousClose"))
 
 
+class SymbolNotFound(LookupError):
+    """Yahoo has no prices for what was typed: an everyday message for the user, not a bug."""
+
+
+class YahooUnavailable(LookupError):
+    """Yahoo Finance couldn't be reached (no connection): also a message for the user."""
+
+
+def suggest_symbols(symbol: str, limit: int = 3) -> list[tuple[str, str]]:
+    """Yahoo's search for what was typed: [(symbol, name)], Indian and Tokyo listings first.
+    Network call (background thread); [] when the search fails."""
+    query = str(symbol or "").strip().upper()
+    for suffix in (".NS", ".BO", ".T"):
+        if query.endswith(suffix):
+            query = query[: -len(suffix)]
+    if not query:
+        return []
+    try:
+        import yfinance as yf
+        quotes = yf.Search(query, max_results=8, news_count=0, lists_count=0, recommended=0,
+                           timeout=8, raise_errors=False).quotes or []
+    except Exception as exc:
+        log.debug("Yahoo search for %s failed: %s", query, exc)
+        return []
+    found = []
+    for q in quotes:
+        sym = str(q.get("symbol") or "")
+        name = str(q.get("longname") or q.get("shortname") or "").strip()
+        if sym and sym not in [f[0] for f in found]:
+            found.append((sym, name))
+    found.sort(key=lambda f: 0 if f[0].endswith((".NS", ".BO", ".T")) else 1)
+    unique, names = [], set()
+    for sym, name in found:           # one listing per company (NSE before BSE, as sorted)
+        if name and name in names:
+            continue
+        names.add(name)
+        unique.append((sym, name))
+    return unique[:limit]
+
+
 def resolve_ticker(symbol: str):
     """Return (info, yf_symbol, ticker) for the first candidate Yahoo has prices for.
 
     Network calls: one .info request per candidate tried. Run in a background thread.
-    Raises LookupError with a message for the user when nothing is found.
+    Raises SymbolNotFound (with suggestions when Yahoo's search has any) or
+    YahooUnavailable, both LookupErrors with a message for the user.
     """
+    import logging
     import yfinance as yf
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)   # no raw "HTTP Error 404" in the log
 
     candidates = yf_symbol_candidates(symbol)
     errors = 0
@@ -68,14 +206,20 @@ def resolve_ticker(symbol: str):
             ticker = yf.Ticker(cand)
             info = ticker.info or {}
         except Exception as exc:
-            errors += 1
+            text = str(exc).lower()
+            if "404" not in text and "not found" not in text:   # a "not found" answer isn't a lost connection
+                errors += 1
             log.debug("Yahoo lookup of %s failed: %s", cand, exc)
             continue
         if _has_price(info):
             return info, cand, ticker
     if candidates and errors == len(candidates):
-        raise LookupError(f"Couldn't reach Yahoo Finance for {symbol}. Check the internet connection and try again.")
-    raise LookupError(f"No price data found for {symbol} (tried {', '.join(candidates) or symbol}).")
+        raise YahooUnavailable(f"Couldn't reach Yahoo Finance for {symbol}. Check the internet connection and try again.")
+    msg = f"No price data found for {symbol}."
+    hints = [f"{s} ({n})" if n else s for s, n in suggest_symbols(symbol)]
+    if hints:
+        msg += " Did you mean " + ", ".join(hints) + "?"
+    raise SymbolNotFound(msg)
 
 
 def currency_symbol(info: dict, yf_symbol: str = "") -> str:
@@ -526,8 +670,12 @@ class ValuationView(BaseView):
 
         # Buy below / Target / Reduce above / Confidence, from the shared rules
         self._decision_labels = {}
-        for i, (key, text) in enumerate((("buy_below", "Buy below:"), ("target", "Target (2–3 yrs):"),
-                                         ("reduce_above", "Reduce above:"), ("confidence", "Confidence:")), start=4):
+        for i, (key, text) in enumerate((("buy_below", "Buy below · practical:"),
+                                         ("strict_buy_below", "Buy below · strict:"),
+                                         ("target", "Target (2–3 yrs):"),
+                                         ("reduce_above", "Reduce above · practical:"),
+                                         ("strict_reduce_above", "Reduce above · strict:"),
+                                         ("confidence", "Confidence:")), start=4):
             tk.Label(prices_frame, text=text, font=ModernStyle.FONT_FIELD_LABEL, bg=ModernStyle.BG_SECONDARY,
                      fg=ModernStyle.TEXT_SECONDARY).grid(row=i, column=0, sticky="w", pady=(6 if i == 4 else 2, 2))
             lbl = tk.Label(prices_frame, text="---", font=ModernStyle.FONT_BODY_BOLD, bg=ModernStyle.BG_SECONDARY,
@@ -541,24 +689,27 @@ class ValuationView(BaseView):
         
         tk.Label(right_summary, text="Decision Rationale", font=ModernStyle.FONT_CARD_TITLE, bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(anchor="w", pady=(0, 4))
         
-        self.txt_rationale = tk.Text(
-            right_summary, height=18, bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_PRIMARY,
-            font=ModernStyle.FONT_BODY, relief=tk.FLAT, highlightthickness=0,
-            wrap=tk.WORD, padx=12, pady=10, cursor="arrow",
-        )
-        self.txt_rationale.tag_configure("head", font=ModernStyle.FONT_BODY_BOLD, foreground=ModernStyle.TEXT_PRIMARY,
-                                         spacing1=6, spacing3=2)
-        self.txt_rationale.tag_configure("pass", foreground=ModernStyle.SUCCESS)
-        self.txt_rationale.tag_configure("fail", foreground=ModernStyle.ERROR)
-        self.txt_rationale.tag_configure("body", foreground=ModernStyle.TEXT_PRIMARY)
-        self.txt_rationale.pack(fill="both", expand=True)
-        self.txt_rationale.configure(state="disabled")
+        # Filled with a DecisionPanel (ui/decision_panel.py) after each analysis: the same
+        # layout as the Watchlist pop-up (the key figures are on the left here already)
+        self._rationale_holder = tk.Frame(right_summary, bg=ModernStyle.BG_TERTIARY)
+        self._rationale_holder.pack(fill="both", expand=True)
 
 
         # ── Detailed Metrics Grid ─────────────────────────────────────────────
         self.metrics_frame = tk.Frame(self.scrollable_inner, bg=ModernStyle.BG_PRIMARY)
         self.metrics_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.metrics_frame.pack_forget()
+
+        # ── How the decision was worked out: below the table (long, for reference) ──
+        self.details_card = ModernCard(
+            self.scrollable_inner, bg=ModernStyle.BG_SECONDARY,
+            highlight_color=ModernStyle.BG_SECONDARY, shadow=True, highlight_thickness=1,
+            radius=ModernStyle.RADIUS_CARD, canvas_bg=ModernStyle.BG_PRIMARY
+        )
+        tk.Label(self.details_card.content, text="How this was worked out", font=ModernStyle.FONT_CARD_TITLE,
+                 bg=ModernStyle.BG_SECONDARY, fg=ModernStyle.TEXT_PRIMARY).pack(anchor="w", padx=20, pady=(14, 0))
+        self._details_holder = tk.Frame(self.details_card.content, bg=ModernStyle.BG_SECONDARY)
+        self._details_holder.pack(fill="both", expand=True, padx=20, pady=(0, 14))
 
         # Dictionary to store metric stringvars
         self._metrics_vars = {}
@@ -624,8 +775,14 @@ class ValuationView(BaseView):
             ],
         }
         
-        # Create a grid layout for cards
-        row_idx = 0
+        # Create a grid layout for cards, under a one-line legend
+        tk.Label(self.metrics_frame,
+                 text="✅ meets the benchmark   ❌ misses it   · in between or no benchmark.   "
+                      "Benchmarks (in grey) are rules of thumb for a typical company, not targets.",
+                 font=ModernStyle.FONT_SMALL, fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_PRIMARY,
+                 anchor="w", justify="left").grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(2, 0))
+        self._metric_icons = {}
+        row_idx = 1
         col_idx = 0
         
         for cat_name, items in categories.items():
@@ -638,39 +795,37 @@ class ValuationView(BaseView):
             self.metrics_frame.grid_columnconfigure(col_idx, weight=1)
             
             # Category Header
-            tk.Label(
-                card.content, text=cat_name.upper(),
-                font=ModernStyle.FONT_SMALL,
-                fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY
-            ).pack(anchor="w", padx=12, pady=(12, 6))
-            
+            tk.Label(card.content, text=cat_name.upper(), font=ModernStyle.FONT_SMALL_BOLD,
+                     fg=ModernStyle.TEXT_SECONDARY, bg=ModernStyle.BG_SECONDARY).pack(anchor="w", padx=12, pady=(12, 6))
+
             # Thin separator
             tk.Frame(card.content, bg=ModernStyle.BORDER_COLOR, height=1).pack(fill="x", padx=12, pady=(0, 6))
-            
+
+            # A small table: mark | metric | benchmark (left-aligned column) | value
             content = tk.Frame(card.content, bg=ModernStyle.BG_SECONDARY)
             content.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-            
-            for i, (label_text, key) in enumerate(items):
-                row = tk.Frame(content, bg=ModernStyle.BG_SECONDARY)
-                row.pack(fill="x", pady=4)
-                
-                tk.Label(
-                    row, text=label_text,
-                    font=ModernStyle.FONT_BODY,
-                    fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY
-                ).pack(side="left")
-                
+            content.grid_columnconfigure(2, weight=1)
+            for col, text, sticky in ((2, "Benchmark", "w"), (3, "Value", "e")):
+                tk.Label(content, text=text, font=ModernStyle.FONT_SMALL, fg=ModernStyle.TEXT_TERTIARY,
+                         bg=ModernStyle.BG_SECONDARY).grid(row=0, column=col, sticky=sticky, pady=(0, 2))
+
+            for i, (label_text, key) in enumerate(items, start=1):
+                icon = tk.Label(content, text="", width=2, font=ModernStyle.FONT_BODY,
+                                fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY)
+                icon.grid(row=i, column=0, sticky="w", pady=3)
+                self._metric_icons[key] = icon
+                tk.Label(content, text=label_text, font=ModernStyle.FONT_BODY, fg=ModernStyle.TEXT_PRIMARY,
+                         bg=ModernStyle.BG_SECONDARY).grid(row=i, column=1, sticky="w", padx=(0, 14), pady=3)
+                tk.Label(content, text=BENCHMARKS.get(key, ("", None))[0], font=ModernStyle.FONT_SMALL,
+                         fg=ModernStyle.TEXT_TERTIARY, bg=ModernStyle.BG_SECONDARY).grid(row=i, column=2, sticky="w", pady=3)
+
                 var = tk.StringVar(value="---")
                 self._metrics_vars[key] = var
-                
-                lbl_val = tk.Label(
-                    row, textvariable=var,
-                    font=ModernStyle.FONT_HEADING,
-                    fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY
-                )
-                lbl_val.pack(side="right")
+                lbl_val = tk.Label(content, textvariable=var, font=ModernStyle.FONT_HEADING,
+                                   fg=ModernStyle.TEXT_PRIMARY, bg=ModernStyle.BG_SECONDARY)
+                lbl_val.grid(row=i, column=3, sticky="e", padx=(10, 0), pady=3)
                 self._metric_labels[key] = lbl_val
-            
+
             # Wrap to next row after 2 columns
             col_idx += 1
             if col_idx > 1:
@@ -713,15 +868,26 @@ class ValuationView(BaseView):
         # Reset UI
         self.summary_card.pack_forget()
         self.metrics_frame.pack_forget()
+        self.details_card.pack_forget()
         self._raw_data = {}
         for var in self._metrics_vars.values():
             var.set("---")
         for lbl in self._metric_labels.values():
             lbl.config(fg=ModernStyle.TEXT_PRIMARY)
+        for icon in getattr(self, "_metric_icons", {}).values():
+            icon.config(text="")
+
+        def work():
+            try:
+                return collect_valuation_data(symbol)
+            except (SymbolNotFound, YahooUnavailable) as exc:   # a message for the user, not a bug
+                log.info("Valuation of %s: %s", symbol, exc)
+                return exc
 
         run_in_background(
-            lambda: collect_valuation_data(symbol),
-            on_done=lambda raw: self._on_fetch_done(gen, raw),
+            work,
+            on_done=lambda raw: (self._on_fetch_failed(gen, symbol, raw) if isinstance(raw, LookupError)
+                                 else self._on_fetch_done(gen, raw)),
             on_error=lambda err: self._on_fetch_failed(gen, symbol, err),
             widget=self, name="valuation-fetch",
         )
@@ -933,11 +1099,11 @@ class ValuationView(BaseView):
             half = 110   # the gauge is 220 wide; its middle is "price = fair value"
             reach = min(abs(upside), 100.0) / 100.0 * half
             if upside >= 0:
-                self.lbl_margin_safety.config(text=f"Upside to fair value: {upside:+.1f}%", fg=ModernStyle.SUCCESS)
+                self.lbl_margin_safety.config(text=f"Value gap: {upside:+.1f}%", fg=ModernStyle.SUCCESS)
                 self.gauge_canvas.itemconfig(self.gauge_rect, fill=ModernStyle.SUCCESS)
                 self.gauge_canvas.coords(self.gauge_rect, half, 0, half + reach, 12)
             else:
-                self.lbl_margin_safety.config(text=f"Upside to fair value: {upside:+.1f}% (price above fair value)",
+                self.lbl_margin_safety.config(text=f"Value gap: {upside:+.1f}% (price above fair value)",
                                               fg=ModernStyle.ERROR)
                 self.gauge_canvas.itemconfig(self.gauge_rect, fill=ModernStyle.ERROR)
                 self.gauge_canvas.coords(self.gauge_rect, half - reach, 0, half, 12)
@@ -952,41 +1118,61 @@ class ValuationView(BaseView):
 
         # 2. The signal: the shared rules decide; the old checklist is information only
         scorecard = self._quality_scorecard()
+        self._apply_benchmarks()
+        for child in self._rationale_holder.winfo_children():
+            child.destroy()
         if decision is not None:
             badge = decision.label
             badge_fg = {"BUY": ModernStyle.SUCCESS, "REDUCE": ModernStyle.ERROR, "SELL": ModernStyle.ERROR,
                         "HOLD": ModernStyle.WARNING}.get(decision.zone, ModernStyle.TEXT_SECONDARY)
-            explained = decision.text().split("\n", 1)[1:]      # its first line repeats the badge
-            tip = "\n".join([f"Confidence: {decision.confidence}"] + explained + ["", scorecard])
+            from ui.decision_panel import DecisionPanel
+            # beside the key figures: only the short part, so the table follows straight after
+            DecisionPanel(self._rationale_holder, decision, bg=ModernStyle.BG_TERTIARY, accent=badge_fg,
+                          sections=("summary", "why", "changes"), wrap=520).pack(fill="both", expand=True,
+                                                                                padx=12, pady=(2, 10))
+            for child in self._details_holder.winfo_children():
+                child.destroy()
+            DecisionPanel(self._details_holder, decision, bg=ModernStyle.BG_SECONDARY, accent=ModernStyle.TEXT_PRIMARY,
+                          sections=("quality", "notes", "footer", "scorecard"), scorecard=scorecard,
+                          wrap=900).pack(fill="both", expand=True)
         else:
             badge, badge_fg = "⚪ No signal", ModernStyle.TEXT_SECONDARY
-            tip = "The fair value couldn't be worked out for this symbol.\n\n" + scorecard
+            tk.Label(self._rationale_holder, text="The fair value couldn't be worked out for this symbol.",
+                     bg=ModernStyle.BG_TERTIARY, fg=ModernStyle.TEXT_SECONDARY, font=ModernStyle.FONT_BODY,
+                     anchor="w").pack(anchor="w", padx=12, pady=10)
         self.lbl_signal_badge.config(text=badge, fg=badge_fg)
 
-        self.txt_rationale.configure(state="normal")
-        self.txt_rationale.delete(1.0, tk.END)
-        for line in tip.split("\n"):
-            if not line.strip():
+        # Show panels: key figures and the short why, the metrics table, then the details
+        self.summary_card.pack(fill="x", padx=20, pady=(10, 6))
+        self.metrics_frame.pack(fill="x", padx=20, pady=(0, 10))
+        if decision is not None:
+            self.details_card.pack(fill="x", padx=20, pady=(0, 20))
+
+
+    def _apply_benchmarks(self) -> None:
+        """✅ / ❌ beside every metric that has a benchmark, and the value in green / red."""
+        raw = self._raw_data
+        for key, icon in self._metric_icons.items():
+            text, rule = BENCHMARKS.get(key, ("", None))
+            value = raw.get(BENCH_SOURCE.get(key, key))
+            status = None
+            if rule is not None and isinstance(value, (int, float)) and not isinstance(value, bool):
+                try:
+                    status = rule(float(value), raw)
+                except Exception:
+                    status = None
+            if value in (None, ""):
+                icon.config(text="")
                 continue
-            if line.startswith(("✅", "🛡", "📈")):
-                tag = "pass"
-            elif line.startswith(("❌", "🚨", "📉")):
-                tag = "fail"
-            elif line.startswith(("•", "·")):
-                tag = "body"
-            else:
-                tag = "head"
-            self.txt_rationale.insert(tk.END, line + "\n", tag)
-        self.txt_rationale.configure(state="disabled")
+            icon.config(text="✅" if status is True else "❌" if status is False else "·",
+                        fg=ModernStyle.TEXT_TERTIARY)
+            if status is not None and key in self._metric_labels:
+                self._metric_labels[key].config(fg=ModernStyle.SUCCESS if status else ModernStyle.ERROR)
 
-        # Show panels
-        self.summary_card.pack(fill="x", padx=20, pady=10)
-        self.metrics_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-
-
-    def _quality_scorecard(self) -> str:
+    def _quality_scorecard(self) -> tuple:
         """The old checklist (P/E, ROE, margins, growth, RSI…) as information only; the
-        signal comes from the shared rules (model/valuation.py). Colours the metric values."""
+        signal comes from the shared rules (model/valuation.py). Colours the metric values.
+        Returns (score, checks counted, strengths, weaknesses)."""
         score = 0
         max_score = 0
         reasons_pass = []
@@ -1115,14 +1301,15 @@ class ValuationView(BaseView):
         check("Beta", "beta", lambda v: v < 1.5, "Lower portfolio volatility vs overall market trends", "High beta — susceptible to violent market swings")
 
 
-        # ── The scorecard text (information only: it doesn't decide the signal) ──
-        if max_score == 0:
-            return "QUALITY SCORECARD: no ratios from Yahoo Finance for this symbol."
-        tip_lines = [f"QUALITY SCORECARD (information only, it doesn't decide the signal): {score}/{max_score}"]
-        if reasons_pass:
-            tip_lines.append("STRENGTHS:")
-            tip_lines.extend(reasons_pass)
-        if reasons_fail:
-            tip_lines.append("WEAKNESSES / RISKS:")
-            tip_lines.extend(reasons_fail)
-        return "\n".join(tip_lines)
+        # ── The scorecard (information only: it doesn't decide the signal), each line with
+        # the value it was judged on and its benchmark ──
+        from ui.decision_panel import with_benchmarks
+
+        def shown(key):
+            if key == "health":
+                return (f"FCF {self._metrics_vars['free_cash_flow'].get()}, "
+                        f"D/E {self._metrics_vars['debt_to_equity'].get()}")
+            var = self._metrics_vars.get(key)
+            return var.get() if var is not None and var.get() != "---" else ""
+        return (score, max_score, with_benchmarks(reasons_pass, VAL_SCORE_INFO, shown),
+                with_benchmarks(reasons_fail, VAL_SCORE_INFO, shown))

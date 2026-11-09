@@ -36,7 +36,6 @@ _SCHEMA = """
         updated_at        TEXT DEFAULT ''
     )
 """
-_schema_ready: set = set()
 
 
 def _now() -> str:
@@ -174,11 +173,11 @@ def _session(conn=None):
 
 
 def ensure_schema(conn) -> None:
-    from model import database
-    key = database.DB_PATH
-    if key not in _schema_ready:
-        conn.execute(_SCHEMA)
-        _schema_ready.add(key)
+    """Create the table when it isn't there. Done on every use (CREATE TABLE IF NOT EXISTS
+    costs next to nothing): remembering "already created" for the whole session left the
+    app without the table until a restart when it disappeared, e.g. after a backup was
+    restored or a failed save rolled its creation back."""
+    conn.execute(_SCHEMA)
 
 
 def save_inputs(symbol: str, new_inputs: dict, conn=None) -> None:

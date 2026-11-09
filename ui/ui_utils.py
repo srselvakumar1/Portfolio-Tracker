@@ -492,6 +492,25 @@ def color_signals(tv, col: str = "Signal", items=None) -> None:
         pass
 
 
+def color_book_cells(tv, col: str) -> None:
+    """Red text for a book value shown in place of a fair value ("₹832.40 (B)"): a
+    loss-making company's net assets a share, not a fair price. Call after filling the table."""
+    from .ui_theme import ModernStyle
+    tv.tag_configure("book_cell", foreground=ModernStyle.ERROR)
+    if col not in tv["columns"]:
+        return
+    iids = list(tv.get_children(""))
+    book = [f"{{{iid} {{{col}}}}}" for iid in iids if str(tv.set(iid, col)).endswith("(B)")]
+    clear = " ".join(f"{{{iid} {{{col}}}}}" for iid in iids)   # rows shown before may carry old colours
+    try:
+        if clear:
+            tv.tk.call(tv._w, "tag", "cell", "remove", "book_cell", clear)
+        if book:
+            tv.tk.call(tv._w, "tag", "cell", "add", "book_cell", " ".join(book))
+    except tk.TclError:
+        pass
+
+
 def treeview_sort_column(tv, col: str, reverse: bool) -> None:
     """Sort a ttk.Treeview clicking on its header, dealing with numeric and text values."""
 

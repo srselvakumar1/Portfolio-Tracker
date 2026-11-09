@@ -1380,7 +1380,7 @@ def get_actionable_insights(limit: int = 10, currency_filter: str = "All") -> li
             for r in cursor.fetchall()
         ]
 
-    # Loss-makers have no fair value: give their book value a share instead ("Book ₹…")
+    # Loss-makers have no fair value: give their book value a share instead ("₹… (B)")
     if any((r["iv"] or 0) <= 0 for r in result):
         try:
             from model import fundamentals

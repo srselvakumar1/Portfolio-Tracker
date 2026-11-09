@@ -95,8 +95,8 @@ COLUMN_HELP = {
     "pe":       "P/E (price ÷ earnings per share)",
     "buy":      "Buy Below (the price at or below which the rules say Accumulate)",
     "fair":     "Fair Value (from the shared valuation rules; for a loss-making company it is for "
-                "reference only, from recent years' profits, or its book value, shown as "
-                "\"Book ₹…\", when there is none; blank for funds)",
+                "reference only, from recent years' profits, or its book value, shown in red as "
+                "\"₹… (B)\" (B = book value a share), when there is none; blank for funds)",
     "upside":   "Value Gap % (how far the price is from fair value: ▲ below it, ▼ above it)",
     "signal":   "Signal (model: price vs fair value)",
 }
@@ -213,7 +213,7 @@ def _broker_info(app_state) -> tuple[list, dict]:
 def _buy_below_levels(df, book: dict | None = None) -> dict:
     """{symbol: buy-below price} from the shared rules (model/valuation.py), the same decision
     the Signal column comes from. With `book`, also fills {symbol: book value a share} for
-    loss-makers that have no fair value (shown as "Book ₹…"). One database read; worker
+    loss-makers that have no fair value (shown as "₹… (B)"). One database read; worker
     thread only."""
     if df is None or df.empty or "symbol" not in df.columns:
         return {}
@@ -343,7 +343,7 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
             format_money(fees, cur),
             f"{pe:.2f}" if pe > 0 else "—",
             format_money(fair, cur) if fair > 0 else
-            (f"Book {format_money(book_values[symbol], cur)}" if symbol in book_values else "—"),
+            (f"{format_money(book_values[symbol], cur)} (B)" if symbol in book_values else "—"),
             _pct_text(upside, 1) if upside is not None else "—",
         )
         meta = {
@@ -1683,6 +1683,8 @@ class HoldingsView(BaseView):
                 reselect.append(iid)
         color_gain_loss(self.tree, GAIN_LOSS_COLS)
         color_signals(self.tree, "signal")
+        from ui.ui_utils import color_book_cells
+        color_book_cells(self.tree, "fair")     # "₹… (B)": no fair value, in red
         self._apply_sort()
         if reselect:
             self.tree.selection_set(reselect)

@@ -317,8 +317,8 @@ SECTIONS = [
             "methods agree, both are the same. Reduce levels work the same way.",
             "**Loss-making companies** stay on **Sell** while the last 12 months' EPS is at or below zero. If the "
             "middle of the last 3 years' and the last 12 months' EPS is still a profit, their fair value and Value "
-            "Gap % are shown **for reference only** (no buy or reduce prices). Otherwise the pop-ups give the "
-            "**book value** per share instead: what the company owns less what it owes, not a fair price.",
+            "Gap % are shown **for reference only** (no buy or reduce prices). Otherwise the tables show the "
+            "**book value** per share in red, as \"₹… (B)\": what the company owns less what it owes, not a fair price.",
             "The Watchlist's older **Quality scorecard** (P/E, ROE, margins, RSI…) is still shown in its pop-up, "
             "as information only.",
             "Yearly figures are fetched at most once a week per company; latest figures with every price refresh.",

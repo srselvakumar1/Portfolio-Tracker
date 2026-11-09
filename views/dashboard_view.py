@@ -548,7 +548,7 @@ class DashboardView(BaseView):
         "roi": "Gain or loss as a % of what you paid",
         "signal": "▲ Accumulate: price is below the buy price\n▼ Reduce: price is more than 20% above fair value\n"
                   "🚨 Sell: bad news (a loss, a big fair-value cut, quality newly failed)",
-        "iv": "Fair value from the shared valuation rules (— when the company is losing money)",
+        "iv": "Fair value from the shared valuation rules. With no fair value (losing money), the book value a share is shown in red as \"₹… (B)\"",
         "target": "Your target price from the Watchlist",
         "pe": "Price ÷ earnings per share (lower can mean cheaper)",
         "eps": "Earnings per share over the last year",
@@ -1518,7 +1518,7 @@ class DashboardView(BaseView):
                     groups["bar_cell"].append((iid, col))
                 elif text.startswith("▲"):
                     groups["up_cell"].append((iid, col))
-                elif text.startswith("▼"):
+                elif text.startswith("▼") or text.endswith("(B)"):   # (B): no fair value, in red
                     groups["down_cell"].append((iid, col))
         for tag, cells in groups.items():   # one call per kind for the whole table
             if cells:
@@ -1646,7 +1646,7 @@ class DashboardView(BaseView):
                 (f"{i + 1}", str(item.get("symbol", "")).strip() or "—", sig_text,
                  format_money(cp, currency), _day_cell(day_pct) if day_pct is not None else "—",
                  format_money(iv, currency) if iv > 0 else
-                 (f"Book {format_money(_num(item.get('book')), currency)}" if _num(item.get("book")) > 0 else "—"),
+                 (f"{format_money(_num(item.get('book')), currency)} (B)" if _num(item.get("book")) > 0 else "—"),
                  _pct_cell(diff_pct) if diff_pct is not None else "—"),
                 tags,
             ))

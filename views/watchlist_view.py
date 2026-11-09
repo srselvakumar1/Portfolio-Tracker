@@ -29,7 +29,8 @@ from ui.ui_theme import ModernStyle
 from ui.ui_widgets import (EmptyState, RoundedBox, ModernButton, ModernEntry, ModernCard, PremiumModal, ScrollArea,
                            action_button, header_button, secondary_button)
 from ui.ui_utils import (add_treeview_copy_menu, format_date, treeview_sort_column, run_in_background,
-                         call_on_ui, color_gain_loss, color_signals, show_toast, ToolTip, HeadingTips)
+                         call_on_ui, color_gain_loss, color_signals, show_toast, ToolTip, HeadingTips,
+                         color_book_cells)
 from ui.decision_panel import level_colour
 
 
@@ -902,8 +903,8 @@ class WatchlistView(BaseView):
             "Current Px": "Latest known price (market refresh or Refresh All, whichever is newer)",
             "Fair Value": "Median of the earnings model, the stock's own P/E history and (for lenders) "
                           "price-to-book. For a loss-making stock it is for reference only (from recent "
-                          "years' profits); with no fair value at all, its book value is shown as "
-                          "\"Book ₹…\". Double-click a row for details",
+                          "years' profits); with no fair value at all, its book value is shown in red "
+                          "as \"₹… (B)\" (B = book value a share). Double-click a row for details",
             "Value Gap %": "How far the price is from fair value (fair value ÷ price − 1): "
                              "▲ green = below fair value, ▼ red = above it",
             "Graham No.": "Benjamin Graham's fair price: √(22.5 × EPS × book value per share)",
@@ -1134,7 +1135,7 @@ class WatchlistView(BaseView):
                     f"{cy}{decision.buy_below:,.2f}" if decision.buy_below else "—",
                     f"{cy}{decision.strict_buy_below:,.2f}" if decision.strict_buy_below else "—",
                     f"{cy}{iv_f:,.2f}" if iv_f else
-                    (f"Book {cy}{decision.book_value:,.2f}" if decision.book_value else "—"),
+                    (f"{cy}{decision.book_value:,.2f} (B)" if decision.book_value else "—"),
                     mos_str,
                     graham_str,
                     money(row.get("analyst_target")),
@@ -1153,6 +1154,7 @@ class WatchlistView(BaseView):
         color_gain_loss(self._tv, ("Value Gap %", "From 52W H"))
         color_signals(self._tv, "Signal")
         _color_levels(self._tv)
+        color_book_cells(self._tv, "Fair Value")
 
         # A friendly empty screen when nothing is listed (once the data has loaded)
         if shown == 0 and (data is not None or self._data_loaded):

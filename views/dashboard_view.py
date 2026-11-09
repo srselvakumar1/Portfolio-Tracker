@@ -1872,7 +1872,7 @@ class DashboardView(BaseView):
             self._show_loading_skeleton()
             self._update_header_subtitle()
 
-        if painted and not self._engine_cache_invalid():
+        if painted and not self._engine_cache_invalid() and not self._snapshot_older_than_engine():
             # The saved figures are current: refresh only the small extras
             # (counts, price time), and the alerts if the cache had none.
             run_in_background(lambda: _query_extras(currency),
@@ -1895,6 +1895,21 @@ class DashboardView(BaseView):
                           on_done=lambda alerts, g=gen: self._on_alerts_loaded(g, alerts),
                           on_error=lambda exc, g=gen: self._on_alerts_failed(g, exc),
                           widget=self, name="dashboard-alerts")
+
+    def _snapshot_older_than_engine(self) -> bool:
+        """True when the engine worked its figures out again after the shown tables were
+        fetched, e.g. after a price refresh: the saved insights (signals, fair values) may
+        be old, so fetch them again. The engine's metrics are often reloaded at once after
+        a refresh (the sidebar asks for them), so "not invalid" alone can't tell. Saving the
+        snapshot again (extras, alerts) doesn't make its tables newer."""
+        try:
+            from model.engine import _metrics_cache, _cache_lock
+            with _cache_lock:
+                computed = _metrics_cache.get("ts") or 0.0
+            return (getattr(self, "_main_at", 0.0) or 0.0) < computed
+        except Exception:
+            log.exception("Dashboard: could not compare the snapshot with the engine")
+            return True
 
     @staticmethod
     def _engine_cache_invalid() -> bool:
@@ -1924,6 +1939,7 @@ class DashboardView(BaseView):
         if _num(metrics.get("total_invested")) <= 0:
             return False
         self._current_extras = cached.get("extras") or {}
+        self._main_at = _num(cached.get("main_at"))   # when these tables were fetched (0: unknown)
         self._apply_payload(metrics, cached.get("performers") or {}, cached.get("insights") or [],
                             save_cache=False)
         if cached.get("alerts_ok", True):
@@ -1964,6 +1980,7 @@ class DashboardView(BaseView):
         self._cancel_timeout("load")
         self._hide_error()
         self._current_extras = res.get("extras") or {}
+        self._main_at = time.time()
         self._apply_payload(res.get("metrics") or {}, res.get("performers") or {},
                             res.get("insights") or [], save_cache=True)
 
@@ -2140,6 +2157,7 @@ class DashboardView(BaseView):
             "alerts": self._current_alerts_data if alerts_ok else [],
             "alerts_ok": alerts_ok,
             "extras": self._current_extras or {},
+            "main_at": getattr(self, "_main_at", 0.0) or 0.0,   # when the tables were fetched
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
         path = self._cache_path()

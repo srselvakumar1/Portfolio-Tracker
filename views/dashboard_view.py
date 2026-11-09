@@ -533,7 +533,7 @@ class DashboardView(BaseView):
                   ("day", "Day Chg", 80, "w"), ("pnl", "P&L", 96, "w"), ("roi", "ROI %", 72, "w"))
     _INSIGHT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                      ("signal", "Signal", 110, "center"), ("current", "Current", 90, "center"),
-                     ("day", "Day Chg", 80, "center"), ("iv", "Fair Value", 90, "center"),
+                     ("day", "Day Chg", 80, "center"), ("iv", "Fair Value", 110, "center"),
                      ("diff", "Value Gap %", 100, "w"))
     _ALERT_COLS = (("num", "#", 34, "center"), ("symbol", "Symbol", 110, "w"),
                    ("target", "Target", 90, "e"), ("current", "Current", 90, "e"),
@@ -1645,7 +1645,8 @@ class DashboardView(BaseView):
             rows.append((
                 (f"{i + 1}", str(item.get("symbol", "")).strip() or "—", sig_text,
                  format_money(cp, currency), _day_cell(day_pct) if day_pct is not None else "—",
-                 format_money(iv, currency) if iv > 0 else "—",
+                 format_money(iv, currency) if iv > 0 else
+                 (f"Book {format_money(_num(item.get('book')), currency)}" if _num(item.get("book")) > 0 else "—"),
                  _pct_cell(diff_pct) if diff_pct is not None else "—"),
                 tags,
             ))
@@ -2116,8 +2117,14 @@ class DashboardView(BaseView):
         # Chips
         pnl_pct = (pnl / total_inv * 100.0) if total_inv else 0.0
         upnl_pct = (upnl / total_inv * 100.0) if total_inv else 0.0
-        day_base = total_v - dpnl
+        # Today's P&L leaves funds out (their price is yesterday's NAV): the % is on the
+        # value it covers, and the funds' last NAV change is noted beside it
+        day_value = _num(metrics["day_value"]) if "day_value" in metrics else total_v
+        day_base = day_value - dpnl
         day_pct = (dpnl / day_base * 100.0) if day_base > 0 else 0.0
+        fund_day = _num(metrics.get("day_pnl_funds"))
+        fund_note = (f" · funds {'+' if fund_day > 0 else ''}{_compact_money(fund_day, cur)}"
+                     if abs(fund_day) >= 0.5 else "")
         stocks, brokers, losing = ex.get("stocks"), ex.get("brokers"), ex.get("losing")
         if stocks:
             held = f"{stocks} stock{'s' if stocks != 1 else ''} · {brokers} broker{'s' if brokers != 1 else ''}"
@@ -2133,7 +2140,7 @@ class DashboardView(BaseView):
             "total_value": f"Invested {_compact_money(total_inv, cur)}",
             "total_invested": held,
             # one line each in a narrow card; the arrow carries the sign
-            "day_pnl": f"{arrow(dpnl)} {abs(day_pct):.2f}% today",
+            "day_pnl": f"{arrow(dpnl)} {abs(day_pct):.2f}% today{fund_note}",
             "overall_pnl": f"{arrow(pnl)} {abs(pnl_pct):.1f}% overall",
             "unrealized_pnl": f"{arrow(upnl)} {abs(upnl_pct):.1f}% on holdings",
             "unrealized_loss": below,
@@ -2793,6 +2800,9 @@ class DashboardView(BaseView):
                             children[b] = [(s, n, _num(v)) for s, n, v in cur.fetchall()]
                 except Exception:
                     log.exception("Failed to fetch the symbol breakdown for %s", metric_key)
+            if metric_key == "day_pnl":   # funds are left out of Today's P&L (yesterday's NAV)
+                from model.engine import is_nav_priced
+                children = {b: [r for r in rs if not is_nav_priced(r[0])] for b, rs in children.items()}
 
             sizes = {}   # broker → [invested, value, value at yesterday's close, {symbol: (the same)}]
             if extras:

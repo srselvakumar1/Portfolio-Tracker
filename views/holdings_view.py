@@ -95,7 +95,8 @@ COLUMN_HELP = {
     "pe":       "P/E (price ÷ earnings per share)",
     "buy":      "Buy Below (the price at or below which the rules say Accumulate)",
     "fair":     "Fair Value (from the shared valuation rules; for a loss-making company it is for "
-                "reference only, from recent years' profits; blank for funds)",
+                "reference only, from recent years' profits, or its book value, shown as "
+                "\"Book ₹…\", when there is none; blank for funds)",
     "upside":   "Value Gap % (how far the price is from fair value: ▲ below it, ▼ above it)",
     "signal":   "Signal (model: price vs fair value)",
 }
@@ -209,9 +210,11 @@ def _broker_info(app_state) -> tuple[list, dict]:
         return [], {}
 
 
-def _buy_below_levels(df) -> dict:
+def _buy_below_levels(df, book: dict | None = None) -> dict:
     """{symbol: buy-below price} from the shared rules (model/valuation.py), the same decision
-    the Signal column comes from. One database read; worker thread only."""
+    the Signal column comes from. With `book`, also fills {symbol: book value a share} for
+    loss-makers that have no fair value (shown as "Book ₹…"). One database read; worker
+    thread only."""
     if df is None or df.empty or "symbol" not in df.columns:
         return {}
     try:
@@ -229,6 +232,8 @@ def _buy_below_levels(df) -> dict:
                 d = decide(rec["inputs"], price, assumptions, rec["state"], when)
                 if d.buy_below and d.zone != "SELL":
                     out[sym] = d.buy_below
+                if book is not None and not d.fair_value and d.book_value:
+                    book[sym] = d.book_value
         return out
     except Exception:
         log.warning("Holdings: could not work out the buy-below prices", exc_info=True)
@@ -248,7 +253,8 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
         iv_signal=p["signal"], exclude_zero_qty=(state == "Active"), zero_qty_only=(state == "Closed"),
     )
     df, summary = cache.get_holdings_filtered(filters)
-    buy_below = _buy_below_levels(df)
+    book_values: dict = {}
+    buy_below = _buy_below_levels(df, book_values)
     if p["symbol"] or p["signal"] != "All":
         # Weight % is measured against everything you hold, not just the matches
         base = HoldingsFilters(broker=p["broker"], currency=p["currency"],
@@ -336,7 +342,8 @@ def _compute_holdings(cache: DataCache, p: dict) -> dict:
             _pnl_text(running, cur),
             format_money(fees, cur),
             f"{pe:.2f}" if pe > 0 else "—",
-            format_money(fair, cur) if fair > 0 else "—",
+            format_money(fair, cur) if fair > 0 else
+            (f"Book {format_money(book_values[symbol], cur)}" if symbol in book_values else "—"),
             _pct_text(upside, 1) if upside is not None else "—",
         )
         meta = {

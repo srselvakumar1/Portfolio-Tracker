@@ -67,28 +67,57 @@ TICKERS = (('^NSEI', 'NIFTY 50'), ('^N225', 'Nikkei 225'), ('^IXIC', 'NASDAQ'), 
            ('JPY=X', 'USD/JPY'), ('JPYINR=X', 'JPY/INR'))
 
 
+def _quote(yf, sym):
+    """(price, previous close) from Yahoo's own quote, or (None, None)."""
+    try:
+        info = yf.Ticker(sym).info or {}
+    except Exception:
+        log.info("Ticker %s: no quote, using the daily history", sym, exc_info=True)
+        return None, None
+    def pos(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+    return (pos(info.get("regularMarketPrice")),
+            pos(info.get("regularMarketPreviousClose")) or pos(info.get("previousClose")))
+
+
 def download_tickers() -> dict:
-    """{name: {"price", "change", "pct"}} for the sidebar tickers (runs in the price helper)."""
+    """{name: {"price", "change", "pct"}} for the sidebar tickers (runs in the price helper).
+
+    The price and the previous close come from Yahoo's own quote, so the change matches what
+    Yahoo shows. The daily history (the fallback) misses special sessions such as Diwali's
+    Muhurat trading, and closes currencies at a different time, so its "previous close" could
+    be two sessions back (NIFTY −0.43% where Yahoo said −0.25%).
+    """
     import yfinance as yf
-    symbols = [s for s, _n in TICKERS]
-    # threads=False avoids ThreadPoolExecutor deadlocks inside daemon threads
-    data = yf.download(symbols, period="7d", progress=False, threads=False)
+    prices = {sym: _quote(yf, sym) for sym, _n in TICKERS}
+    missing = [sym for sym, (cp, pc) in prices.items() if not (cp and pc)]
+    if missing:
+        try:   # threads=False avoids ThreadPoolExecutor deadlocks inside daemon threads
+            data = yf.download(missing, period="7d", progress=False, threads=False)
+            for sym in missing:
+                closes = data['Close'][sym] if len(missing) > 1 else data['Close']
+                series = (closes.iloc[:, 0] if hasattr(closes, "columns") else closes).dropna()
+                if len(series) >= 2:
+                    prices[sym] = (float(series.iloc[-1]), float(series.iloc[-2]))
+                else:
+                    log.info("Ticker %s skipped: only %d price points", sym, len(series))
+        except Exception:
+            log.exception("Could not download the ticker history for %s", missing)
     results = {}
     for sym, name in TICKERS:
         try:
-            series = data['Close'][sym].dropna()
-            if len(series) >= 2:
-                cp = float(series.iloc[-1])
-                pc = float(series.iloc[-2])
-                if cp > 0:
-                    chg = cp - pc
-                    pct = (chg / pc * 100) if pc > 0 else 0.0
-                    if sym == 'JPYINR=X':
-                        cp *= 100
-                        chg *= 100
-                    results[name] = {"price": cp, "change": chg, "pct": pct}
-            else:
-                log.info("Ticker %s skipped: only %d price points", sym, len(series))
+            cp, pc = prices.get(sym) or (None, None)
+            if cp and cp > 0 and pc:
+                chg = cp - pc
+                pct = (chg / pc * 100) if pc > 0 else 0.0
+                if sym == 'JPYINR=X':
+                    cp *= 100
+                    chg *= 100
+                results[name] = {"price": cp, "change": chg, "pct": pct}
         except Exception:
             log.exception("Could not read ticker %s", sym)
     return results

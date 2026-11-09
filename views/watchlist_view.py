@@ -902,7 +902,8 @@ class WatchlistView(BaseView):
             "Current Px": "Latest known price (market refresh or Refresh All, whichever is newer)",
             "Fair Value": "Median of the earnings model, the stock's own P/E history and (for lenders) "
                           "price-to-book. For a loss-making stock it is for reference only (from recent "
-                          "years' profits), or blank. Double-click a row for details",
+                          "years' profits); with no fair value at all, its book value is shown as "
+                          "\"Book ₹…\". Double-click a row for details",
             "Value Gap %": "How far the price is from fair value (fair value ÷ price − 1): "
                              "▲ green = below fair value, ▼ red = above it",
             "Graham No.": "Benjamin Graham's fair price: √(22.5 × EPS × book value per share)",
@@ -1132,7 +1133,8 @@ class WatchlistView(BaseView):
                     f"{cy}{cv_f:,.2f}" if cv_f else "—",
                     f"{cy}{decision.buy_below:,.2f}" if decision.buy_below else "—",
                     f"{cy}{decision.strict_buy_below:,.2f}" if decision.strict_buy_below else "—",
-                    f"{cy}{iv_f:,.2f}" if iv_f else "—",
+                    f"{cy}{iv_f:,.2f}" if iv_f else
+                    (f"Book {cy}{decision.book_value:,.2f}" if decision.book_value else "—"),
                     mos_str,
                     graham_str,
                     money(row.get("analyst_target")),

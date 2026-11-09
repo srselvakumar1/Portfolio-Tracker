@@ -216,6 +216,13 @@ def _invalidate_broker_metrics_cache():
         _broker_metrics_cache["data"] = None
         _broker_metrics_cache["ts"] = 0.0
 
+def is_nav_priced(symbol) -> bool:
+    """A mutual fund: priced once a day (its NAV, published after the market closes), so
+    its latest change is yesterday's, not today's. Today's P&L leaves these out. Yahoo
+    codes them "0P…" (e.g. 0P0000XVU2.BO)."""
+    return str(symbol or "").strip().upper().startswith("0P")
+
+
 def invalidate_all_caches():
     """Invalidate all UI caches when data changes."""
     with _cache_lock:
@@ -462,15 +469,27 @@ def _fetch_single_ticker(yf_sym: str, orig_sym: str, now: str, want_history: boo
             current_price = float(full_info.get('currentPrice', 0.0) or
                                   full_info.get('regularMarketPrice', 0.0) or 0.0)
 
+        # The previous close as Yahoo quotes it (its "Previous Close", which its change is
+        # measured from). fast_info works one out from the daily history instead, which misses
+        # special sessions such as Diwali's Muhurat trading, so "today" was measured from two
+        # sessions back (TATASTEEL showed a gain on a day it fell).
         previous_close = 0.0
-        try:
-            val = float(ticker.fast_info.previous_close)
-            if not math.isnan(val): previous_close = val
-        except Exception:
-            pass
+        for key in ('regularMarketPreviousClose', 'previousClose'):
+            try:
+                val = float(full_info.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if val > 0.0 and not math.isnan(val):
+                previous_close = val
+                break
         if previous_close <= 0.0:
-            previous_close = float(full_info.get('previousClose', 0.0) or
-                                   full_info.get('regularMarketPreviousClose', current_price) or current_price)
+            try:
+                val = float(ticker.fast_info.previous_close)
+                if not math.isnan(val): previous_close = val
+            except Exception:
+                pass
+        if previous_close <= 0.0:
+            previous_close = current_price
 
         # Fallback to .BO if .NS fails to yield a price
         if current_price == 0.0 and not yf_sym.endswith('.BO'):
@@ -1041,13 +1060,15 @@ def get_dashboard_metrics(force_refresh: bool = False, broker_filter: str = None
                 h.realized_pnl,
                 h.earliest_date,
                 h.currency,
-                COALESCE(m.previous_close, COALESCE(NULLIF(m.current_price, 0.0), h.avg_price))
+                COALESCE(m.previous_close, COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)),
+                h.symbol
             FROM holdings h
             LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE h.qty > 0 OR h.running_pnl != 0
         ''')
         
         invested = current_val = overall_pnl = overall_loss = unrealized_loss = day_pnl = 0.0
+        day_pnl_funds = day_value = 0.0     # funds' last NAV change; the value Today's P&L is on
         closed_realized_pnl = closed_realized_loss = 0.0
         total_realized_pnl = total_realized_loss = 0.0
         earliest_date = None
@@ -1061,6 +1082,7 @@ def get_dashboard_metrics(force_refresh: bool = False, broker_filter: str = None
             date_str = row[5]
             currency = str(row[6] or 'INR').strip().upper()
             prev_close = float(row[7] or 0.0)
+            symbol = row[8]
             
             if currency_filter != "All" and currency != currency_filter.upper():
                 continue
@@ -1071,7 +1093,13 @@ def get_dashboard_metrics(force_refresh: bool = False, broker_filter: str = None
                 row_inv = (qty * avg_price) * rate
                 row_cur = (qty * mkt_price) * rate
                 row_unrealized = row_cur - row_inv
-                row_day_pnl = (qty * (mkt_price - prev_close)) * rate
+                # no previous close: no change today (not the whole value)
+                row_day_pnl = (qty * (mkt_price - prev_close)) * rate if prev_close > 0 else 0.0
+                if is_nav_priced(symbol):   # a fund: its latest change is yesterday's NAV
+                    day_pnl_funds += row_day_pnl
+                    row_day_pnl = 0.0
+                else:
+                    day_value += row_cur
                 if row_unrealized < 0:
                     unrealized_loss += row_unrealized
             else:
@@ -1120,7 +1148,8 @@ def get_dashboard_metrics(force_refresh: bool = False, broker_filter: str = None
         "total_invested": invested, "total_value": current_val,
         "overall_pnl": overall_pnl, "unrealized_pnl": unrealized_pnl,
         "realized_pnl": realized_pnl, "realized_loss": realized_loss, "unrealized_loss": unrealized_loss,
-        "overall_xirr": overall_xirr, "overall_cagr": overall_cagr, "day_pnl": day_pnl
+        "overall_xirr": overall_xirr, "overall_cagr": overall_cagr, "day_pnl": day_pnl,
+        "day_pnl_funds": day_pnl_funds, "day_value": day_value,
     }
     with _cache_lock:
         _metrics_cache["data"], _metrics_cache["ts"] = result, time.time()
@@ -1145,7 +1174,8 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
                 h.realized_pnl,
                 h.earliest_date,
                 h.currency,
-                COALESCE(m.previous_close, COALESCE(NULLIF(m.current_price, 0.0), h.avg_price))
+                COALESCE(m.previous_close, COALESCE(NULLIF(m.current_price, 0.0), h.avg_price)),
+                h.symbol
             FROM holdings h
             LEFT JOIN marketdata m ON h.symbol = m.symbol
             WHERE (h.qty > 0 OR h.running_pnl != 0)
@@ -1186,7 +1216,8 @@ def get_metrics_by_broker(currency_filter: str = "All", force_refresh: bool = Fa
                 row_inv = (qty * avg_price) * rate
                 row_cur = (qty * mkt_price) * rate
                 row_unrealized = row_cur - row_inv
-                row_day_pnl = (qty * (mkt_price - prev_close)) * rate
+                row_day_pnl = ((qty * (mkt_price - prev_close)) * rate
+                               if prev_close > 0 and not is_nav_priced(row[9]) else 0.0)
                 if row_unrealized < 0:
                     metrics["unrealized_loss"] += row_unrealized
             else:
@@ -1348,6 +1379,19 @@ def get_actionable_insights(limit: int = 10, currency_filter: str = "All") -> li
             }
             for r in cursor.fetchall()
         ]
+
+    # Loss-makers have no fair value: give their book value a share instead ("Book ₹…")
+    if any((r["iv"] or 0) <= 0 for r in result):
+        try:
+            from model import fundamentals
+            from model.valuation import canonical
+            recs = fundamentals.load_records([r["symbol"] for r in result if (r["iv"] or 0) <= 0])
+            for r in result:
+                bv = ((recs.get(canonical(r["symbol"])) or {}).get("inputs") or {}).get("bvps")
+                if (r["iv"] or 0) <= 0 and isinstance(bv, (int, float)) and bv > 0:
+                    r["book"] = float(bv)
+        except Exception:
+            log.warning("Insights: could not read the book values", exc_info=True)
 
     with _cache_lock:
         _insights_cache["data"], _insights_cache["ts"] = result, time.time()

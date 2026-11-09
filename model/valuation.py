@@ -22,6 +22,9 @@ The rules are written up in VALUATION_REVIEW.md (sections 6 and 7). In short:
   × 1.2, HOLD in between. SELL only on bad news. NONE ("no signal") when the
   data is missing or old, or no method applies (e.g. funds). Next to a boundary the zone from
   the last refresh stays until the price is 3% past it (no flip-flopping).
+* A loss over the last 12 months is a SELL. Its fair value, when the middle of recent
+  years' EPS is still a profit, is shown for reference only (no buy / reduce levels);
+  otherwise the book value per share is given for reference.
 
 The assumptions (required return, growth limits, margins) are settings. These
 are choices, not facts, and every decision carries the ones it used.
@@ -320,6 +323,8 @@ class Decision:
     analyst_target: float | None = None   # for reference only (not part of the fair value)
     analyst_count: int | None = None
     dividend_yield: float | None = None   # percent
+    reference_only: bool = False          # loss-making: the fair value is shown, but the signal is SELL
+    book_value: float | None = None       # per share, for reference (loss-makers)
 
     @property
     def label(self) -> str:
@@ -337,9 +342,11 @@ class Decision:
         lines = [f"Decision: {self.label}  (confidence {self.confidence})"]
         if self.fair_value:
             rng = f"  (range {m(self.low)} – {m(self.high)})" if self.low and self.high and self.high > self.low else ""
-            lines.append(f"Fair value: {m(self.fair_value)}{rng}")
+            ref = "  (for reference only: loss-making)" if self.reference_only else ""
+            lines.append(f"Fair value: {m(self.fair_value)}{rng}{ref}")
             if self.upside is not None:
                 lines.append(f"Value gap: {self.upside:+.1f}%")
+        if self.fair_value and not self.reference_only:
             lines.append(f"Buy below: {m(self.buy_below)}   ·   Target (2–3 years): {m(self.target)}"
                          f"   ·   Reduce above: {m(self.reduce_above)}")
             if self.expected_return is not None:
@@ -535,7 +542,23 @@ def decide(inputs: dict | None, price, assumptions: dict | None = None, state: d
     ttm = _num(inputs.get("eps_ttm"))
     if ttm is not None and ttm <= 0:
         d.zone = "SELL"
-        d.reasons.append(f"Loss-making: EPS over the last 12 months is {m(ttm)}, so there is no fair value.")
+        bvps = _num(inputs.get("bvps"))
+        d.book_value = bvps if bvps and bvps > 0 else None
+        if fv:   # recent years' EPS is still a profit: a fair value for reference, no levels
+            d.fair_value, d.low, d.high, d.reference_only = fv, lo, hi, True
+            d.upside = (fv / price - 1.0) * 100.0
+            d.reasons.append(f"Loss-making: EPS over the last 12 months is {m(ttm)}, so the signal is Sell. "
+                             f"The fair value {m(fv)} is for reference only: it uses the middle of recent "
+                             f"years' EPS ({m(eps_used)}), which is still a profit.")
+            if len(methods) >= 2:
+                d.notes.append("Methods: " + ", ".join(f"{n} {m(v)}" for n, v in methods))
+        else:
+            d.reasons.append(f"Loss-making: EPS over the last 12 months is {m(ttm)}, and the middle of recent "
+                             f"years' EPS is not a profit either, so there is no fair value.")
+        if d.book_value:
+            d.reasons.append(f"For reference: book value is {m(d.book_value)} a share (the price is "
+                             f"{price / d.book_value:.2f}× book). It is what the company owns less what it owes, "
+                             f"not a fair price for a loss-making business.")
         d.changes.append("Leaves SELL when 12-month EPS is positive again.")
         return d
     if fv:
@@ -703,7 +726,7 @@ def next_state(state: dict | None, d: Decision, assumptions: dict | None = None,
     now = now or datetime.now()
     st = dict(state or {})
     key = _basis_key(d.assumptions, d.methods)
-    fv = d.fair_value
+    fv = None if d.reference_only else d.fair_value   # a loss year's reference value isn't remembered
     old = _num(st.get("fair_value"))
     if st.get("basis") != key:
         st["fair_value_prev"], st["fv_changed_on"] = None, None

@@ -2328,8 +2328,12 @@ class DashboardView(BaseView):
             fv_text = format_money(decision.fair_value, currency) if decision.fair_value else "N/A"
             if decision.fair_value and decision.low and decision.high and decision.high > decision.low:
                 fv_text += f"  ({format_money(decision.low, currency)} – {format_money(decision.high, currency)})"
+            if decision.reference_only:        # loss-making: shown, but the signal is Sell
+                fv_text += "  · reference only"
             _kv(c5, "Fair value (range):", fv_text)
-            if decision.fair_value:
+            if decision.book_value and decision.zone == "SELL":
+                _kv(c5, "Book value:", f"{format_money(decision.book_value, currency)} a share")
+            if decision.fair_value and not decision.reference_only:
                 _kv(c5, "Buy below:", format_money(decision.buy_below, currency))
                 _kv(c5, "Target (2–3 years):", format_money(decision.target, currency))
                 _kv(c5, "Reduce above:", format_money(decision.reduce_above, currency))

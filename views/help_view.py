@@ -315,6 +315,10 @@ SECTIONS = [
             "and no higher than the lowest method). The strict buy price takes the cushion off the lowest method "
             "itself, so it is lower; it is shown for reference on the Watchlist and the Valuation page. When the "
             "methods agree, both are the same. Reduce levels work the same way.",
+            "**Loss-making companies** stay on **Sell** while the last 12 months' EPS is at or below zero. If the "
+            "middle of the last 3 years' and the last 12 months' EPS is still a profit, their fair value and Value "
+            "Gap % are shown **for reference only** (no buy or reduce prices). Otherwise the pop-ups give the "
+            "**book value** per share instead: what the company owns less what it owes, not a fair price.",
             "The Watchlist's older **Quality scorecard** (P/E, ROE, margins, RSI…) is still shown in its pop-up, "
             "as information only.",
             "Yearly figures are fetched at most once a week per company; latest figures with every price refresh.",
@@ -331,7 +335,7 @@ SECTIONS = [
             ["**EPS**", "Double digits (> 10)", "The profit for each share."],
             ["**Debt to equity**", "Below 1", "Borrowing ÷ shareholders' money: is the company over-borrowed?"],
             ["**Book value**", "Compare with the price", "Net assets per share: roughly what is left if the company closed."],
-            ["**Fair value**", "Above the market price", "From the shared rules (see Valuations); blank for loss-making stocks."],
+            ["**Fair value**", "Above the market price", "From the shared rules (see Valuations); for loss-making stocks, for reference only or blank."],
         ]),
         ("sub", "Profitability"),
         ("table", ["Number", "Look for", "What it means"], [

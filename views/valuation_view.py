@@ -13,14 +13,17 @@ Watchlist view, so both pages find the same Yahoo symbol for what you type.
 from __future__ import annotations
 
 import math
+import sys
+import time
 import tkinter as tk
 from tkinter import ttk
 
 from model.applog import log
-from views.base_view import BaseView, _enable_canvas_mousewheel
+from views.base_view import BaseView
 from ui.ui_theme import ModernStyle
 from ui.ui_widgets import RoundedBox, LoadingOverlay, action_button, ModernCard, ModernEntry, ScrollArea
 from ui.ui_utils import run_in_background
+from ui.decision_panel import level_colour
 import pandas as pd
 
 
@@ -530,6 +533,79 @@ def collect_valuation_data(symbol: str) -> dict:
     return raw
 
 
+class _SmoothArea(ScrollArea):
+    """A ScrollArea that can also move by single pixels (for trackpads)."""
+
+    def scroll_pixels(self, px: int) -> None:
+        self._top += int(px)
+        self._apply()
+
+
+def _smooth_wheel(area: _SmoothArea) -> None:
+    """Scroll the results smoothly with a trackpad or a mouse wheel.
+
+    A trackpad moves the page by exactly the distance the fingers moved (Tk 9's
+    <TouchpadScroll>), not a fixed 30 px jump per event; a wheel moves 60 px a notch.
+    Bound on the window rather than bind_all on <Enter>, so it works over every widget
+    in the results, including the ones built after each analysis."""
+    top = area.winfo_toplevel()
+    state = {"touch": 0.0, "rest": 0.0}
+
+    def inside(widget) -> bool:
+        try:
+            path, mine = str(widget), str(area)
+            return (path == mine or path.startswith(mine + ".")) and bool(area.winfo_ismapped())
+        except tk.TclError:   # the page is gone
+            return False
+
+    def move(px: float) -> None:
+        px += state["rest"]
+        whole = int(px)
+        state["rest"] = px - whole
+        if whole:
+            area.scroll_pixels(whole)
+
+    def on_touchpad(event):
+        if not inside(event.widget):
+            return None
+        try:
+            low = int(event.delta) & 0xFFFF
+        except (TypeError, ValueError):
+            return "break"
+        dy = low - 0x10000 if low >= 0x8000 else low
+        state["touch"] = time.monotonic()
+        move(-dy)
+        return "break"
+
+    def on_wheel(event):
+        if not inside(event.widget):
+            return None
+        d = getattr(event, "delta", 0) or 0
+        if d and time.monotonic() - state["touch"] > 0.3:   # not an echo of a trackpad gesture
+            move(-d / 2 if (abs(d) >= 120 or tk.TkVersion >= 9) else -d * 15)
+        return "break"
+
+    def on_button(step):
+        return lambda event: (move(step), "break")[1] if inside(event.widget) else None
+
+    bound = [("<MouseWheel>", top.bind("<MouseWheel>", on_wheel, add="+")),
+             ("<Button-4>", top.bind("<Button-4>", on_button(-60), add="+")),
+             ("<Button-5>", top.bind("<Button-5>", on_button(60), add="+"))]
+    try:
+        bound.append(("<TouchpadScroll>", top.bind("<TouchpadScroll>", on_touchpad, add="+")))
+    except tk.TclError:
+        pass   # Tk 8.6 has no touchpad events
+
+    def forget(event):
+        if event.widget is area and sys.version_info >= (3, 13):   # older unbind drops every handler
+            for seq, funcid in bound:
+                try:
+                    top.unbind(seq, funcid)
+                except tk.TclError:
+                    pass
+    area.bind("<Destroy>", forget, add="+")
+
+
 class ValuationView(BaseView):
     """View to analyze a single stock's valuation metrics."""
 
@@ -546,11 +622,11 @@ class ValuationView(BaseView):
         # A ScrollArea, not a canvas window: Tk lays a canvas window out again on every
         # visit to the page (about 0.08 s here)
         scrollbar = ttk.Scrollbar(self.main_scroll_frame, orient="vertical")
-        canvas = ScrollArea(self.main_scroll_frame, ModernStyle.BG_PRIMARY, scrollbar=scrollbar, unit=30)
+        canvas = _SmoothArea(self.main_scroll_frame, ModernStyle.BG_PRIMARY, scrollbar=scrollbar, unit=30)
         self.scrollable_inner = canvas.inner
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        _enable_canvas_mousewheel(canvas)
+        _smooth_wheel(canvas)
         
         # ── Loading Overlay ───────────────────────────────────────────────────
         self.loading_overlay = LoadingOverlay(self.main_scroll_frame)
@@ -679,7 +755,7 @@ class ValuationView(BaseView):
             tk.Label(prices_frame, text=text, font=ModernStyle.FONT_FIELD_LABEL, bg=ModernStyle.BG_SECONDARY,
                      fg=ModernStyle.TEXT_SECONDARY).grid(row=i, column=0, sticky="w", pady=(6 if i == 4 else 2, 2))
             lbl = tk.Label(prices_frame, text="---", font=ModernStyle.FONT_BODY_BOLD, bg=ModernStyle.BG_SECONDARY,
-                           fg=ModernStyle.TEXT_PRIMARY)
+                           fg=level_colour(key))
             lbl.grid(row=i, column=1, sticky="w", padx=10, pady=(6 if i == 4 else 2, 2))
             self._decision_labels[key] = lbl
 
@@ -1085,12 +1161,21 @@ class ValuationView(BaseView):
             if decision is None:
                 lbl.config(text="---")
             elif key == "confidence":
-                lbl.config(text=decision.confidence if decision.fair_value else "---")
+                lbl.config(text="---" if not decision.fair_value else
+                           "reference only" if decision.reference_only else decision.confidence)
             else:
                 lbl.config(text=fmt(getattr(decision, key)))
 
         self.lbl_current_price.config(text=f"{cy}{cur_price:,.2f}" if cur_price else "---")
-        self.lbl_intrinsic_value.config(text=f"{cy}{iv_val:,.2f}" if iv_val else "---")
+        # a loss-maker: the fair value is for reference only; with none, the book value is given
+        book = decision.book_value if decision is not None else None
+        if iv_val and decision is not None and decision.reference_only:
+            iv_text = f"{cy}{iv_val:,.2f} (reference)"
+        elif iv_val:
+            iv_text = f"{cy}{iv_val:,.2f}"
+        else:
+            iv_text = f"--- · book {cy}{book:,.2f}" if book else "---"
+        self.lbl_intrinsic_value.config(text=iv_text)
 
         if cur_price and iv_val and iv_val > 0:
             # Upside to fair value = fair value ÷ price − 1: the same figure as the

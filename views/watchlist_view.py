@@ -30,6 +30,7 @@ from ui.ui_widgets import (EmptyState, RoundedBox, ModernButton, ModernEntry, Mo
                            action_button, header_button, secondary_button)
 from ui.ui_utils import (add_treeview_copy_menu, format_date, treeview_sort_column, run_in_background,
                          call_on_ui, color_gain_loss, color_signals, show_toast, ToolTip, HeadingTips)
+from ui.decision_panel import level_colour
 
 
 # ── Signals ───────────────────────────────────────────────────────────────────
@@ -110,6 +111,23 @@ def row_price(row: dict) -> tuple[float | None, str | None]:
     if price:
         return price, when
     return parse_num(row.get("current_value")), None
+
+
+def _color_levels(tv) -> None:
+    """Practical Buy in blue and Strict Buy in amber, cell by cell, so the two prices are
+    easy to tell apart (the rest of each row keeps its colours). Call after filling the
+    table; Tk without cell tags: no colours."""
+    tv.tag_configure("practical_cell", foreground=level_colour("buy_below"))
+    tv.tag_configure("strict_cell", foreground=level_colour("strict_buy_below"))
+    items = tv.get_children("")
+    if not items:
+        return
+    try:
+        for tag, col in (("practical_cell", "Practical Buy"), ("strict_cell", "Strict Buy")):
+            if col in tv["columns"]:
+                tv.tk.call(tv._w, "tag", "cell", "add", tag, " ".join(f"{{{i} {{{col}}}}}" for i in items))
+    except tk.TclError:
+        pass
 
 
 def _is_tokyo(symbol) -> bool:
@@ -883,7 +901,8 @@ class WatchlistView(BaseView):
                       "Wait / Watch = hold zone, Avoid = reduce or sell, No Data = no signal",
             "Current Px": "Latest known price (market refresh or Refresh All, whichever is newer)",
             "Fair Value": "Median of the earnings model, the stock's own P/E history and (for lenders) "
-                          "price-to-book. Blank for loss-making stocks. Double-click a row for details",
+                          "price-to-book. For a loss-making stock it is for reference only (from recent "
+                          "years' profits), or blank. Double-click a row for details",
             "Value Gap %": "How far the price is from fair value (fair value ÷ price − 1): "
                              "▲ green = below fair value, ▼ red = above it",
             "Graham No.": "Benjamin Graham's fair price: √(22.5 × EPS × book value per share)",
@@ -891,9 +910,9 @@ class WatchlistView(BaseView):
             "My Target": "Your own target price",
             "Name": "Company name",
             "Practical Buy": "Buy below this price, the signal says Accumulate: fair value less the margin "
-                             "of safety (and no higher than the lowest method when they disagree)",
+                             "of safety (and no higher than the lowest method when they disagree). In blue",
             "Strict Buy": "The cautious price: the margin of safety taken off the lowest method. The same as "
-                          "Practical Buy when the methods agree",
+                          "Practical Buy when the methods agree. In amber",
             "P/E": "Price ÷ earnings per share (lower can mean cheaper)",
             "PEG": "P/E ÷ earnings growth (under 1 can mean cheap for its growth)",
             "Div. Yield": "Yearly dividend as a % of the price",
@@ -1131,6 +1150,7 @@ class WatchlistView(BaseView):
             shown += 1
         color_gain_loss(self._tv, ("Value Gap %", "From 52W H"))
         color_signals(self._tv, "Signal")
+        _color_levels(self._tv)
 
         # A friendly empty screen when nothing is listed (once the data has loaded)
         if shown == 0 and (data is not None or self._data_loaded):

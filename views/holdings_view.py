@@ -94,7 +94,8 @@ COLUMN_HELP = {
     "fees":     "Fees (all brokerage and charges)",
     "pe":       "P/E (price ÷ earnings per share)",
     "buy":      "Buy Below (the price at or below which the rules say Accumulate)",
-    "fair":     "Fair Value (from the shared valuation rules; blank for losses and funds)",
+    "fair":     "Fair Value (from the shared valuation rules; for a loss-making company it is for "
+                "reference only, from recent years' profits; blank for funds)",
     "upside":   "Value Gap % (how far the price is from fair value: ▲ below it, ▼ above it)",
     "signal":   "Signal (model: price vs fair value)",
 }

@@ -19,6 +19,16 @@ import tkinter as tk
 from ui.ui_theme import ModernStyle
 
 
+def level_colour(key: str) -> str:
+    """Practical prices in blue, strict ones in amber: the same two colours on every page
+    (neither green nor red, which mean gain / loss). key: a Decision field name."""
+    if key in ("buy_below", "reduce_above"):
+        return ModernStyle.TEXT_ACCENT
+    if key in ("strict_buy_below", "strict_reduce_above"):
+        return ModernStyle.WARNING
+    return ModernStyle.TEXT_PRIMARY
+
+
 class ScoreItem(str):
     """A quality-scorecard line ("✅ ROE: Strong return…") that also carries the value it
     was judged on and its benchmark. Everywhere else it is just the text."""
@@ -80,7 +90,26 @@ class DecisionPanel(tk.Frame):
             self._wrapped.append((lbl, 24))
 
         if "figures" in sections:
-            if d.fair_value:
+            reference = getattr(d, "reference_only", False)
+            book = getattr(d, "book_value", None)
+            if reference or (not d.fair_value and book):
+                # loss-making: the fair value (if any) and the book value, for reference only
+                up = d.upside
+                tiles = [("Price", money(d.price), None, ""),
+                         ("Fair value", money(d.fair_value) if d.fair_value else "—", None,
+                          "reference only: loss-making" if d.fair_value else "none: loss-making")]
+                if d.fair_value:
+                    tiles.append(("Value gap", f"{up:+.1f}%" if up is not None else "—",
+                                  S.SUCCESS if (up or 0) > 0 else S.ERROR if (up or 0) < 0 else None,
+                                  "to the reference value"))
+                if book:
+                    tiles.append(("Book value", money(book), None,
+                                  f"a share · price {d.price / book:.2f}× book" if d.price else "a share"))
+                if d.analyst_target:
+                    tiles.append(("Analyst target", money(d.analyst_target), None,
+                                  f"{_pct(d.analyst_target, d.price)} from today"))
+                self._tiles(tiles)
+            elif d.fair_value:
                 rng = (f"{money(d.low)} – {money(d.high)}"
                        if d.low and d.high and d.high > d.low * 1.001 else "")
                 up = d.upside
@@ -284,8 +313,19 @@ def _decision_rows(d) -> list:
     zone_status = {"BUY": True, "REDUCE": False, "SELL": False}.get(d.zone)
     rows.append((zone_status, "Signal", d.reasons[0] if d.reasons else "", d.label,
                  "Strong Buy ≤ strict buy · Accumulate ≤ practical buy"))
-    if not d.fair_value or not d.price:
-        return rows
+    if getattr(d, "reference_only", False) or not d.fair_value or not d.price:
+        # loss-making (or no fair value): reference figures only, no buy / reduce levels
+        if d.fair_value and d.price and d.upside is not None:
+            rows.append((None, "Fair value (reference)", "From the middle of recent years' EPS; the 12-month "
+                         "loss keeps the signal on Sell", m(d.fair_value), "not used for the signal"))
+            rows.append((None, "Value gap", "How far the reference value is above (+) or below (−) the price",
+                         f"{d.upside:+.1f}%", "reference only"))
+        book = getattr(d, "book_value", None)
+        if book and d.price:
+            rows.append((None, "Book value", "What the company owns less what it owes, a share (not a fair "
+                         "price for a loss-making business)", f"{m(book)} ({d.price / book:.2f}× book)",
+                         "below 1× = price under book value"))
+        return rows + _reference_rows(d, m)
     a = d.assumptions or {}
     margin = d.margin or a.get("mos_medium", 0.35)
     in_buy = d.buy_below is not None and d.price <= d.buy_below
@@ -322,7 +362,13 @@ def _decision_rows(d) -> list:
         rows.append((True if er >= req else False if er < 0 else None, "Yearly return to target",
                      "If the price reaches fair value in 3 years, with dividends", f"{er:+.1f}% a year",
                      f"≥ {req:.1f}% (required return)"))
-    if d.analyst_target:
+    return rows + _reference_rows(d, m)
+
+
+def _reference_rows(d, m) -> list:
+    """Analyst target and dividend yield: shown for every stock, never part of the signal."""
+    rows = []
+    if d.analyst_target and d.price:
         up = (d.analyst_target / d.price - 1) * 100
         cnt = f", {d.analyst_count} analysts" if d.analyst_count else ""
         rows.append((up > 0, "Analyst target", f"Average analyst target (reference only{cnt})",
